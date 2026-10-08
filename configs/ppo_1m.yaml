@@ -1,0 +1,21 @@
+env_name: Craftax-Classic-Symbolic-v1
+seed: 0
+total_timesteps: 1048576
+num_envs: 64
+num_steps: 64
+max_episode_steps: 10000
+learning_rate: 0.0002
+anneal_learning_rate: true
+update_epochs: 4
+num_minibatches: 8
+gamma: 0.99
+gae_lambda: 0.8
+clip_epsilon: 0.2
+entropy_coefficient: 0.01
+value_coefficient: 0.5
+max_grad_norm: 1.0
+hidden_size: 256
+log_every: 8
+checkpoint_every: 64
+output_dir: runs/ppo-1m
+

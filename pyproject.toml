@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tiny-sima"
+version = "0.1.0"
+description = "A single-GPU hierarchical vision-language-action agent for Craftax."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Tiny-SIMA contributors" }]
+dependencies = [
+    "craftax==1.6.1",
+    "flax==0.12.8",
+    "jax==0.10.2",
+    "numpy==2.4.6",
+    "optax==0.2.8",
+    "PyYAML==6.0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<10",
+    "pytest-cov>=6,<8",
+    "ruff>=0.9,<1",
+]
+notebook = [
+    "ipykernel>=6.29,<8",
+    "jupyterlab>=4.3,<5",
+    "matplotlib>=3.9,<4",
+    "nbformat>=5.10,<6",
+]
+cuda12 = [
+    "jax[cuda12]==0.10.2",
+]
+
+[project.scripts]
+tiny-sima-train = "tiny_sima.executor.ppo:main"
+tiny-sima-evaluate = "tiny_sima.evaluation.policy:main"
+tiny-sima-benchmark = "tiny_sima.envs.craftax:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tiny_sima"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
