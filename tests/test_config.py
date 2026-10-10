@@ -36,3 +36,23 @@ def test_config_rejects_invalid_minibatches() -> None:
 def test_config_rejects_unknown_override() -> None:
     with pytest.raises(ValueError, match="Unknown PPO configuration"):
         PPOConfig().with_overrides(not_a_field=1)
+
+
+def test_config_rejects_invalid_optimistic_reset_ratio() -> None:
+    with pytest.raises(ValueError, match="cannot exceed num_envs"):
+        PPOConfig(
+            num_envs=8,
+            num_minibatches=4,
+            optimistic_reset_ratio=16,
+        ).validate()
+
+
+def test_config_allows_disabling_optimistic_resets() -> None:
+    config = PPOConfig(
+        num_envs=8,
+        num_minibatches=4,
+        use_optimistic_resets=False,
+        optimistic_reset_ratio=16,
+    ).validate()
+
+    assert not config.use_optimistic_resets

@@ -16,10 +16,8 @@ from flax.training.train_state import TrainState
 
 from tiny_sima.config import PPOConfig, load_config, save_config
 from tiny_sima.envs.craftax import (
-    CraftaxBundle,
-    make_environment,
-    reset_batch,
-    step_batch,
+    VectorizedCraftax,
+    make_vectorized_environment,
 )
 from tiny_sima.executor.checkpoints import save_checkpoint
 from tiny_sima.executor.model import (
@@ -87,7 +85,7 @@ def create_train_state(
 
 def initialize_runner(
     config: PPOConfig,
-    bundle: CraftaxBundle,
+    vector_env: VectorizedCraftax,
     model: ActorCriticRNN,
 ) -> RunnerState:
     """Initialize policy parameters and a vector of Craftax environments."""
@@ -97,11 +95,11 @@ def initialize_runner(
     params = initialize_parameters(
         model,
         parameter_rng,
-        bundle.spec.observation_shape,
+        vector_env.spec.observation_shape,
         batch_size=config.num_envs,
     )
     train_state = create_train_state(model, params, config)
-    observation, env_state = reset_batch(bundle, reset_rng, config.num_envs)
+    observation, env_state = vector_env.reset(reset_rng)
 
     return RunnerState(
         train_state=train_state,
@@ -147,7 +145,7 @@ def _calculate_gae(
 
 def make_update(
     config: PPOConfig,
-    bundle: CraftaxBundle,
+    vector_env: VectorizedCraftax,
     model: ActorCriticRNN,
 ):
     """Build one compiled rollout-and-update function."""
@@ -175,8 +173,7 @@ def make_update(
             action = jax.random.categorical(action_rng, logits, axis=-1)
             log_probability = categorical_log_probability(logits, action)
 
-            observation, env_state, reward, done, _ = step_batch(
-                bundle,
+            observation, env_state, reward, done, _ = vector_env.step(
                 env_rng,
                 current.env_state,
                 action,
@@ -423,17 +420,19 @@ def train(
     run_dir.mkdir(parents=True, exist_ok=True)
     save_config(config, run_dir / "config.yaml")
 
-    bundle = make_environment(
+    vector_env = make_vectorized_environment(
         config.env_name,
-        auto_reset=True,
+        num_envs=config.num_envs,
         max_episode_steps=config.max_episode_steps,
+        use_optimistic_resets=config.use_optimistic_resets,
+        optimistic_reset_ratio=config.optimistic_reset_ratio,
     )
     model = ActorCriticRNN(
-        num_actions=bundle.spec.num_actions,
+        num_actions=vector_env.spec.num_actions,
         hidden_size=config.hidden_size,
     )
-    runner = initialize_runner(config, bundle, model)
-    update = make_update(config, bundle, model)
+    runner = initialize_runner(config, vector_env, model)
+    update = make_update(config, vector_env, model)
 
     metrics_path = run_dir / "metrics.jsonl"
     start = time.perf_counter()
@@ -442,6 +441,7 @@ def train(
     runner, device_metrics = update(runner)
     jax.block_until_ready(device_metrics)
     compile_and_first_update_seconds = time.perf_counter() - compile_start
+    post_compile_start = time.perf_counter()
 
     latest_metrics = _host_metrics(device_metrics)
 
@@ -461,11 +461,18 @@ def train(
 
                 timesteps = (update_index + 1) * config.batch_size
                 elapsed = time.perf_counter() - start
+                post_compile_elapsed = time.perf_counter() - post_compile_start
+                post_compile_timesteps = update_index * config.batch_size
                 record = {
                     "update": update_index + 1,
                     "timesteps": timesteps,
                     "elapsed_seconds": elapsed,
                     "steps_per_second_including_compile": timesteps / elapsed,
+                    "steps_per_second_after_compile": (
+                        post_compile_timesteps / post_compile_elapsed
+                        if post_compile_timesteps
+                        else None
+                    ),
                     **latest_metrics,
                 }
                 metrics_file.write(json.dumps(record, sort_keys=True) + "\n")
@@ -474,7 +481,8 @@ def train(
                     f"update={update_index + 1}/{config.num_updates} "
                     f"steps={timesteps} "
                     f"reward={latest_metrics['reward_mean']:.4f} "
-                    f"sps={record['steps_per_second_including_compile']:.0f}"
+                    f"sps={record['steps_per_second_including_compile']:.0f} "
+                    f"steady_sps={record['steps_per_second_after_compile'] or 0:.0f}"
                 )
 
             if (
@@ -495,6 +503,8 @@ def train(
     completed_length_sum = float(np.asarray(runner.completed_length_sum))
     completed_episodes = int(np.asarray(runner.completed_episodes))
     total_seconds = time.perf_counter() - start
+    post_compile_seconds = time.perf_counter() - post_compile_start
+    post_compile_timesteps = max(0, config.total_timesteps - config.batch_size)
     mean_episode_return = (
         completed_return_sum / completed_episodes if completed_episodes else None
     )
@@ -508,7 +518,17 @@ def train(
         "updates": config.num_updates,
         "total_seconds": total_seconds,
         "compile_and_first_update_seconds": compile_and_first_update_seconds,
+        "post_compile_seconds": post_compile_seconds,
         "steps_per_second_including_compile": config.total_timesteps / total_seconds,
+        "steps_per_second_after_compile": (
+            post_compile_timesteps / post_compile_seconds
+            if post_compile_timesteps
+            else None
+        ),
+        "reset_mode": ("optimistic" if config.use_optimistic_resets else "automatic"),
+        "optimistic_reset_ratio": (
+            config.optimistic_reset_ratio if config.use_optimistic_resets else None
+        ),
         "mean_completed_episode_return": mean_episode_return,
         "mean_completed_episode_length": mean_episode_length,
         "completed_episodes": completed_episodes,

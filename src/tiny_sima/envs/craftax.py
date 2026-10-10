@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from craftax.craftax_env import make_craftax_env_from_name
 
@@ -32,11 +33,45 @@ class CraftaxBundle:
     spec: EnvironmentSpec
 
 
+@dataclass(frozen=True)
+class VectorizedCraftax:
+    """A batched environment with optional efficient optimistic resets."""
+
+    bundle: CraftaxBundle
+    num_envs: int
+    optimistic_reset_ratio: int | None = None
+
+    @property
+    def spec(self) -> EnvironmentSpec:
+        return self.bundle.spec
+
+    def reset(self, rng: jax.Array) -> tuple[jax.Array, Any]:
+        return reset_batch(self.bundle, rng, self.num_envs)
+
+    def step(
+        self,
+        rng: jax.Array,
+        state: Any,
+        action: jax.Array,
+    ) -> tuple[jax.Array, Any, jax.Array, jax.Array, dict[str, jax.Array]]:
+        if self.optimistic_reset_ratio is None:
+            return step_batch(self.bundle, rng, state, action)
+        return optimistic_step_batch(
+            self.bundle,
+            rng,
+            state,
+            action,
+            reset_ratio=self.optimistic_reset_ratio,
+        )
+
+
 class BenchmarkResult(NamedTuple):
     environment: str
     device: str
     num_envs: int
     num_steps: int
+    reset_mode: str
+    optimistic_reset_ratio: int | None
     compile_seconds: float
     run_seconds: float
     steps_per_second: float
@@ -97,6 +132,120 @@ def step_batch(
     )
 
 
+def optimistic_step_batch(
+    bundle: CraftaxBundle,
+    rng: jax.Array,
+    state: Any,
+    action: jax.Array,
+    *,
+    reset_ratio: int,
+) -> tuple[jax.Array, Any, jax.Array, jax.Array, dict[str, jax.Array]]:
+    """Step non-auto-reset environments using a small shared reset pool.
+
+    This follows the optimistic reset strategy used by the official Craftax
+    baselines. It may reuse a reset state when more environments terminate in
+    one step than the reset pool contains.
+    """
+
+    num_envs = action.shape[0]
+    if reset_ratio < 1 or num_envs % reset_ratio:
+        raise ValueError("reset_ratio must be positive and divide num_envs.")
+    num_resets = num_envs // reset_ratio
+
+    step_rng, reset_rng, selection_rng = jax.random.split(rng, 3)
+    stepped_observation, stepped_state, reward, done, info = step_batch(
+        bundle,
+        step_rng,
+        state,
+        action,
+    )
+    reset_observation, reset_state = reset_batch(
+        bundle,
+        reset_rng,
+        num_resets,
+    )
+
+    random_scores = jax.random.uniform(selection_rng, shape=(num_envs,))
+    done_scores = jnp.where(done, random_scores, -1.0)
+    random_reset_indices = jnp.argsort(done_scores)[-num_resets:]
+    deterministic_reset_indices = jnp.argsort(done)[-num_resets:]
+    selected_reset_indices = jnp.where(
+        done.sum() < num_resets,
+        deterministic_reset_indices,
+        random_reset_indices,
+    )
+
+    reset_assignment = jnp.arange(num_resets).repeat(reset_ratio)
+    reset_assignment = reset_assignment.at[selected_reset_indices].set(
+        jnp.arange(num_resets)
+    )
+    expanded_reset_observation = reset_observation[reset_assignment]
+    expanded_reset_state = jax.tree_util.tree_map(
+        lambda value: value[reset_assignment],
+        reset_state,
+    )
+
+    observation = jax.vmap(
+        lambda terminal, reset_value, stepped_value: jax.lax.select(
+            terminal,
+            reset_value,
+            stepped_value,
+        )
+    )(done, expanded_reset_observation, stepped_observation)
+
+    def select_state(terminal: jax.Array, reset_value: Any, stepped_value: Any):
+        return jax.tree_util.tree_map(
+            lambda reset_leaf, stepped_leaf: jax.lax.select(
+                terminal,
+                reset_leaf,
+                stepped_leaf,
+            ),
+            reset_value,
+            stepped_value,
+        )
+
+    next_state = jax.vmap(select_state)(
+        done,
+        expanded_reset_state,
+        stepped_state,
+    )
+    return observation, next_state, reward, done, info
+
+
+def make_vectorized_environment(
+    env_name: str,
+    *,
+    num_envs: int,
+    max_episode_steps: int,
+    use_optimistic_resets: bool,
+    optimistic_reset_ratio: int,
+) -> VectorizedCraftax:
+    """Create the vectorized environment used by PPO training."""
+
+    if use_optimistic_resets:
+        if optimistic_reset_ratio < 1 or num_envs % optimistic_reset_ratio:
+            raise ValueError(
+                "optimistic_reset_ratio must be positive and divide num_envs."
+            )
+        bundle = make_environment(
+            env_name,
+            auto_reset=False,
+            max_episode_steps=max_episode_steps,
+        )
+        return VectorizedCraftax(
+            bundle=bundle,
+            num_envs=num_envs,
+            optimistic_reset_ratio=optimistic_reset_ratio,
+        )
+
+    bundle = make_environment(
+        env_name,
+        auto_reset=True,
+        max_episode_steps=max_episode_steps,
+    )
+    return VectorizedCraftax(bundle=bundle, num_envs=num_envs)
+
+
 def render_state(
     state: Any,
     env_name: str,
@@ -131,18 +280,22 @@ def benchmark_environment(
     num_steps: int = 256,
     seed: int = 0,
     max_episode_steps: int = 1000,
+    use_optimistic_resets: bool = True,
+    optimistic_reset_ratio: int = 16,
 ) -> BenchmarkResult:
     """Compile and time a vectorized random-policy rollout."""
 
-    bundle = make_environment(
+    vector_env = make_vectorized_environment(
         env_name,
-        auto_reset=True,
+        num_envs=num_envs,
         max_episode_steps=max_episode_steps,
+        use_optimistic_resets=use_optimistic_resets,
+        optimistic_reset_ratio=optimistic_reset_ratio,
     )
 
     def rollout(rng: jax.Array) -> jax.Array:
         rng, reset_rng = jax.random.split(rng)
-        observation, state = reset_batch(bundle, reset_rng, num_envs)
+        observation, state = vector_env.reset(reset_rng)
 
         def step(carry: tuple[jax.Array, Any], _: None):
             step_rng, env_state = carry
@@ -151,10 +304,9 @@ def benchmark_environment(
                 action_rng,
                 shape=(num_envs,),
                 minval=0,
-                maxval=bundle.spec.num_actions,
+                maxval=vector_env.spec.num_actions,
             )
-            next_observation, next_state, _, _, _ = step_batch(
-                bundle,
+            next_observation, next_state, _, _, _ = vector_env.step(
                 env_rng,
                 env_state,
                 action,
@@ -186,6 +338,10 @@ def benchmark_environment(
         device=str(jax.devices()[0]),
         num_envs=num_envs,
         num_steps=num_steps,
+        reset_mode="optimistic" if use_optimistic_resets else "automatic",
+        optimistic_reset_ratio=(
+            optimistic_reset_ratio if use_optimistic_resets else None
+        ),
         compile_seconds=compile_seconds,
         run_seconds=run_seconds,
         steps_per_second=total_steps / run_seconds,
@@ -202,6 +358,12 @@ def main() -> None:
     parser.add_argument("--num-steps", type=int, default=256)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-episode-steps", type=int, default=1000)
+    parser.add_argument(
+        "--no-optimistic-resets",
+        action="store_true",
+        help="Use regular per-environment automatic resets.",
+    )
+    parser.add_argument("--optimistic-reset-ratio", type=int, default=16)
     args = parser.parse_args()
 
     result = benchmark_environment(
@@ -210,6 +372,8 @@ def main() -> None:
         num_steps=args.num_steps,
         seed=args.seed,
         max_episode_steps=args.max_episode_steps,
+        use_optimistic_resets=not args.no_optimistic_resets,
+        optimistic_reset_ratio=args.optimistic_reset_ratio,
     )
     print(json.dumps(result._asdict(), indent=2))
 

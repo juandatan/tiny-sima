@@ -172,6 +172,55 @@ The larger Phase 1 configuration is available at `configs/ppo_1m.yaml`.
 Generated runs and checkpoints are written under `runs/` and are not tracked
 by Git.
 
+### JupyterHub
+
+After pulling the repository, open
+`notebooks/00_environment_smoke_test.ipynb` and select the Python kernel you
+want to use. The first cell:
+
+- Finds the repository root.
+- Installs Tiny-SIMA into the active kernel.
+- Installs the CUDA 12 JAX dependencies when `nvidia-smi` reports an available
+  GPU.
+
+Run all cells to reset, step, render, and benchmark Craftax. No terminal
+installation is required for this notebook.
+
+To override automatic GPU detection, set `TINY_SIMA_USE_CUDA=1` or
+`TINY_SIMA_USE_CUDA=0` in the JupyterHub environment before starting the
+kernel.
+
+Jupyter notebooks reserve 60% of GPU memory for JAX by default. Override this
+before starting the kernel when needed:
+
+```bash
+export TINY_SIMA_JAX_MEMORY_FRACTION=0.75
+```
+
+Keep only one JAX notebook kernel running during training. Shutting a notebook
+tab does not necessarily stop its kernel.
+
+### One-million-step baseline
+
+The training notebook supports both the debug and 1M configurations:
+
+1. Open `notebooks/01_train_baseline.ipynb`.
+2. Restart its kernel so the JAX memory setting is applied before import.
+3. Shut down other GPU-backed notebook kernels.
+4. Set `RUN_1M = True` in the configuration cell.
+5. Run all cells.
+
+The 1M configuration uses 64 environments, 64 rollout steps, and optimistic
+resets. It writes intermediate and final checkpoints under `runs/ppo-1m/`.
+
+Training logs report two throughput values:
+
+- `sps`: overall steps per second, including compilation.
+- `steady_sps`: steps per second after the first compiled update.
+
+After training, open `notebooks/02_evaluate_baseline.ipynb`, change
+`run_name` to `ppo-1m`, and run all cells.
+
 ## Development phases
 
 ### Phase 1: Environment and baseline
@@ -366,6 +415,14 @@ Verified locally on October 8, 2026:
 
 The short-run returns are smoke-test results only and are not evidence of
 meaningful policy learning.
+
+Optimized locally on October 9, 2026:
+
+- Added optimistic vectorized resets for training and benchmarking.
+- Improved the 16-environment CPU benchmark from about 3,205 to 4,587
+  environment steps/second.
+- Added post-compilation throughput reporting.
+- Added shared-GPU memory controls to the notebooks.
 
 Still required to complete Phase 1:
 

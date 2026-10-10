@@ -14,6 +14,7 @@ def test_checkpoint_round_trip(tmp_path: Path) -> None:
         num_envs=2,
         num_steps=2,
         num_minibatches=1,
+        optimistic_reset_ratio=2,
         hidden_size=16,
     ).validate()
     model = ActorCriticRNN(num_actions=3, hidden_size=16)

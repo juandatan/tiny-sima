@@ -19,6 +19,8 @@ class PPOConfig:
     num_envs: int = 16
     num_steps: int = 32
     max_episode_steps: int = 1000
+    use_optimistic_resets: bool = True
+    optimistic_reset_ratio: int = 16
     learning_rate: float = 2e-4
     anneal_learning_rate: bool = True
     update_epochs: int = 2
@@ -60,6 +62,15 @@ class PPOConfig:
             )
         if self.num_envs % self.num_minibatches:
             raise ValueError("num_envs must be divisible by num_minibatches.")
+        if self.use_optimistic_resets:
+            if self.optimistic_reset_ratio < 1:
+                raise ValueError("optimistic_reset_ratio must be positive.")
+            if self.optimistic_reset_ratio > self.num_envs:
+                raise ValueError("optimistic_reset_ratio cannot exceed num_envs.")
+            if self.num_envs % self.optimistic_reset_ratio:
+                raise ValueError(
+                    "num_envs must be divisible by optimistic_reset_ratio."
+                )
         if self.num_steps < 2:
             raise ValueError("num_steps must be at least 2.")
         if self.max_episode_steps < 1:

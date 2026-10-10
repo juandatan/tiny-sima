@@ -4,6 +4,8 @@ total_timesteps: 1048576
 num_envs: 64
 num_steps: 64
 max_episode_steps: 10000
+use_optimistic_resets: true
+optimistic_reset_ratio: 16
 learning_rate: 0.0002
 anneal_learning_rate: true
 update_epochs: 4
@@ -18,4 +20,3 @@ hidden_size: 256
 log_every: 8
 checkpoint_every: 64
 output_dir: runs/ppo-1m
-

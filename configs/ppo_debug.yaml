@@ -4,6 +4,8 @@ total_timesteps: 8192
 num_envs: 16
 num_steps: 32
 max_episode_steps: 256
+use_optimistic_resets: true
+optimistic_reset_ratio: 16
 learning_rate: 0.0002
 anneal_learning_rate: true
 update_epochs: 2
@@ -18,4 +20,3 @@ hidden_size: 128
 log_every: 4
 checkpoint_every: 0
 output_dir: runs/ppo-debug
-
