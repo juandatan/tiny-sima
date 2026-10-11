@@ -19,4 +19,6 @@ max_grad_norm: 1.0
 hidden_size: 256
 log_every: 8
 checkpoint_every: 64
+monitor_gpu: true
+gpu_monitor_interval_seconds: 0.5
 output_dir: runs/ppo-1m

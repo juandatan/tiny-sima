@@ -10,8 +10,8 @@ The agent will use:
 - Structured memory to remember progress, discoveries, and failures.
 
 The project is designed to train and run on one accessible GPU, such as an
-RTX 4090 or A100. Training, testing, and evaluation should also be runnable
-from Jupyter notebooks.
+RTX 4090, L40, or A100. Training, testing, and evaluation should also be
+runnable from Jupyter notebooks.
 
 ## Research question
 
@@ -218,8 +218,48 @@ Training logs report two throughput values:
 - `sps`: overall steps per second, including compilation.
 - `steady_sps`: steps per second after the first compiled update.
 
+Each training run also writes:
+
+- `gpu_metrics.csv`: periodic `nvidia-smi` utilization, memory, and power
+  samples.
+- `gpu_summary.json`: peak and mean hardware measurements.
+- `summary.json`: training results plus GPU and JAX allocator summaries.
+
+`nvidia-smi` memory includes memory reserved by JAX. For estimating the
+policy's actual memory requirement, use
+`jax_memory.peak_bytes_in_use_mib` in `summary.json`.
+
 After training, open `notebooks/02_evaluate_baseline.ipynb`, change
 `run_name` to `ppo-1m`, and run all cells.
+
+### Recorded Phase 1 baseline
+
+The first one-million-step run completed on a single NVIDIA L40:
+
+| Measurement | Result |
+| --- | ---: |
+| Training steps | 1,048,576 |
+| Training seed | 0 |
+| Updates | 256 |
+| Total time, including compilation | 132.8 seconds |
+| Compile and first update | 48.0 seconds |
+| Post-compilation throughput | 12,321.7 steps/second |
+| Completed training episodes | 7,090 |
+| Mean completed training return | 4.260 |
+
+The final checkpoint was evaluated deterministically for 64 episodes with
+seed 1:
+
+| Measurement | Result |
+| --- | ---: |
+| Mean return | 3.647 |
+| Return standard deviation | 1.499 |
+| Minimum return | 0.100 |
+| Maximum return | 7.100 |
+| Mean episode length | 176.95 |
+
+This is a single training seed and establishes the engineering baseline. It
+is not yet a statistically robust comparison.
 
 ## Development phases
 
@@ -393,7 +433,7 @@ tiny-sima/
 
 ## Current status
 
-**Phase 1 is in progress.**
+**The Phase 1 baseline is complete and Phase 2 has started.**
 
 Implemented:
 
@@ -403,6 +443,9 @@ Implemented:
 - Checkpoint evaluation.
 - Automated configuration, environment, model, checkpoint, and PPO tests.
 - Command-line scripts and Phase 1 notebooks.
+- Automatic `nvidia-smi` sampling and JAX allocator peak-memory reporting.
+- An initial six-skill registry with preconditions, progress, success, and
+  sparse-reward predicates.
 
 Verified locally on October 8, 2026:
 
@@ -424,7 +467,22 @@ Optimized locally on October 9, 2026:
 - Added post-compilation throughput reporting.
 - Added shared-GPU memory controls to the notebooks.
 
-Still required to complete Phase 1:
+Verified on an NVIDIA L40 on October 11, 2026:
 
-- Record remote GPU throughput and memory use.
-- Run and record the one-million-step baseline.
+- The one-million-step baseline completed in 132.8 seconds.
+- Post-compilation throughput reached about 12,322 environment steps/second.
+- A deterministic 64-episode evaluation reached a mean return of 3.647.
+
+Started on October 11, 2026:
+
+- All 27 automated tests pass locally.
+- Defined `collect_wood`, `collect_stone`, `drink_water`, `place_table`,
+  `craft_wood_pickaxe`, and `craft_wood_sword`.
+- Added repeatable state-delta success predicates instead of relying on
+  one-time achievement flags.
+- Added feasibility preconditions, normalized progress, and one-shot sparse
+  rewards.
+
+The next L40 training run will populate the new GPU memory, utilization, and
+power artifacts. Those measurements will guide whether to increase the number
+of parallel environments, rollout length, or model size.

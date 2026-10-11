@@ -34,6 +34,8 @@ class PPOConfig:
     hidden_size: int = 128
     log_every: int = 4
     checkpoint_every: int = 0
+    monitor_gpu: bool = True
+    gpu_monitor_interval_seconds: float = 0.5
     output_dir: str = "runs/ppo-debug"
 
     @property
@@ -81,6 +83,8 @@ class PPOConfig:
             raise ValueError("update_epochs must be positive.")
         if self.log_every < 1:
             raise ValueError("log_every must be positive.")
+        if self.gpu_monitor_interval_seconds <= 0:
+            raise ValueError("gpu_monitor_interval_seconds must be positive.")
         return self
 
     def with_overrides(self, **overrides: Any) -> PPOConfig:

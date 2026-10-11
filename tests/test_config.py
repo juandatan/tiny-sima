@@ -56,3 +56,8 @@ def test_config_allows_disabling_optimistic_resets() -> None:
     ).validate()
 
     assert not config.use_optimistic_resets
+
+
+def test_config_rejects_invalid_gpu_monitor_interval() -> None:
+    with pytest.raises(ValueError, match="gpu_monitor_interval_seconds"):
+        PPOConfig(gpu_monitor_interval_seconds=0).validate()

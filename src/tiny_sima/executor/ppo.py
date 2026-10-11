@@ -19,6 +19,10 @@ from tiny_sima.envs.craftax import (
     VectorizedCraftax,
     make_vectorized_environment,
 )
+from tiny_sima.evaluation.gpu_monitor import (
+    NvidiaSmiMonitor,
+    jax_allocator_summary,
+)
 from tiny_sima.executor.checkpoints import save_checkpoint
 from tiny_sima.executor.model import (
     ActorCriticRNN,
@@ -420,6 +424,12 @@ def train(
     run_dir.mkdir(parents=True, exist_ok=True)
     save_config(config, run_dir / "config.yaml")
 
+    gpu_monitor = NvidiaSmiMonitor(
+        enabled=config.monitor_gpu,
+        interval_seconds=config.gpu_monitor_interval_seconds,
+    )
+    gpu_monitor.start()
+
     vector_env = make_vectorized_environment(
         config.env_name,
         num_envs=config.num_envs,
@@ -499,6 +509,8 @@ def train(
                 )
 
     jax.block_until_ready(runner.train_state.params)
+    jax_memory = jax_allocator_summary(jax.devices()[0])
+    gpu_summary = gpu_monitor.stop(run_dir)
     completed_return_sum = float(np.asarray(runner.completed_return_sum))
     completed_length_sum = float(np.asarray(runner.completed_length_sum))
     completed_episodes = int(np.asarray(runner.completed_episodes))
@@ -533,6 +545,8 @@ def train(
         "mean_completed_episode_length": mean_episode_length,
         "completed_episodes": completed_episodes,
         "latest_metrics": latest_metrics,
+        "jax_memory": jax_memory,
+        "gpu_monitor": gpu_summary,
     }
 
     checkpoint_dir = save_checkpoint(
