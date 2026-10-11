@@ -451,9 +451,15 @@ def train(
     runner, device_metrics = update(runner)
     jax.block_until_ready(device_metrics)
     compile_and_first_update_seconds = time.perf_counter() - compile_start
+    steady_state_start_seconds = gpu_monitor.elapsed_seconds()
     post_compile_start = time.perf_counter()
 
     latest_metrics = _host_metrics(device_metrics)
+    previous_log_timesteps: int | None = None
+    previous_log_elapsed: float | None = None
+    previous_log_monitor_seconds: float | None = None
+    tail_steps_per_second: float | None = None
+    tail_gpu_start_seconds: float | None = None
 
     with metrics_path.open("w", encoding="utf-8") as metrics_file:
         for update_index in range(config.num_updates):
@@ -473,6 +479,19 @@ def train(
                 elapsed = time.perf_counter() - start
                 post_compile_elapsed = time.perf_counter() - post_compile_start
                 post_compile_timesteps = update_index * config.batch_size
+                interval_steps_per_second = None
+                if (
+                    previous_log_timesteps is not None
+                    and previous_log_elapsed is not None
+                ):
+                    interval_steps_per_second = (
+                        timesteps - previous_log_timesteps
+                    ) / (elapsed - previous_log_elapsed)
+                    tail_steps_per_second = interval_steps_per_second
+
+                monitor_elapsed = gpu_monitor.elapsed_seconds()
+                if previous_log_monitor_seconds is not None:
+                    tail_gpu_start_seconds = previous_log_monitor_seconds
                 record = {
                     "update": update_index + 1,
                     "timesteps": timesteps,
@@ -483,6 +502,7 @@ def train(
                         if post_compile_timesteps
                         else None
                     ),
+                    "interval_steps_per_second": interval_steps_per_second,
                     **latest_metrics,
                 }
                 metrics_file.write(json.dumps(record, sort_keys=True) + "\n")
@@ -494,6 +514,9 @@ def train(
                     f"sps={record['steps_per_second_including_compile']:.0f} "
                     f"steady_sps={record['steps_per_second_after_compile'] or 0:.0f}"
                 )
+                previous_log_timesteps = timesteps
+                previous_log_elapsed = elapsed
+                previous_log_monitor_seconds = monitor_elapsed
 
             if (
                 config.checkpoint_every > 0
@@ -510,7 +533,11 @@ def train(
 
     jax.block_until_ready(runner.train_state.params)
     jax_memory = jax_allocator_summary(jax.devices()[0])
-    gpu_summary = gpu_monitor.stop(run_dir)
+    gpu_summary = gpu_monitor.stop(
+        run_dir,
+        steady_state_start_seconds=steady_state_start_seconds,
+        tail_start_seconds=tail_gpu_start_seconds,
+    )
     completed_return_sum = float(np.asarray(runner.completed_return_sum))
     completed_length_sum = float(np.asarray(runner.completed_length_sum))
     completed_episodes = int(np.asarray(runner.completed_episodes))
@@ -537,6 +564,7 @@ def train(
             if post_compile_timesteps
             else None
         ),
+        "tail_steps_per_second": tail_steps_per_second,
         "reset_mode": ("optimistic" if config.use_optimistic_resets else "automatic"),
         "optimistic_reset_ratio": (
             config.optimistic_reset_ratio if config.use_optimistic_resets else None

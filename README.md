@@ -130,7 +130,8 @@ boundary should not be a performance bottleneck.
 
 ## Quick start
 
-Use Python 3.11 for the initial development environment.
+Use Python 3.11 or 3.12. Python 3.10 is not supported because the pinned Flax
+version requires Python 3.11 or newer.
 
 ```bash
 ./scripts/setup_env.sh
@@ -234,7 +235,7 @@ After training, open `notebooks/02_evaluate_baseline.ipynb`, change
 
 ### Recorded Phase 1 baseline
 
-The first one-million-step run completed on a single NVIDIA L40:
+The first one-million-step run completed on a single NVIDIA L40S:
 
 | Measurement | Result |
 | --- | ---: |
@@ -260,6 +261,78 @@ seed 1:
 
 This is a single training seed and establishes the engineering baseline. It
 is not yet a statistically robust comparison.
+
+The instrumented repeat run produced similar throughput and measured hardware
+use:
+
+| Measurement | Result |
+| --- | ---: |
+| Post-compilation throughput | 12,129.8 steps/second |
+| JAX peak live allocation | 172.1 MiB |
+| JAX preallocated pool | 27,276 MiB |
+| Peak live allocation as a fraction of the pool | 0.63% |
+| Mean GPU utilization, including compilation | 39.9% |
+| Mean power draw | 88.5 W |
+| Peak power draw | 103.7 W |
+
+The 27.8 GiB reported by `nvidia-smi` is almost entirely JAX's configured 60%
+preallocation. The executor is compute-underutilized and has substantial room
+for a larger environment batch or model.
+
+### Executor scaling sweep
+
+The completed L40S sweep produced:
+
+| Environments | Batch size | Tail steps/second | Tail GPU use | JAX peak memory | Speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 4,096 | 16,006 | 25.9% | 172.1 MiB | 1.00x |
+| 128 | 8,192 | 31,339 | 28.2% | 173.5 MiB | 1.96x |
+| 256 | 16,384 | 59,256 | 28.4% | 253.2 MiB | 3.70x |
+| 512 | 32,768 | 112,383 | 28.3% | 481.6 MiB | 7.02x |
+| 1,024 | 65,536 | 197,427 | 96.8% | 945.3 MiB | 12.33x |
+| 2,048 | 131,072 | 318,774 | 99.5% | 1,897.6 MiB | 19.92x |
+| 4,096 | 262,144 | 410,578 | 99.6% | 3,754.4 MiB | 25.65x |
+
+GPU saturation begins around 1,024 environments. The 2,048-environment
+configuration reaches about 78% of the maximum measured throughput with half
+the environment batch and memory of 4,096. Doubling from 2,048 to 4,096 adds
+only 29% more throughput, so 2,048 is the practical hardware-efficiency point
+and 4,096 is the maximum-throughput point.
+
+Open `notebooks/01_profile_executor_scaling.ipynb` and run all cells to
+reproduce the sweep. Completed candidates are reused automatically. Each
+candidate:
+
+- Runs for 32 PPO updates.
+- Uses the same rollout length and optimizer settings as the baseline.
+- Runs in a fresh subprocess.
+- Records cumulative and tail-window throughput, utilization, power, and JAX
+  peak memory.
+
+Results are written to `runs/executor-scaling/scaling_summary.json` and
+`scaling_summary.csv`. This sweep compares hardware throughput only; changing
+the PPO batch size may also change learning behavior.
+
+We will not change the learning default based on throughput alone. At one
+million total steps, 64 environments produce 256 PPO updates, while 512,
+1,024, 2,048, and 4,096 environments produce only 32, 16, 8, and 4 updates.
+The next learning experiment will compare 64, 256, and 512 environments over
+equal environment steps and multiple seeds.
+
+### Final learning-scale comparison
+
+Open `notebooks/02_compare_learning_scaling.ipynb` and run all cells. It runs
+nine isolated training jobs:
+
+- Environment counts: 64, 256, and 512.
+- Training seeds: 0, 1, and 2.
+- Training budget: 1,048,576 environment steps per run.
+- Evaluation: 64 deterministic episodes using the same evaluation seed.
+- PPO hyperparameters: unchanged from the baseline.
+
+The experiment is resumable and writes partial results after each completed
+run. Aggregate JSON and CSV files are written under
+`runs/learning-scaling-comparison/`.
 
 ## Development phases
 
@@ -415,7 +488,9 @@ tiny-sima/
 ├── notebooks/
 │   ├── 00_environment_smoke_test.ipynb
 │   ├── 01_train_baseline.ipynb
+│   ├── 01_profile_executor_scaling.ipynb
 │   ├── 02_evaluate_baseline.ipynb
+│   ├── 02_compare_learning_scaling.ipynb
 │   ├── 03_train_skills.ipynb
 │   └── 04_hierarchical_evaluation.ipynb
 ├── src/
@@ -467,15 +542,18 @@ Optimized locally on October 9, 2026:
 - Added post-compilation throughput reporting.
 - Added shared-GPU memory controls to the notebooks.
 
-Verified on an NVIDIA L40 on October 11, 2026:
+Verified on an NVIDIA L40S on October 11, 2026:
 
 - The one-million-step baseline completed in 132.8 seconds.
 - Post-compilation throughput reached about 12,322 environment steps/second.
 - A deterministic 64-episode evaluation reached a mean return of 3.647.
+- The instrumented repeat peaked at 172.1 MiB of live JAX allocations.
+- Overall GPU utilization averaged 39.9%, confirming that the baseline leaves
+  substantial accelerator capacity unused.
 
 Started on October 11, 2026:
 
-- All 27 automated tests pass locally.
+- All 38 automated tests pass locally.
 - Defined `collect_wood`, `collect_stone`, `drink_water`, `place_table`,
   `craft_wood_pickaxe`, and `craft_wood_sword`.
 - Added repeatable state-delta success predicates instead of relying on
@@ -483,6 +561,8 @@ Started on October 11, 2026:
 - Added feasibility preconditions, normalized progress, and one-shot sparse
   rewards.
 
-The next L40 training run will populate the new GPU memory, utilization, and
-power artifacts. Those measurements will guide whether to increase the number
-of parallel environments, rollout length, or model size.
+The executor scaling sweep is complete. GPU saturation starts near 1,024
+environments; 2,048 is the practical hardware-efficiency point and 4,096 is
+the maximum-throughput point. The resumable final comparison is ready to test
+whether 256 or 512 environments improve wall-clock learning without harming
+final policy quality.

@@ -7,7 +7,7 @@ name = "tiny-sima"
 version = "0.1.0"
 description = "A single-GPU hierarchical vision-language-action agent for Craftax."
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.11,<3.13"
 license = { text = "MIT" }
 authors = [{ name = "Tiny-SIMA contributors" }]
 dependencies = [
@@ -39,6 +39,8 @@ cuda12 = [
 tiny-sima-train = "tiny_sima.executor.ppo:main"
 tiny-sima-evaluate = "tiny_sima.evaluation.policy:main"
 tiny-sima-benchmark = "tiny_sima.envs.craftax:main"
+tiny-sima-profile = "tiny_sima.profiling:main"
+tiny-sima-compare-learning = "tiny_sima.learning_comparison:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tiny_sima"]

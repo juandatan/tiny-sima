@@ -43,6 +43,26 @@ def test_monitor_writes_empty_artifacts_when_disabled(tmp_path: Path) -> None:
     assert (tmp_path / "gpu_summary.json").is_file()
 
 
+def test_monitor_summarizes_steady_state_window(tmp_path: Path) -> None:
+    monitor = NvidiaSmiMonitor(enabled=False)
+    monitor.samples = [
+        NvidiaSmiSample(0.5, 0, "GPU", 100, 10, 20, 5, 50),
+        NvidiaSmiSample(1.5, 0, "GPU", 100, 20, 80, 10, 90),
+    ]
+
+    summary = monitor.stop(
+        tmp_path,
+        steady_state_start_seconds=1.0,
+        tail_start_seconds=1.25,
+    )
+
+    steady_gpu = summary["steady_state"]["gpus"][0]
+    tail_gpu = summary["tail"]["gpus"][0]
+    assert steady_gpu["sample_count"] == 1
+    assert steady_gpu["mean_gpu_utilization_percent"] == 80
+    assert tail_gpu["sample_count"] == 1
+
+
 def test_jax_allocator_summary_converts_byte_fields() -> None:
     class FakeDevice:
         def memory_stats(self):

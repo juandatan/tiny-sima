@@ -229,7 +229,20 @@ class NvidiaSmiMonitor:
         with self._lock:
             self.samples.extend(samples)
 
-    def stop(self, output_dir: str | Path | None = None) -> dict[str, Any]:
+    def elapsed_seconds(self) -> float | None:
+        """Return elapsed monitor time, or ``None`` when sampling did not start."""
+
+        if self._start_time is None:
+            return None
+        return time.perf_counter() - self._start_time
+
+    def stop(
+        self,
+        output_dir: str | Path | None = None,
+        *,
+        steady_state_start_seconds: float | None = None,
+        tail_start_seconds: float | None = None,
+    ) -> dict[str, Any]:
         """Stop sampling, write artifacts, and return the aggregate summary."""
 
         self._stop_event.set()
@@ -242,6 +255,22 @@ class NvidiaSmiMonitor:
         summary["interval_seconds"] = self.interval_seconds
         if self.reason is not None:
             summary["reason"] = self.reason
+        if steady_state_start_seconds is not None:
+            steady_samples = [
+                sample
+                for sample in samples
+                if sample.elapsed_seconds >= steady_state_start_seconds
+            ]
+            summary["steady_state_start_seconds"] = steady_state_start_seconds
+            summary["steady_state"] = summarize_samples(steady_samples)
+        if tail_start_seconds is not None:
+            tail_samples = [
+                sample
+                for sample in samples
+                if sample.elapsed_seconds >= tail_start_seconds
+            ]
+            summary["tail_start_seconds"] = tail_start_seconds
+            summary["tail"] = summarize_samples(tail_samples)
 
         if output_dir is not None:
             run_dir = Path(output_dir)
