@@ -33,7 +33,7 @@ class SkillSpec:
     interaction_action: Action
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class SkillGoal:
     """One concrete short-horizon objective."""
 
@@ -41,12 +41,20 @@ class SkillGoal:
     quantity: int = 1
     horizon: int | None = None
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "skill_id", SkillId(self.skill_id))
-        if self.quantity < 1:
+    def __init__(
+        self,
+        skill_id: SkillId | str,
+        quantity: int = 1,
+        horizon: int | None = None,
+    ) -> None:
+        normalized_skill_id = SkillId(skill_id)
+        if quantity < 1:
             raise ValueError("Skill quantity must be positive.")
-        if self.horizon is not None and self.horizon < 1:
+        if horizon is not None and horizon < 1:
             raise ValueError("Skill horizon must be positive.")
+        object.__setattr__(self, "skill_id", normalized_skill_id)
+        object.__setattr__(self, "quantity", quantity)
+        object.__setattr__(self, "horizon", horizon)
 
     @property
     def effective_horizon(self) -> int:

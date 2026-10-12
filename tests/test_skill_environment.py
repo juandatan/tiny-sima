@@ -1,9 +1,11 @@
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from craftax.craftax_classic.constants import Action
 
 from tiny_sima.envs.skills import (
+    SkillStep,
     make_skill_environment,
     reset_skill_batch,
 )
@@ -23,22 +25,23 @@ def test_skill_scenarios_are_feasible_and_scripted_policy_succeeds(
 
     assert bool(np.asarray(skill_precondition(environment.goal, state.env_state)))
 
-    done = False
+    result: SkillStep | None = None
     reward = 0.0
     for step in range(2):
         action = scripted_skill_action(environment, state)
-        _, state, reward_array, done_array, info = environment.step(
+        result = environment.step(
             jax.random.PRNGKey(step + 1),
             state,
             action,
         )
-        reward += float(np.asarray(reward_array))
-        done = bool(np.asarray(done_array))
-        if done:
+        state = result.state
+        reward += float(np.asarray(result.reward))
+        if bool(np.asarray(result.done)):
             break
 
-    assert done
-    assert bool(np.asarray(info["skill_success"]))
+    assert result is not None
+    assert bool(np.asarray(result.done))
+    assert bool(np.asarray(result.info["skill_success"]))
     assert reward == 1.0
 
 
@@ -46,17 +49,20 @@ def test_skill_episode_times_out_without_completion() -> None:
     environment = make_skill_environment(SkillId.COLLECT_WOOD, horizon=2)
     _, state = environment.reset(jax.random.PRNGKey(0))
 
+    result: SkillStep | None = None
     for step in range(2):
-        _, state, reward, done, info = environment.step(
+        result = environment.step(
             jax.random.PRNGKey(step + 1),
             state,
-            np.asarray(Action.NOOP.value),
+            jnp.asarray(Action.NOOP.value),
         )
+        state = result.state
 
-    assert bool(np.asarray(done))
-    assert bool(np.asarray(info["skill_timeout"]))
-    assert not bool(np.asarray(info["skill_success"]))
-    assert float(np.asarray(reward)) == 0.0
+    assert result is not None
+    assert bool(np.asarray(result.done))
+    assert bool(np.asarray(result.info["skill_timeout"]))
+    assert not bool(np.asarray(result.info["skill_success"]))
+    assert float(np.asarray(result.reward)) == 0.0
 
 
 def test_skill_batch_reset_shapes() -> None:

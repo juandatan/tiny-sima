@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 from functools import partial
+from typing import Any, NamedTuple, cast
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
 from flax.linen.initializers import constant, orthogonal
+
+
+class ActorCriticOutput(NamedTuple):
+    """Typed outputs produced by the recurrent actor-critic."""
+
+    hidden: jax.Array
+    logits: jax.Array
+    value: jax.Array
 
 
 class ScannedGRU(nn.Module):
@@ -44,7 +53,7 @@ class ActorCriticRNN(nn.Module):
         self,
         hidden: jax.Array,
         inputs: tuple[jax.Array, jax.Array],
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    ) -> ActorCriticOutput:
         observations, resets = inputs
 
         embedding = nn.Dense(
@@ -88,7 +97,22 @@ class ActorCriticRNN(nn.Module):
             name="critic_value",
         )(critic)
 
-        return hidden, logits, jnp.squeeze(value, axis=-1)
+        return ActorCriticOutput(
+            hidden=hidden,
+            logits=logits,
+            value=jnp.squeeze(value, axis=-1),
+        )
+
+
+def apply_actor_critic(
+    model: ActorCriticRNN,
+    params: Any,
+    hidden: jax.Array,
+    inputs: tuple[jax.Array, jax.Array],
+) -> ActorCriticOutput:
+    """Apply a Flax model behind a precisely typed project boundary."""
+
+    return cast(ActorCriticOutput, model.apply(params, hidden, inputs))
 
 
 def initial_hidden(batch_size: int, hidden_size: int) -> jax.Array:
@@ -103,7 +127,7 @@ def initialize_parameters(
     observation_shape: tuple[int, ...],
     *,
     batch_size: int = 1,
-):
+) -> Any:
     """Initialize model parameters for a given environment observation shape."""
 
     observations = jnp.zeros(

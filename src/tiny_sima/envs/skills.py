@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
 from craftax.craftax_classic.constants import DIRECTIONS, Action, BlockType
 from craftax.craftax_classic.envs.craftax_state import Inventory
-from flax import struct
 
 from tiny_sima.envs.craftax import CraftaxBundle, make_environment
 from tiny_sima.goals.skills import (
@@ -22,13 +21,36 @@ from tiny_sima.goals.skills import (
 )
 
 
-@struct.dataclass
-class SkillEpisodeState:
+class SkillEpisodeState(NamedTuple):
     """Dynamic state needed by a short skill episode."""
 
     env_state: Any
     initial_metric: jax.Array
     steps: jax.Array
+    target_direction: jax.Array
+
+
+class SkillReset(NamedTuple):
+    """Output of a single or batched skill reset."""
+
+    observation: jax.Array
+    state: SkillEpisodeState
+
+
+class SkillStep(NamedTuple):
+    """Output of a single or batched skill step."""
+
+    observation: jax.Array
+    state: SkillEpisodeState
+    reward: jax.Array
+    done: jax.Array
+    info: dict[str, jax.Array]
+
+
+class PreparedSkillScenario(NamedTuple):
+    """Craftax state and target metadata produced by scenario preparation."""
+
+    state: Any
     target_direction: jax.Array
 
 
@@ -39,35 +61,29 @@ class SkillEnvironment:
     bundle: CraftaxBundle
     goal: SkillGoal
 
-    def reset(self, rng: jax.Array) -> tuple[jax.Array, SkillEpisodeState]:
+    def reset(self, rng: jax.Array) -> SkillReset:
         world_rng, scenario_rng = jax.random.split(rng)
         _, state = self.bundle.env.reset(world_rng, self.bundle.params)
-        state, target_direction = prepare_skill_scenario(
+        scenario = prepare_skill_scenario(
             state,
             self.goal,
             scenario_rng,
         )
-        observation = self.bundle.env.get_obs(state)
+        observation = self.bundle.env.get_obs(scenario.state)
         episode_state = SkillEpisodeState(
-            env_state=state,
-            initial_metric=skill_metric(self.goal.skill_id, state),
+            env_state=scenario.state,
+            initial_metric=skill_metric(self.goal.skill_id, scenario.state),
             steps=jnp.array(0, dtype=jnp.int32),
-            target_direction=target_direction,
+            target_direction=scenario.target_direction,
         )
-        return observation, episode_state
+        return SkillReset(observation=observation, state=episode_state)
 
     def step(
         self,
         rng: jax.Array,
         state: SkillEpisodeState,
         action: jax.Array,
-    ) -> tuple[
-        jax.Array,
-        SkillEpisodeState,
-        jax.Array,
-        jax.Array,
-        dict[str, jax.Array],
-    ]:
+    ) -> SkillStep:
         previous_metric = skill_metric(self.goal.skill_id, state.env_state)
         precondition = skill_precondition(self.goal, state.env_state)
         observation, env_state, native_reward, env_done, info = self.bundle.env.step(
@@ -86,7 +102,7 @@ class SkillEnvironment:
         reward = (success & ~previous_success).astype(jnp.float32)
         timeout = (steps >= self.goal.effective_horizon) & ~success
         done = env_done | success | timeout
-        next_state = state.replace(env_state=env_state, steps=steps)
+        next_state = state._replace(env_state=env_state, steps=steps)
         skill_info = {
             **info,
             "native_reward": native_reward,
@@ -99,7 +115,13 @@ class SkillEnvironment:
             ),
             "skill_precondition": precondition,
         }
-        return observation, next_state, reward, done, skill_info
+        return SkillStep(
+            observation=observation,
+            state=next_state,
+            reward=reward,
+            done=done,
+            info=skill_info,
+        )
 
 
 def _clear_mobs(state: Any) -> Any:
@@ -119,7 +141,7 @@ def prepare_skill_scenario(
     state: Any,
     goal: SkillGoal,
     rng: jax.Array,
-) -> tuple[Any, jax.Array]:
+) -> PreparedSkillScenario:
     """Inject a valid nearby target while retaining real Craftax dynamics."""
 
     if goal.quantity != 1:
@@ -165,7 +187,7 @@ def prepare_skill_scenario(
         clean_map = clean_map.at[target_position[0], target_position[1]].set(
             BlockType.STONE.value
         )
-        inventory = inventory.replace(wood_pickaxe=1)
+        inventory = replace(inventory, wood_pickaxe=1)
         player_direction = target_direction % 4 + 1
     elif skill_id is SkillId.DRINK_WATER:
         clean_map = clean_map.at[target_position[0], target_position[1]].set(
@@ -174,7 +196,7 @@ def prepare_skill_scenario(
         player_drink = 5
         player_direction = target_direction % 4 + 1
     elif skill_id is SkillId.PLACE_TABLE:
-        inventory = inventory.replace(wood=2)
+        inventory = replace(inventory, wood=2)
     elif skill_id in {
         SkillId.CRAFT_WOOD_PICKAXE,
         SkillId.CRAFT_WOOD_SWORD,
@@ -182,7 +204,7 @@ def prepare_skill_scenario(
         clean_map = clean_map.at[target_position[0], target_position[1]].set(
             BlockType.CRAFTING_TABLE.value
         )
-        inventory = inventory.replace(wood=1)
+        inventory = replace(inventory, wood=1)
     else:
         raise AssertionError(f"Unhandled skill: {skill_id}")
 
@@ -205,7 +227,7 @@ def prepare_skill_scenario(
         timestep=0,
         light_level=1.0,
     )
-    return state, target_direction
+    return PreparedSkillScenario(state=state, target_direction=target_direction)
 
 
 def make_skill_environment(
@@ -221,7 +243,8 @@ def make_skill_environment(
         auto_reset=False,
         max_episode_steps=max(128, horizon + 1),
     )
-    params = bundle.params.replace(
+    params = replace(
+        bundle.params,
         spawn_cow_chance=0.0,
         spawn_zombie_base_chance=0.0,
         spawn_zombie_night_chance=0.0,
@@ -234,7 +257,7 @@ def reset_skill_batch(
     environment: SkillEnvironment,
     rng: jax.Array,
     num_envs: int,
-) -> tuple[jax.Array, SkillEpisodeState]:
+) -> SkillReset:
     """Reset a vector of independent skill scenarios."""
 
     reset_keys = jax.random.split(rng, num_envs)
@@ -246,13 +269,7 @@ def step_skill_batch(
     rng: jax.Array,
     state: SkillEpisodeState,
     action: jax.Array,
-) -> tuple[
-    jax.Array,
-    SkillEpisodeState,
-    jax.Array,
-    jax.Array,
-    dict[str, jax.Array],
-]:
+) -> SkillStep:
     """Step a vector of independent skill scenarios."""
 
     step_keys = jax.random.split(rng, action.shape[0])

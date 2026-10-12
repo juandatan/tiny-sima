@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +27,7 @@ from tiny_sima.evaluation.gpu_monitor import (
 from tiny_sima.executor.checkpoints import save_checkpoint
 from tiny_sima.executor.model import (
     ActorCriticRNN,
+    apply_actor_critic,
     categorical_entropy,
     categorical_log_probability,
     initial_hidden,
@@ -57,6 +59,34 @@ class RunnerState(NamedTuple):
     completed_return_sum: jax.Array
     completed_length_sum: jax.Array
     completed_episodes: jax.Array
+
+
+class GAECarry(NamedTuple):
+    """Values propagated backward while calculating GAE."""
+
+    advantage: jax.Array
+    next_value: jax.Array
+    next_done: jax.Array
+
+
+class Minibatch(NamedTuple):
+    """One recurrent PPO minibatch."""
+
+    hidden: jax.Array
+    transitions: Transition
+    advantages: jax.Array
+    targets: jax.Array
+
+
+class OptimizationCarry(NamedTuple):
+    """Optimizer state and RNG carried between PPO epochs."""
+
+    train_state: TrainState
+    rng: jax.Array
+
+
+UpdateMetrics = dict[str, jax.Array]
+UpdateFunction = Callable[[RunnerState], tuple[RunnerState, UpdateMetrics]]
 
 
 def create_train_state(
@@ -127,20 +157,36 @@ def _calculate_gae(
     config: PPOConfig,
 ) -> tuple[jax.Array, jax.Array]:
     def step(
-        carry: tuple[jax.Array, jax.Array, jax.Array],
+        carry: GAECarry,
         transition: Transition,
-    ):
-        gae, next_value, next_done = carry
-        not_done = 1.0 - next_done.astype(jnp.float32)
+    ) -> tuple[GAECarry, jax.Array]:
+        not_done = 1.0 - carry.next_done.astype(jnp.float32)
         delta = (
-            transition.reward + config.gamma * next_value * not_done - transition.value
+            transition.reward
+            + config.gamma * carry.next_value * not_done
+            - transition.value
         )
-        gae = delta + config.gamma * config.gae_lambda * not_done * gae
-        return (gae, transition.value, transition.reset), gae
+        advantage = (
+            delta
+            + config.gamma
+            * config.gae_lambda
+            * not_done
+            * carry.advantage
+        )
+        next_carry = GAECarry(
+            advantage=advantage,
+            next_value=transition.value,
+            next_done=transition.reset,
+        )
+        return next_carry, advantage
 
-    (_, _, _), advantages = jax.lax.scan(
+    _, advantages = jax.lax.scan(
         step,
-        (jnp.zeros_like(last_value), last_value, last_done),
+        GAECarry(
+            advantage=jnp.zeros_like(last_value),
+            next_value=last_value,
+            next_done=last_done,
+        ),
         transitions,
         reverse=True,
     )
@@ -151,15 +197,15 @@ def make_update(
     config: PPOConfig,
     vector_env: VectorizedCraftax,
     model: ActorCriticRNN,
-):
+) -> UpdateFunction:
     """Build one compiled rollout-and-update function."""
 
-    def update(runner: RunnerState) -> tuple[RunnerState, dict[str, jax.Array]]:
+    def update(runner: RunnerState) -> tuple[RunnerState, UpdateMetrics]:
         initial_recurrent_state = runner.hidden
 
         def collect_step(
             current: RunnerState,
-            _: None,
+            _unused: None,
         ) -> tuple[RunnerState, Transition]:
             rng, action_rng, env_rng = jax.random.split(current.rng, 3)
 
@@ -167,33 +213,34 @@ def make_update(
                 current.observation[None, ...],
                 current.done[None, ...],
             )
-            hidden, logits, value = model.apply(
+            model_output = apply_actor_critic(
+                model,
                 current.train_state.params,
                 current.hidden,
                 network_input,
             )
-            logits = logits[0]
-            value = value[0]
+            logits = model_output.logits[0]
+            value = model_output.value[0]
             action = jax.random.categorical(action_rng, logits, axis=-1)
             log_probability = categorical_log_probability(logits, action)
 
-            observation, env_state, reward, done, _ = vector_env.step(
+            env_step = vector_env.step(
                 env_rng,
                 current.env_state,
                 action,
             )
 
-            episode_return = current.episode_return + reward
+            episode_return = current.episode_return + env_step.reward
             episode_length = current.episode_length + 1
-            completed_return = jnp.where(done, episode_return, 0.0)
-            completed_length = jnp.where(done, episode_length, 0)
+            completed_return = jnp.where(env_step.done, episode_return, 0.0)
+            completed_length = jnp.where(env_step.done, episode_length, 0)
 
             transition = Transition(
                 reset=current.done,
-                done=done,
+                done=env_step.done,
                 action=action,
                 value=value,
-                reward=reward,
+                reward=env_step.reward,
                 log_probability=log_probability,
                 observation=current.observation,
                 completed_return=completed_return,
@@ -201,20 +248,30 @@ def make_update(
             )
             next_runner = RunnerState(
                 train_state=current.train_state,
-                env_state=env_state,
-                observation=observation,
-                done=done,
-                hidden=hidden,
+                env_state=env_step.state,
+                observation=env_step.observation,
+                done=env_step.done,
+                hidden=model_output.hidden,
                 rng=rng,
-                episode_return=jnp.where(done, 0.0, episode_return),
-                episode_length=jnp.where(done, 0, episode_length),
+                episode_return=jnp.where(
+                    env_step.done,
+                    0.0,
+                    episode_return,
+                ),
+                episode_length=jnp.where(
+                    env_step.done,
+                    0,
+                    episode_length,
+                ),
                 completed_return_sum=(
                     current.completed_return_sum + completed_return.sum()
                 ),
                 completed_length_sum=(
                     current.completed_length_sum + completed_length.sum()
                 ),
-                completed_episodes=current.completed_episodes + done.sum(),
+                completed_episodes=(
+                    current.completed_episodes + env_step.done.sum()
+                ),
             )
             return next_runner, transition
 
@@ -229,14 +286,15 @@ def make_update(
             runner.observation[None, ...],
             runner.done[None, ...],
         )
-        _, _, last_value = model.apply(
+        last_model_output = apply_actor_critic(
+            model,
             runner.train_state.params,
             runner.hidden,
             network_input,
         )
         advantages, targets = _calculate_gae(
             transitions,
-            last_value[0],
+            last_model_output.value[0],
             runner.done,
             config,
         )
@@ -247,8 +305,9 @@ def make_update(
             minibatch_transitions: Transition,
             minibatch_advantages: jax.Array,
             minibatch_targets: jax.Array,
-        ):
-            _, logits, values = model.apply(
+        ) -> tuple[jax.Array, UpdateMetrics]:
+            model_output = apply_actor_critic(
+                model,
                 params,
                 minibatch_hidden,
                 (
@@ -257,16 +316,18 @@ def make_update(
                 ),
             )
             log_probability = categorical_log_probability(
-                logits,
+                model_output.logits,
                 minibatch_transitions.action,
             )
 
             value_clipped = minibatch_transitions.value + jnp.clip(
-                values - minibatch_transitions.value,
+                model_output.value - minibatch_transitions.value,
                 -config.clip_epsilon,
                 config.clip_epsilon,
             )
-            value_loss_unclipped = jnp.square(values - minibatch_targets)
+            value_loss_unclipped = jnp.square(
+                model_output.value - minibatch_targets
+            )
             value_loss_clipped = jnp.square(value_clipped - minibatch_targets)
             value_loss = (
                 0.5
@@ -295,7 +356,7 @@ def make_update(
                 actor_loss_clipped,
             ).mean()
 
-            entropy = categorical_entropy(logits).mean()
+            entropy = categorical_entropy(model_output.logits).mean()
             total_loss = (
                 actor_loss
                 + config.value_coefficient * value_loss
@@ -315,36 +376,24 @@ def make_update(
 
         def update_minibatch(
             train_state: TrainState,
-            minibatch: tuple[
-                jax.Array,
-                Transition,
-                jax.Array,
-                jax.Array,
-            ],
-        ):
-            (
-                minibatch_hidden,
-                minibatch_transitions,
-                minibatch_advantages,
-                minibatch_targets,
-            ) = minibatch
+            minibatch: Minibatch,
+        ) -> tuple[TrainState, UpdateMetrics]:
             gradient_function = jax.value_and_grad(loss, has_aux=True)
             (_, metrics), gradients = gradient_function(
                 train_state.params,
-                minibatch_hidden,
-                minibatch_transitions,
-                minibatch_advantages,
-                minibatch_targets,
+                minibatch.hidden,
+                minibatch.transitions,
+                minibatch.advantages,
+                minibatch.targets,
             )
             train_state = train_state.apply_gradients(grads=gradients)
             return train_state, metrics
 
         def update_epoch(
-            carry: tuple[TrainState, jax.Array],
-            _: None,
-        ):
-            train_state, rng = carry
-            rng, permutation_rng = jax.random.split(rng)
+            carry: OptimizationCarry,
+            _unused: None,
+        ) -> tuple[OptimizationCarry, UpdateMetrics]:
+            rng, permutation_rng = jax.random.split(carry.rng)
             permutation = jax.random.permutation(
                 permutation_rng,
                 config.num_envs,
@@ -372,20 +421,27 @@ def make_update(
 
             train_state, metrics = jax.lax.scan(
                 update_minibatch,
-                train_state,
-                (
-                    minibatch_hidden,
-                    minibatch_transitions,
-                    minibatch_advantages,
-                    minibatch_targets,
+                carry.train_state,
+                Minibatch(
+                    hidden=minibatch_hidden,
+                    transitions=minibatch_transitions,
+                    advantages=minibatch_advantages,
+                    targets=minibatch_targets,
                 ),
             )
             metrics = jax.tree_util.tree_map(jnp.mean, metrics)
-            return (train_state, rng), metrics
+            next_carry = OptimizationCarry(
+                train_state=train_state,
+                rng=rng,
+            )
+            return next_carry, metrics
 
-        (train_state, rng), optimization_metrics = jax.lax.scan(
+        optimization, optimization_metrics = jax.lax.scan(
             update_epoch,
-            (runner.train_state, runner.rng),
+            OptimizationCarry(
+                train_state=runner.train_state,
+                rng=runner.rng,
+            ),
             None,
             length=config.update_epochs,
         )
@@ -402,10 +458,13 @@ def make_update(
             "completed_length_sum": transitions.completed_length.sum(),
         }
         metrics = {**optimization_metrics, **rollout_metrics}
-        runner = runner._replace(train_state=train_state, rng=rng)
+        runner = runner._replace(
+            train_state=optimization.train_state,
+            rng=optimization.rng,
+        )
         return runner, metrics
 
-    return jax.jit(update)
+    return cast(UpdateFunction, jax.jit(update))
 
 
 def _host_metrics(metrics: dict[str, jax.Array]) -> dict[str, float]:

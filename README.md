@@ -148,6 +148,7 @@ Run the automated checks:
 
 ```bash
 pytest
+pyright
 ruff check .
 ```
 

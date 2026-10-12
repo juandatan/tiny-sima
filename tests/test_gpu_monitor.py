@@ -65,7 +65,7 @@ def test_monitor_summarizes_steady_state_window(tmp_path: Path) -> None:
 
 def test_jax_allocator_summary_converts_byte_fields() -> None:
     class FakeDevice:
-        def memory_stats(self):
+        def memory_stats(self) -> dict[str, int]:
             return {
                 "bytes_in_use": 10 * 1024**2,
                 "peak_bytes_in_use": 20 * 1024**2,

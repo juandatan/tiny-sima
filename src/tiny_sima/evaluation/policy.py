@@ -6,7 +6,7 @@ import argparse
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -17,9 +17,29 @@ from tiny_sima.envs.craftax import make_environment, reset_batch, step_batch
 from tiny_sima.executor.checkpoints import load_checkpoint
 from tiny_sima.executor.model import (
     ActorCriticRNN,
+    apply_actor_critic,
     initial_hidden,
     initialize_parameters,
 )
+
+
+class EvaluationRolloutCarry(NamedTuple):
+    """Dynamic state carried through checkpoint evaluation."""
+
+    rng: jax.Array
+    env_state: Any
+    observation: jax.Array
+    done: jax.Array
+    hidden: jax.Array
+    episode_return: jax.Array
+    episode_length: jax.Array
+
+
+class CompletedEpisodes(NamedTuple):
+    """Episode metrics emitted by each vectorized environment step."""
+
+    episode_return: jax.Array
+    episode_length: jax.Array
 
 
 def evaluate_policy(
@@ -50,80 +70,91 @@ def evaluate_policy(
     batches_needed = math.ceil(num_episodes / num_envs)
     rollout_steps = config.max_episode_steps * batches_needed
 
-    def rollout(rng: jax.Array):
+    def rollout(rng: jax.Array) -> CompletedEpisodes:
         rng, reset_rng = jax.random.split(rng)
         observation, env_state = reset_batch(bundle, reset_rng, num_envs)
-        hidden = initial_hidden(num_envs, config.hidden_size)
-        done = jnp.zeros((num_envs,), dtype=jnp.bool_)
-        episode_return = jnp.zeros((num_envs,), dtype=jnp.float32)
-        episode_length = jnp.zeros((num_envs,), dtype=jnp.int32)
+        initial_carry = EvaluationRolloutCarry(
+            rng=rng,
+            env_state=env_state,
+            observation=observation,
+            done=jnp.zeros((num_envs,), dtype=jnp.bool_),
+            hidden=initial_hidden(num_envs, config.hidden_size),
+            episode_return=jnp.zeros((num_envs,), dtype=jnp.float32),
+            episode_length=jnp.zeros((num_envs,), dtype=jnp.int32),
+        )
 
-        def step(carry, _):
-            (
-                rng,
-                env_state,
-                observation,
-                done,
-                hidden,
-                episode_return,
-                episode_length,
-            ) = carry
-            rng, action_rng, env_rng = jax.random.split(rng, 3)
-            hidden, logits, _ = model.apply(
+        def step(
+            carry: EvaluationRolloutCarry,
+            _unused: None,
+        ) -> tuple[EvaluationRolloutCarry, CompletedEpisodes]:
+            rng, action_rng, env_rng = jax.random.split(carry.rng, 3)
+            model_output = apply_actor_critic(
+                model,
                 params,
-                hidden,
-                (observation[None, ...], done[None, ...]),
+                carry.hidden,
+                (
+                    carry.observation[None, ...],
+                    carry.done[None, ...],
+                ),
             )
-            logits = logits[0]
+            logits = model_output.logits[0]
             if deterministic:
                 action = jnp.argmax(logits, axis=-1)
             else:
                 action = jax.random.categorical(action_rng, logits, axis=-1)
 
-            observation, env_state, reward, done, _ = step_batch(
+            env_step = step_batch(
                 bundle,
                 env_rng,
-                env_state,
+                carry.env_state,
                 action,
             )
-            episode_return = episode_return + reward
-            episode_length = episode_length + 1
-            completed_return = jnp.where(done, episode_return, jnp.nan)
+            episode_return = carry.episode_return + env_step.reward
+            episode_length = carry.episode_length + 1
+            completed_return = jnp.where(
+                env_step.done,
+                episode_return,
+                jnp.nan,
+            )
             completed_length = jnp.where(
-                done,
+                env_step.done,
                 episode_length.astype(jnp.float32),
                 jnp.nan,
             )
-            next_carry = (
-                rng,
-                env_state,
-                observation,
-                done,
-                hidden,
-                jnp.where(done, 0.0, episode_return),
-                jnp.where(done, 0, episode_length),
+            next_carry = EvaluationRolloutCarry(
+                rng=rng,
+                env_state=env_step.state,
+                observation=env_step.observation,
+                done=env_step.done,
+                hidden=model_output.hidden,
+                episode_return=jnp.where(
+                    env_step.done,
+                    0.0,
+                    episode_return,
+                ),
+                episode_length=jnp.where(
+                    env_step.done,
+                    0,
+                    episode_length,
+                ),
             )
-            return next_carry, (completed_return, completed_length)
+            completed = CompletedEpisodes(
+                episode_return=completed_return,
+                episode_length=completed_length,
+            )
+            return next_carry, completed
 
         _, completed = jax.lax.scan(
             step,
-            (
-                rng,
-                env_state,
-                observation,
-                done,
-                hidden,
-                episode_return,
-                episode_length,
-            ),
+            initial_carry,
             None,
             length=rollout_steps,
         )
         return completed
 
-    completed_return, completed_length = jax.jit(rollout)(jax.random.PRNGKey(seed))
-    completed_return = np.asarray(completed_return).reshape(-1)
-    completed_length = np.asarray(completed_length).reshape(-1)
+    completed = jax.jit(rollout)(jax.random.PRNGKey(seed))
+    completed_return = np.asarray(completed.episode_return).reshape(-1)
+    completed_length = np.asarray(completed.episode_length).reshape(-1)
     valid = ~np.isnan(completed_return)
     returns = completed_return[valid][:num_episodes]
     lengths = completed_length[valid][:num_episodes]

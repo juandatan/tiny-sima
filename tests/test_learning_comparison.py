@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 
 from tiny_sima.config import PPOConfig
 from tiny_sima.learning_comparison import (
@@ -31,7 +32,11 @@ def test_make_comparison_config_keeps_total_steps_fixed(tmp_path: Path) -> None:
     assert config.checkpoint_every == 0
 
 
-def _record(num_envs: int, seed: int, evaluation_return: float):
+def _record(
+    num_envs: int,
+    seed: int,
+    evaluation_return: float,
+) -> dict[str, Any]:
     return {
         "num_envs": num_envs,
         "training_seed": seed,

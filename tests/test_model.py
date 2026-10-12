@@ -3,6 +3,7 @@ import jax.numpy as jnp
 
 from tiny_sima.executor.model import (
     ActorCriticRNN,
+    apply_actor_critic,
     categorical_entropy,
     categorical_log_probability,
     initial_hidden,
@@ -22,17 +23,18 @@ def test_actor_critic_shapes_and_finite_outputs() -> None:
     observations = jnp.zeros((5, 3, 19), dtype=jnp.float32)
     resets = jnp.zeros((5, 3), dtype=jnp.bool_)
 
-    next_hidden, logits, values = model.apply(
+    output = apply_actor_critic(
+        model,
         params,
         hidden,
         (observations, resets),
     )
 
-    assert next_hidden.shape == (3, 32)
-    assert logits.shape == (5, 3, 7)
-    assert values.shape == (5, 3)
-    assert jnp.isfinite(logits).all()
-    assert jnp.isfinite(values).all()
+    assert output.hidden.shape == (3, 32)
+    assert output.logits.shape == (5, 3, 7)
+    assert output.value.shape == (5, 3)
+    assert jnp.isfinite(output.logits).all()
+    assert jnp.isfinite(output.value).all()
 
 
 def test_categorical_helpers() -> None:

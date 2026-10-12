@@ -1,3 +1,5 @@
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -18,7 +20,7 @@ from tiny_sima.goals import (
 )
 
 
-def _initial_state():
+def _initial_state() -> Any:
     bundle = make_environment(
         "Craftax-Classic-Symbolic-v1",
         auto_reset=False,

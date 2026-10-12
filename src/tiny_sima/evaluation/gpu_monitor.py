@@ -165,7 +165,12 @@ class NvidiaSmiMonitor:
         "utilization.memory,power.draw"
     )
 
-    def __init__(self, *, enabled: bool = True, interval_seconds: float = 0.5):
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        interval_seconds: float = 0.5,
+    ) -> None:
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be positive.")
         self.enabled = enabled

@@ -90,7 +90,7 @@ def evaluate_skill_policy(
 
         def step(
             carry: SkillRolloutCarry,
-            _: None,
+            _unused: None,
         ) -> tuple[SkillRolloutCarry, None]:
             rng, action_rng, step_rng = jax.random.split(carry.rng, 3)
             if policy == "scripted":
@@ -103,7 +103,7 @@ def evaluate_skill_policy(
                     maxval=environment.bundle.spec.num_actions,
                 )
 
-            _, state, reward, done, info = step_skill_batch(
+            result = step_skill_batch(
                 environment,
                 step_rng,
                 carry.state,
@@ -112,10 +112,13 @@ def evaluate_skill_policy(
             active = ~carry.finished
             next_carry = SkillRolloutCarry(
                 rng=rng,
-                state=state,
-                finished=carry.finished | done,
-                succeeded=carry.succeeded | (active & info["skill_success"]),
-                episode_return=carry.episode_return + reward * active,
+                state=result.state,
+                finished=carry.finished | result.done,
+                succeeded=(
+                    carry.succeeded
+                    | (active & result.info["skill_success"])
+                ),
+                episode_return=carry.episode_return + result.reward * active,
                 episode_length=(
                     carry.episode_length + active.astype(jnp.int32)
                 ),

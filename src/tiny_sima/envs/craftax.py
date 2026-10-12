@@ -33,6 +33,23 @@ class CraftaxBundle:
     spec: EnvironmentSpec
 
 
+class EnvironmentReset(NamedTuple):
+    """Observation and state returned by an environment reset."""
+
+    observation: jax.Array
+    state: Any
+
+
+class EnvironmentStep(NamedTuple):
+    """Values returned by a vectorized environment step."""
+
+    observation: jax.Array
+    state: Any
+    reward: jax.Array
+    done: jax.Array
+    info: dict[str, jax.Array]
+
+
 @dataclass(frozen=True)
 class VectorizedCraftax:
     """A batched environment with optional efficient optimistic resets."""
@@ -45,7 +62,7 @@ class VectorizedCraftax:
     def spec(self) -> EnvironmentSpec:
         return self.bundle.spec
 
-    def reset(self, rng: jax.Array) -> tuple[jax.Array, Any]:
+    def reset(self, rng: jax.Array) -> EnvironmentReset:
         return reset_batch(self.bundle, rng, self.num_envs)
 
     def step(
@@ -53,7 +70,7 @@ class VectorizedCraftax:
         rng: jax.Array,
         state: Any,
         action: jax.Array,
-    ) -> tuple[jax.Array, Any, jax.Array, jax.Array, dict[str, jax.Array]]:
+    ) -> EnvironmentStep:
         if self.optimistic_reset_ratio is None:
             return step_batch(self.bundle, rng, state, action)
         return optimistic_step_batch(
@@ -77,6 +94,13 @@ class BenchmarkResult(NamedTuple):
     steps_per_second: float
 
 
+class BenchmarkCarry(NamedTuple):
+    """Dynamic state carried through a benchmark rollout."""
+
+    rng: jax.Array
+    state: Any
+
+
 def make_environment(
     env_name: str = "Craftax-Classic-Symbolic-v1",
     *,
@@ -85,8 +109,8 @@ def make_environment(
 ) -> CraftaxBundle:
     """Create a Craftax environment and describe its observation/action spaces."""
 
-    env = make_craftax_env_from_name(env_name, auto_reset=auto_reset)
-    params = env.default_params
+    env: Any = make_craftax_env_from_name(env_name, auto_reset=auto_reset)
+    params: Any = env.default_params
     if max_episode_steps is not None:
         if not hasattr(params, "replace"):
             raise TypeError("Craftax environment parameters do not support replace().")
@@ -108,11 +132,15 @@ def reset_batch(
     bundle: CraftaxBundle,
     rng: jax.Array,
     num_envs: int,
-) -> tuple[jax.Array, Any]:
+) -> EnvironmentReset:
     """Reset a batch of independent environments."""
 
     reset_keys = jax.random.split(rng, num_envs)
-    return jax.vmap(bundle.env.reset, in_axes=(0, None))(reset_keys, bundle.params)
+    observation, state = jax.vmap(bundle.env.reset, in_axes=(0, None))(
+        reset_keys,
+        bundle.params,
+    )
+    return EnvironmentReset(observation=observation, state=state)
 
 
 def step_batch(
@@ -120,15 +148,25 @@ def step_batch(
     rng: jax.Array,
     state: Any,
     action: jax.Array,
-) -> tuple[jax.Array, Any, jax.Array, jax.Array, dict[str, jax.Array]]:
+) -> EnvironmentStep:
     """Step a batch of independent environments."""
 
     step_keys = jax.random.split(rng, action.shape[0])
-    return jax.vmap(bundle.env.step, in_axes=(0, 0, 0, None))(
+    observation, state, reward, done, info = jax.vmap(
+        bundle.env.step,
+        in_axes=(0, 0, 0, None),
+    )(
         step_keys,
         state,
         action,
         bundle.params,
+    )
+    return EnvironmentStep(
+        observation=observation,
+        state=state,
+        reward=reward,
+        done=done,
+        info=info,
     )
 
 
@@ -139,7 +177,7 @@ def optimistic_step_batch(
     action: jax.Array,
     *,
     reset_ratio: int,
-) -> tuple[jax.Array, Any, jax.Array, jax.Array, dict[str, jax.Array]]:
+) -> EnvironmentStep:
     """Step non-auto-reset environments using a small shared reset pool.
 
     This follows the optimistic reset strategy used by the official Craftax
@@ -193,7 +231,11 @@ def optimistic_step_batch(
         )
     )(done, expanded_reset_observation, stepped_observation)
 
-    def select_state(terminal: jax.Array, reset_value: Any, stepped_value: Any):
+    def select_state(
+        terminal: jax.Array,
+        reset_value: Any,
+        stepped_value: Any,
+    ) -> Any:
         return jax.tree_util.tree_map(
             lambda reset_leaf, stepped_leaf: jax.lax.select(
                 terminal,
@@ -209,7 +251,13 @@ def optimistic_step_batch(
         expanded_reset_state,
         stepped_state,
     )
-    return observation, next_state, reward, done, info
+    return EnvironmentStep(
+        observation=observation,
+        state=next_state,
+        reward=reward,
+        done=done,
+        info=info,
+    )
 
 
 def make_vectorized_environment(
@@ -297,25 +345,28 @@ def benchmark_environment(
         rng, reset_rng = jax.random.split(rng)
         observation, state = vector_env.reset(reset_rng)
 
-        def step(carry: tuple[jax.Array, Any], _: None):
-            step_rng, env_state = carry
-            step_rng, action_rng, env_rng = jax.random.split(step_rng, 3)
+        def step(
+            carry: BenchmarkCarry,
+            _unused: None,
+        ) -> tuple[BenchmarkCarry, jax.Array]:
+            rng, action_rng, env_rng = jax.random.split(carry.rng, 3)
             action = jax.random.randint(
                 action_rng,
                 shape=(num_envs,),
                 minval=0,
                 maxval=vector_env.spec.num_actions,
             )
-            next_observation, next_state, _, _, _ = vector_env.step(
+            result = vector_env.step(
                 env_rng,
-                env_state,
+                carry.state,
                 action,
             )
-            return (step_rng, next_state), next_observation
+            next_carry = BenchmarkCarry(rng=rng, state=result.state)
+            return next_carry, result.observation
 
-        (_, _), observations = jax.lax.scan(
+        _, observations = jax.lax.scan(
             step,
-            (rng, state),
+            BenchmarkCarry(rng=rng, state=state),
             None,
             length=num_steps,
         )
