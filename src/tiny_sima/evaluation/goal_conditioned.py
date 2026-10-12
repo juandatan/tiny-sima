@@ -10,6 +10,7 @@ from typing import Any, NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+from craftax.craftax_classic.constants import Action
 
 from tiny_sima.config import SkillPPOConfig, load_skill_config
 from tiny_sima.envs.skills import (
@@ -28,12 +29,24 @@ from tiny_sima.evaluation.skill_rollout import (
 from tiny_sima.executor.checkpoints import load_checkpoint
 from tiny_sima.executor.model import (
     apply_goal_conditioned_actor_critic,
+    categorical_entropy,
     initial_hidden,
     initialize_goal_conditioned_parameters,
     make_goal_conditioned_actor_critic,
     select_action,
 )
-from tiny_sima.goals import SKILL_IDS, SkillId, skill_index
+from tiny_sima.goals import (
+    SKILL_IDS,
+    SkillId,
+    get_skill_spec,
+    skill_index,
+)
+
+_TURN_THEN_INTERACT_SKILLS = {
+    SkillId.COLLECT_WOOD,
+    SkillId.COLLECT_STONE,
+    SkillId.DRINK_WATER,
+}
 
 
 class GoalEvaluationCarry(NamedTuple):
@@ -44,6 +57,260 @@ class GoalEvaluationCarry(NamedTuple):
     observation: jax.Array
     hidden: jax.Array
     tracker: SkillEpisodeTracker
+
+
+class ActionProbe(NamedTuple):
+    """Per-scenario action statistics at one controlled skill stage."""
+
+    top_action: jax.Array
+    top_action_correct: jax.Array
+    correct_action_probability: jax.Array
+    entropy: jax.Array
+
+
+class InteractionSkillProbe(NamedTuple):
+    """Action probes before and after an oracle supplies the correct turn."""
+
+    initial_turn: ActionProbe
+    after_oracle_turn: ActionProbe
+
+
+class LoadedGoalConditionedCheckpoint(NamedTuple):
+    """Parameters and configuration restored from one executor checkpoint."""
+
+    params: Any
+    config: SkillPPOConfig
+
+
+def _probe_actions(
+    logits: jax.Array,
+    correct_action: jax.Array,
+) -> ActionProbe:
+    probabilities = jax.nn.softmax(logits, axis=-1)
+    top_action = jnp.argmax(logits, axis=-1)
+    return ActionProbe(
+        top_action=top_action,
+        top_action_correct=top_action == correct_action,
+        correct_action_probability=jnp.take_along_axis(
+            probabilities,
+            correct_action[..., None],
+            axis=-1,
+        )[..., 0],
+        entropy=categorical_entropy(logits),
+    )
+
+
+def _action_name(action: int) -> str:
+    return Action(action).name.lower()
+
+
+def _summarize_action_probe(
+    probe: ActionProbe,
+    *,
+    target: str,
+    num_actions: int,
+) -> dict[str, Any]:
+    top_actions = np.asarray(probe.top_action)
+    action_values, action_counts = np.unique(top_actions, return_counts=True)
+    action_histogram = {
+        _action_name(int(action)): float(count / len(top_actions))
+        for action, count in zip(action_values, action_counts, strict=True)
+    }
+    mean_entropy = float(np.asarray(probe.entropy).mean())
+    return {
+        "target": target,
+        "top1_accuracy": float(np.asarray(probe.top_action_correct).mean()),
+        "mean_target_probability": float(
+            np.asarray(probe.correct_action_probability).mean()
+        ),
+        "mean_action_entropy": mean_entropy,
+        "normalized_action_entropy": (mean_entropy / float(np.log(num_actions))),
+        "top1_action_histogram": action_histogram,
+    }
+
+
+def diagnose_goal_conditioned_skill(
+    params: Any,
+    config: SkillPPOConfig,
+    skill_id: SkillId | str,
+    *,
+    num_scenarios: int = 256,
+    seed: int = 1,
+) -> dict[str, Any]:
+    """Probe action ranking at controlled stages of one requested skill."""
+
+    if num_scenarios < 1:
+        raise ValueError("num_scenarios must be positive.")
+
+    normalized_skill_id = SkillId(skill_id)
+    environment = make_skill_environment(
+        normalized_skill_id,
+        horizon=config.skill_horizon,
+    )
+    model = make_goal_conditioned_actor_critic(
+        num_actions=environment.bundle.spec.num_actions,
+        num_skills=len(SKILL_IDS),
+        hidden_size=config.hidden_size,
+        skill_embedding_size=config.skill_embedding_size,
+    )
+    categorical_skill_id = skill_index(normalized_skill_id)
+    skill_ids = jnp.full(
+        (num_scenarios,),
+        categorical_skill_id,
+        dtype=jnp.int32,
+    )
+
+    if normalized_skill_id in _TURN_THEN_INTERACT_SKILLS:
+
+        def probe_interaction(rng: jax.Array) -> InteractionSkillProbe:
+            reset_rng, step_rng = jax.random.split(rng)
+            reset = reset_skill_batch(
+                environment,
+                reset_rng,
+                num_scenarios,
+            )
+            hidden = initial_hidden(num_scenarios, config.hidden_size)
+            initial_output = apply_goal_conditioned_actor_critic(
+                model,
+                params,
+                hidden,
+                (
+                    reset.observation[None, ...],
+                    skill_ids[None, ...],
+                    jnp.zeros(
+                        (1, num_scenarios),
+                        dtype=jnp.bool_,
+                    ),
+                ),
+            )
+            correct_turn = reset.state.target_direction
+            initial_probe = _probe_actions(
+                initial_output.logits[0],
+                correct_turn,
+            )
+            oracle_step = step_skill_batch(
+                environment,
+                step_rng,
+                reset.state,
+                correct_turn,
+            )
+            followup_output = apply_goal_conditioned_actor_critic(
+                model,
+                params,
+                initial_output.hidden,
+                (
+                    oracle_step.observation[None, ...],
+                    skill_ids[None, ...],
+                    oracle_step.done[None, ...],
+                ),
+            )
+            correct_interaction = jnp.full(
+                (num_scenarios,),
+                Action.DO.value,
+                dtype=jnp.int32,
+            )
+            return InteractionSkillProbe(
+                initial_turn=initial_probe,
+                after_oracle_turn=_probe_actions(
+                    followup_output.logits[0],
+                    correct_interaction,
+                ),
+            )
+
+        probe = jax.jit(probe_interaction)(jax.random.PRNGKey(seed))
+        initial = _summarize_action_probe(
+            probe.initial_turn,
+            target="face_target",
+            num_actions=environment.bundle.spec.num_actions,
+        )
+        followup = _summarize_action_probe(
+            probe.after_oracle_turn,
+            target=_action_name(Action.DO.value),
+            num_actions=environment.bundle.spec.num_actions,
+        )
+        initial_correct = np.asarray(probe.initial_turn.top_action_correct)
+        followup_correct = np.asarray(probe.after_oracle_turn.top_action_correct)
+        estimated_sequence_probability = np.asarray(
+            probe.initial_turn.correct_action_probability
+            * probe.after_oracle_turn.correct_action_probability
+        )
+        return {
+            "skill_id": normalized_skill_id.value,
+            "skill_structure": "turn_then_interact",
+            "num_scenarios": num_scenarios,
+            "seed": seed,
+            "initial": initial,
+            "after_oracle_turn": followup,
+            "deterministic_sequence_accuracy": float(
+                (initial_correct & followup_correct).mean()
+            ),
+            "estimated_stochastic_sequence_probability": float(
+                estimated_sequence_probability.mean()
+            ),
+        }
+
+    correct_action_value = get_skill_spec(normalized_skill_id).interaction_action.value
+
+    def probe_direct(rng: jax.Array) -> ActionProbe:
+        reset = reset_skill_batch(
+            environment,
+            rng,
+            num_scenarios,
+        )
+        output = apply_goal_conditioned_actor_critic(
+            model,
+            params,
+            initial_hidden(num_scenarios, config.hidden_size),
+            (
+                reset.observation[None, ...],
+                skill_ids[None, ...],
+                jnp.zeros((1, num_scenarios), dtype=jnp.bool_),
+            ),
+        )
+        correct_action = jnp.full(
+            (num_scenarios,),
+            correct_action_value,
+            dtype=jnp.int32,
+        )
+        return _probe_actions(output.logits[0], correct_action)
+
+    direct_probe = jax.jit(probe_direct)(jax.random.PRNGKey(seed))
+    initial = _summarize_action_probe(
+        direct_probe,
+        target=_action_name(correct_action_value),
+        num_actions=environment.bundle.spec.num_actions,
+    )
+    return {
+        "skill_id": normalized_skill_id.value,
+        "skill_structure": "direct",
+        "num_scenarios": num_scenarios,
+        "seed": seed,
+        "initial": initial,
+        "after_oracle_turn": None,
+        "deterministic_sequence_accuracy": initial["top1_accuracy"],
+        "estimated_stochastic_sequence_probability": initial["mean_target_probability"],
+    }
+
+
+def diagnose_goal_conditioned_policy(
+    params: Any,
+    config: SkillPPOConfig,
+    *,
+    num_scenarios_per_skill: int = 256,
+    seed: int = 1,
+) -> list[dict[str, Any]]:
+    """Run controlled action probes for every requested skill."""
+
+    return [
+        diagnose_goal_conditioned_skill(
+            params,
+            config,
+            skill_id,
+            num_scenarios=num_scenarios_per_skill,
+            seed=seed + index,
+        )
+        for index, skill_id in enumerate(SKILL_IDS)
+    ]
 
 
 def evaluate_goal_conditioned_skill(
@@ -191,6 +458,36 @@ def evaluate_goal_conditioned_checkpoint(
 ) -> list[dict[str, Any]]:
     """Load and evaluate a saved goal-conditioned executor."""
 
+    checkpoint = _load_goal_conditioned_checkpoint(checkpoint_dir)
+    return evaluate_goal_conditioned_policy(
+        checkpoint.params,
+        checkpoint.config,
+        num_episodes_per_skill=num_episodes_per_skill,
+        seed=seed,
+        deterministic=deterministic,
+    )
+
+
+def diagnose_goal_conditioned_checkpoint(
+    checkpoint_dir: str | Path,
+    *,
+    num_scenarios_per_skill: int = 256,
+    seed: int = 1,
+) -> list[dict[str, Any]]:
+    """Load a checkpoint and probe its action ranking for every skill."""
+
+    checkpoint = _load_goal_conditioned_checkpoint(checkpoint_dir)
+    return diagnose_goal_conditioned_policy(
+        checkpoint.params,
+        checkpoint.config,
+        num_scenarios_per_skill=num_scenarios_per_skill,
+        seed=seed,
+    )
+
+
+def _load_goal_conditioned_checkpoint(
+    checkpoint_dir: str | Path,
+) -> LoadedGoalConditionedCheckpoint:
     checkpoint_path = Path(checkpoint_dir)
     config = load_skill_config(checkpoint_path / "config.yaml")
     environment = make_skill_environment(
@@ -209,12 +506,9 @@ def evaluate_goal_conditioned_checkpoint(
         environment.bundle.spec.observation_shape,
     )
     params, _ = load_checkpoint(checkpoint_path, template_params)
-    return evaluate_goal_conditioned_policy(
-        params,
-        config,
-        num_episodes_per_skill=num_episodes_per_skill,
-        seed=seed,
-        deterministic=deterministic,
+    return LoadedGoalConditionedCheckpoint(
+        params=params,
+        config=config,
     )
 
 

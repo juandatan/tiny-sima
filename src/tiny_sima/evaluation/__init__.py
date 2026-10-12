@@ -1,6 +1,9 @@
 """Policy evaluation helpers."""
 
 from tiny_sima.evaluation.goal_conditioned import (
+    diagnose_goal_conditioned_checkpoint,
+    diagnose_goal_conditioned_policy,
+    diagnose_goal_conditioned_skill,
     evaluate_goal_conditioned_checkpoint,
     evaluate_goal_conditioned_policy,
     evaluate_goal_conditioned_skill,
@@ -18,6 +21,9 @@ from tiny_sima.evaluation.skills import (
 
 __all__ = [
     "NvidiaSmiMonitor",
+    "diagnose_goal_conditioned_checkpoint",
+    "diagnose_goal_conditioned_policy",
+    "diagnose_goal_conditioned_skill",
     "evaluate_checkpoint",
     "evaluate_goal_conditioned_checkpoint",
     "evaluate_goal_conditioned_policy",

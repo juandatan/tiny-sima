@@ -4,6 +4,7 @@ import numpy as np
 from tiny_sima.config import SkillPPOConfig
 from tiny_sima.envs.skills import make_vectorized_skill_environment
 from tiny_sima.evaluation.goal_conditioned import (
+    diagnose_goal_conditioned_skill,
     evaluate_goal_conditioned_skill,
 )
 from tiny_sima.executor.model import GoalConditionedActorCriticRNN
@@ -77,6 +78,30 @@ def test_single_goal_conditioned_ppo_update() -> None:
     assert 1.0 <= evaluation["mean_episode_length"] <= config.skill_horizon
     assert 0.0 <= evaluation["feasible_timeout_rate"] <= 1.0
     assert 0.0 <= evaluation["precondition_lost_rate"] <= 1.0
+
+    diagnostic = diagnose_goal_conditioned_skill(
+        updated_runner.train_state.params,
+        config,
+        "collect_wood",
+        num_scenarios=2,
+        seed=5,
+    )
+    assert diagnostic["skill_structure"] == "turn_then_interact"
+    assert diagnostic["initial"]["target"] == "face_target"
+    assert diagnostic["after_oracle_turn"]["target"] == "do"
+    assert 0.0 <= diagnostic["initial"]["top1_accuracy"] <= 1.0
+    assert 0.0 <= diagnostic["estimated_stochastic_sequence_probability"] <= 1.0
+
+    direct_diagnostic = diagnose_goal_conditioned_skill(
+        updated_runner.train_state.params,
+        config,
+        "place_table",
+        num_scenarios=2,
+        seed=6,
+    )
+    assert direct_diagnostic["skill_structure"] == "direct"
+    assert direct_diagnostic["initial"]["target"] == "place_table"
+    assert direct_diagnostic["after_oracle_turn"] is None
 
 
 def test_stratified_minibatches_include_every_skill() -> None:

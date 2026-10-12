@@ -634,6 +634,9 @@ Started on October 12, 2026:
   normalization. The latter is disabled by default after a debug ablation
   showed that it collapsed unsolved interaction skills.
 - Added side-by-side deterministic and stochastic checkpoint evaluation.
+- Added controlled action diagnostics for initial target-facing accuracy,
+  follow-up interaction accuracy after an oracle turn, direct-action accuracy,
+  target-action probability, and per-stage policy entropy.
 
 The next step is to rerun the goal-conditioned baseline with balanced metrics,
 then add progressively less-structured starting states.
