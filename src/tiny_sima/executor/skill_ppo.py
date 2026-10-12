@@ -39,6 +39,8 @@ from tiny_sima.executor.ppo_common import (
     calculate_gae,
     clipped_ppo_loss,
     create_train_state,
+    normalize_advantages_by_group,
+    stratified_minibatch_indices,
 )
 from tiny_sima.executor.training import run_training_loop, save_final_run
 from tiny_sima.goals import SKILL_IDS
@@ -58,6 +60,9 @@ class SkillTransition(NamedTuple):
     completed_success: jax.Array
     completed_episode: jax.Array
     completed_length: jax.Array
+    completed_feasible_timeout: jax.Array
+    completed_precondition_loss: jax.Array
+    completed_environment_termination: jax.Array
 
 
 class SkillRunnerState(NamedTuple):
@@ -71,9 +76,13 @@ class SkillRunnerState(NamedTuple):
     hidden: jax.Array
     rng: jax.Array
     episode_length: jax.Array
+    episode_precondition_lost: jax.Array
     completed_successes: jax.Array
     completed_episodes: jax.Array
     completed_length_sum: jax.Array
+    completed_feasible_timeouts: jax.Array
+    completed_precondition_losses: jax.Array
+    completed_environment_terminations: jax.Array
 
 
 UpdateFunction = Callable[
@@ -95,7 +104,8 @@ def _format_progress(
     return (
         f"update={update_index}/{record['total_updates']} "
         f"steps={timesteps} "
-        f"success={metrics['success_rate']:.3f} "
+        f"macro_success={metrics['macro_success_rate']:.3f} "
+        f"weighted_success={metrics['success_rate']:.3f} "
         f"sps={record['steps_per_second_including_compile']:.0f}"
     )
 
@@ -128,9 +138,25 @@ def initialize_skill_runner(
         hidden=initial_hidden(config.num_envs, config.hidden_size),
         rng=runner_rng,
         episode_length=jnp.zeros((config.num_envs,), dtype=jnp.int32),
+        episode_precondition_lost=jnp.zeros(
+            (config.num_envs,),
+            dtype=jnp.bool_,
+        ),
         completed_successes=jnp.zeros((num_skills,), dtype=jnp.int32),
         completed_episodes=jnp.zeros((num_skills,), dtype=jnp.int32),
         completed_length_sum=jnp.zeros((num_skills,), dtype=jnp.int32),
+        completed_feasible_timeouts=jnp.zeros(
+            (num_skills,),
+            dtype=jnp.int32,
+        ),
+        completed_precondition_losses=jnp.zeros(
+            (num_skills,),
+            dtype=jnp.int32,
+        ),
+        completed_environment_terminations=jnp.zeros(
+            (num_skills,),
+            dtype=jnp.int32,
+        ),
     )
 
 
@@ -142,6 +168,11 @@ def make_skill_update(
     """Build one compiled goal-conditioned rollout-and-update function."""
 
     num_skills = environment.num_skills
+    if environment.envs_per_skill % config.num_minibatches:
+        raise ValueError(
+            "Goal-conditioned PPO requires envs_per_skill to be divisible "
+            "by num_minibatches so every minibatch contains every skill."
+        )
 
     def update(
         runner: SkillRunnerState,
@@ -179,6 +210,20 @@ def make_skill_update(
                 jnp.int32
             )
             completed_length = jnp.where(env_step.done, episode_length, 0)
+            episode_precondition_lost = (
+                current.episode_precondition_lost
+                | ~env_step.info["skill_precondition_after"]
+            )
+            failed = env_step.done & ~env_step.info["skill_success"]
+            completed_precondition_loss = (failed & episode_precondition_lost).astype(
+                jnp.int32
+            )
+            completed_feasible_timeout = (
+                failed & env_step.info["skill_timeout"] & ~episode_precondition_lost
+            ).astype(jnp.int32)
+            completed_environment_termination = (
+                failed & ~env_step.info["skill_timeout"] & ~episode_precondition_lost
+            ).astype(jnp.int32)
             skill_one_hot = jax.nn.one_hot(
                 current.skill_id,
                 num_skills,
@@ -197,6 +242,9 @@ def make_skill_update(
                 completed_success=completed_success,
                 completed_episode=completed_episode,
                 completed_length=completed_length,
+                completed_feasible_timeout=completed_feasible_timeout,
+                completed_precondition_loss=completed_precondition_loss,
+                completed_environment_termination=(completed_environment_termination),
             )
             next_runner = SkillRunnerState(
                 train_state=current.train_state,
@@ -211,6 +259,11 @@ def make_skill_update(
                     0,
                     episode_length,
                 ),
+                episode_precondition_lost=jnp.where(
+                    env_step.done,
+                    False,
+                    episode_precondition_lost,
+                ),
                 completed_successes=(
                     current.completed_successes
                     + (skill_one_hot * completed_success[:, None]).sum(axis=0)
@@ -222,6 +275,20 @@ def make_skill_update(
                 completed_length_sum=(
                     current.completed_length_sum
                     + (skill_one_hot * completed_length[:, None]).sum(axis=0)
+                ),
+                completed_feasible_timeouts=(
+                    current.completed_feasible_timeouts
+                    + (skill_one_hot * completed_feasible_timeout[:, None]).sum(axis=0)
+                ),
+                completed_precondition_losses=(
+                    current.completed_precondition_losses
+                    + (skill_one_hot * completed_precondition_loss[:, None]).sum(axis=0)
+                ),
+                completed_environment_terminations=(
+                    current.completed_environment_terminations
+                    + (skill_one_hot * completed_environment_termination[:, None]).sum(
+                        axis=0
+                    )
                 ),
             )
             return next_runner, transition
@@ -251,6 +318,12 @@ def make_skill_update(
             runner.done,
             config,
         )
+        if config.normalize_advantages_per_skill:
+            advantages = normalize_advantages_by_group(
+                advantages,
+                transitions.skill_id,
+                num_skills,
+            )
 
         def loss(
             params: Any,
@@ -277,6 +350,9 @@ def make_skill_update(
                     target=minibatch.targets,
                 ),
                 config,
+                group_ids=minibatch.transitions.skill_id,
+                num_groups=num_skills,
+                normalize_advantage=(not config.normalize_advantages_per_skill),
             )
 
         def update_minibatch(
@@ -298,13 +374,11 @@ def make_skill_update(
             _unused: None,
         ) -> tuple[OptimizationCarry, UpdateMetrics]:
             rng, permutation_rng = jax.random.split(carry.rng)
-            permutation = jax.random.permutation(
+            minibatch_indices = stratified_minibatch_indices(
                 permutation_rng,
-                config.num_envs,
-            )
-            minibatch_indices = permutation.reshape(
-                config.num_minibatches,
-                config.envs_per_minibatch,
+                num_groups=num_skills,
+                items_per_group=environment.envs_per_skill,
+                num_minibatches=config.num_minibatches,
             )
             minibatches = RecurrentMinibatch(
                 hidden=initial_recurrent_state[minibatch_indices],
@@ -350,8 +424,44 @@ def make_skill_update(
             jnp.mean,
             optimization_metrics,
         )
-        completed_episodes = transitions.completed_episode.sum()
-        completed_successes = transitions.completed_success.sum()
+        membership = jax.nn.one_hot(
+            transitions.skill_id,
+            num_skills,
+            dtype=jnp.int32,
+        )
+
+        def sum_by_skill(values: jax.Array) -> jax.Array:
+            return (membership * values[..., None]).sum(axis=(0, 1))
+
+        completed_by_skill = sum_by_skill(transitions.completed_episode)
+        successes_by_skill = sum_by_skill(transitions.completed_success)
+        feasible_timeouts_by_skill = sum_by_skill(
+            transitions.completed_feasible_timeout
+        )
+        precondition_losses_by_skill = sum_by_skill(
+            transitions.completed_precondition_loss
+        )
+        environment_terminations_by_skill = sum_by_skill(
+            transitions.completed_environment_termination
+        )
+        success_rates_by_skill = jnp.where(
+            completed_by_skill > 0,
+            successes_by_skill / completed_by_skill,
+            0.0,
+        )
+        represented_skills = completed_by_skill > 0
+        macro_success_rate = jnp.where(
+            represented_skills.any(),
+            jnp.where(
+                represented_skills,
+                success_rates_by_skill,
+                0.0,
+            ).sum()
+            / represented_skills.sum(),
+            0.0,
+        )
+        completed_episodes = completed_by_skill.sum()
+        completed_successes = successes_by_skill.sum()
         rollout_metrics = {
             "reward_mean": transitions.reward.mean(),
             "completed_episodes": completed_episodes,
@@ -361,7 +471,28 @@ def make_skill_update(
                 completed_successes / completed_episodes,
                 0.0,
             ),
+            "macro_success_rate": macro_success_rate,
         }
+        for index, skill_id in enumerate(SKILL_IDS):
+            prefix = f"skill/{skill_id.value}"
+            episodes = completed_by_skill[index]
+            rollout_metrics[f"{prefix}/completed_episodes"] = episodes
+            rollout_metrics[f"{prefix}/success_rate"] = success_rates_by_skill[index]
+            rollout_metrics[f"{prefix}/feasible_timeout_rate"] = jnp.where(
+                episodes > 0,
+                feasible_timeouts_by_skill[index] / episodes,
+                0.0,
+            )
+            rollout_metrics[f"{prefix}/precondition_lost_rate"] = jnp.where(
+                episodes > 0,
+                precondition_losses_by_skill[index] / episodes,
+                0.0,
+            )
+            rollout_metrics[f"{prefix}/environment_termination_rate"] = jnp.where(
+                episodes > 0,
+                environment_terminations_by_skill[index] / episodes,
+                0.0,
+            )
         runner = runner._replace(
             train_state=optimization.train_state,
             rng=optimization.rng,
@@ -417,6 +548,9 @@ def train_goal_conditioned(
     successes = np.asarray(runner.completed_successes)
     episodes = np.asarray(runner.completed_episodes)
     lengths = np.asarray(runner.completed_length_sum)
+    feasible_timeouts = np.asarray(runner.completed_feasible_timeouts)
+    precondition_losses = np.asarray(runner.completed_precondition_losses)
+    environment_terminations = np.asarray(runner.completed_environment_terminations)
     per_skill = {
         skill_id.value: {
             "completed_episodes": int(episodes[index]),
@@ -426,9 +560,31 @@ def train_goal_conditioned(
             "mean_episode_length": (
                 float(lengths[index] / episodes[index]) if episodes[index] else None
             ),
+            "feasible_timeout_rate": (
+                float(feasible_timeouts[index] / episodes[index])
+                if episodes[index]
+                else None
+            ),
+            "precondition_lost_rate": (
+                float(precondition_losses[index] / episodes[index])
+                if episodes[index]
+                else None
+            ),
+            "environment_termination_rate": (
+                float(environment_terminations[index] / episodes[index])
+                if episodes[index]
+                else None
+            ),
         }
         for index, skill_id in enumerate(SKILL_IDS)
     }
+    per_skill_success_rates = [
+        metrics["success_rate"]
+        for metrics in per_skill.values()
+        if metrics["success_rate"] is not None
+    ]
+    total_completed_episodes = int(episodes.sum())
+    total_completed_successes = int(successes.sum())
     summary = {
         "environment": "Tiny-SIMA-Nearby-Skills-v0",
         "device": str(jax.devices()[0]),
@@ -437,6 +593,8 @@ def train_goal_conditioned(
         "num_envs": config.num_envs,
         "num_skills": len(SKILL_IDS),
         "skill_horizon": config.skill_horizon,
+        "stratified_minibatches": True,
+        "normalize_advantages_per_skill": (config.normalize_advantages_per_skill),
         "total_seconds": loop.total_seconds,
         "compile_and_first_update_seconds": (loop.compile_and_first_update_seconds),
         "post_compile_seconds": loop.post_compile_seconds,
@@ -445,6 +603,14 @@ def train_goal_conditioned(
         ),
         "steps_per_second_after_compile": (loop.steps_per_second_after_compile),
         "tail_steps_per_second": loop.tail_steps_per_second,
+        "macro_success_rate": (
+            float(np.mean(per_skill_success_rates)) if per_skill_success_rates else None
+        ),
+        "episode_weighted_success_rate": (
+            total_completed_successes / total_completed_episodes
+            if total_completed_episodes
+            else None
+        ),
         "latest_metrics": loop.latest_metrics,
         "per_skill": per_skill,
         "jax_memory": jax_allocator_summary(jax.devices()[0]),

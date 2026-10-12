@@ -24,3 +24,4 @@ gpu_monitor_interval_seconds: 0.5
 output_dir: runs/skill-ppo-1m
 skill_horizon: 8
 skill_embedding_size: 32
+normalize_advantages_per_skill: false

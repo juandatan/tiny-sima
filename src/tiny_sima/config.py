@@ -107,6 +107,7 @@ class SkillPPOConfig(PPOConfig):
 
     skill_horizon: int = 8
     skill_embedding_size: int = 32
+    normalize_advantages_per_skill: bool = False
 
     def validate(self) -> Self:
         super().validate()

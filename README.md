@@ -39,6 +39,13 @@ The planner selects from a fixed set of skills instead of producing arbitrary
 instructions. This keeps its decisions grounded in actions that the executor
 has learned.
 
+The current Phase 3 implementation tests the executor in isolation. There is
+not yet a VLM choosing skills. The training environment assigns one requested
+skill to each environment slot at reset, guarantees that its initial
+preconditions hold, and supplies the corresponding skill ID to the shared
+policy at every action step. A new episode for the same requested skill starts
+after success, timeout, or environment termination.
+
 ```text
 Long-term objective
         |
@@ -407,6 +414,14 @@ or a skill-specific time limit and use a one-shot sparse completion reward.
 
 Goal: train one policy that can perform multiple skills.
 
+PPO minibatches are stratified so every minibatch contains every requested
+skill, and losses are averaged across skills because this phase optimizes equal
+competence over an externally balanced skill suite. Per-skill advantage
+normalization is available experimentally but disabled by default: short
+rollouts without any successful examples can otherwise amplify critic noise.
+A later planner experiment may instead weight skills by the planner's real
+request distribution.
+
 Tasks:
 
 - Condition the PPO-RNN policy on a skill ID.
@@ -611,6 +626,14 @@ Started on October 12, 2026:
 - Added debug and one-million-step configurations.
 - Added `notebooks/04_train_goal_conditioned.ipynb` for notebook-based
   training and per-skill evaluation.
+- Added macro and per-skill success metrics so short skills cannot dominate
+  the reported result through more frequent episode resets.
+- Added explicit failure categories for feasible timeout, lost preconditions,
+  and unrelated environment termination.
+- Added skill-stratified minibatches and optional per-skill advantage
+  normalization. The latter is disabled by default after a debug ablation
+  showed that it collapsed unsolved interaction skills.
+- Added side-by-side deterministic and stochastic checkpoint evaluation.
 
-The next step is to run the goal-conditioned baseline, record per-skill
-success rates, and then add progressively less-structured starting states.
+The next step is to rerun the goal-conditioned baseline with balanced metrics,
+then add progressively less-structured starting states.

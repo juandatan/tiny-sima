@@ -123,6 +123,7 @@ class SkillEnvironment:
             state.initial_metric,
             env_state,
         )
+        precondition_after = skill_precondition(self.goal, env_state)
         previous_success = previous_metric - state.initial_metric >= self.goal.quantity
         reward = (success & ~previous_success).astype(jnp.float32)
         timeout = (steps >= self.goal.effective_horizon) & ~success
@@ -139,6 +140,7 @@ class SkillEnvironment:
                 env_state,
             ),
             "skill_precondition": precondition,
+            "skill_precondition_after": precondition_after,
         }
         return SkillStep(
             observation=observation,
@@ -193,9 +195,7 @@ def prepare_skill_scenario(
     )
     for direction in range(Action.LEFT.value, Action.DOWN.value + 1):
         position = player_position + DIRECTIONS[direction]
-        clean_map = clean_map.at[position[0], position[1]].set(
-            BlockType.GRASS.value
-        )
+        clean_map = clean_map.at[position[0], position[1]].set(BlockType.GRASS.value)
 
     target_position = player_position + DIRECTIONS[target_direction]
     skill_id = goal.skill_id
@@ -436,8 +436,7 @@ def make_vectorized_skill_environment(
             f"num_envs must be divisible by the {num_skills} registered skills."
         )
     environments = tuple(
-        make_skill_environment(skill_id, horizon=horizon)
-        for skill_id in SKILL_IDS
+        make_skill_environment(skill_id, horizon=horizon) for skill_id in SKILL_IDS
     )
     expected_indices = tuple(
         skill_index(environment.goal.skill_id) for environment in environments

@@ -66,6 +66,24 @@ def test_skill_episode_times_out_without_completion() -> None:
     assert float(np.asarray(result.reward)) == 0.0
 
 
+def test_wrong_crafting_action_can_invalidate_requested_skill() -> None:
+    environment = make_skill_environment(
+        SkillId.CRAFT_WOOD_PICKAXE,
+        horizon=4,
+    )
+    _, state = environment.reset(jax.random.PRNGKey(0))
+
+    result = environment.step(
+        jax.random.PRNGKey(1),
+        state,
+        jnp.asarray(Action.MAKE_WOOD_SWORD.value),
+    )
+
+    assert bool(np.asarray(result.info["skill_precondition"]))
+    assert not bool(np.asarray(result.info["skill_precondition_after"]))
+    assert not bool(np.asarray(result.info["skill_success"]))
+
+
 def test_skill_batch_reset_shapes() -> None:
     environment = make_skill_environment(SkillId.DRINK_WATER)
     observation, state = reset_skill_batch(

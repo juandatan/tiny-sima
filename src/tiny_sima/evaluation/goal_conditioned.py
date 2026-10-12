@@ -137,14 +137,25 @@ def evaluate_goal_conditioned_skill(
 
     output = jax.jit(rollout)(jax.random.PRNGKey(seed))
     succeeded = np.asarray(output.succeeded)
+    episode_return = np.asarray(output.episode_return)
     episode_length = np.asarray(output.episode_length)
+    failed = ~succeeded
+    precondition_lost = np.asarray(output.precondition_lost) & failed
+    feasible_timeout = np.asarray(output.timed_out) & failed & ~precondition_lost
+    environment_terminated = (
+        np.asarray(output.environment_terminated) & failed & ~precondition_lost
+    )
     return {
         "skill_id": normalized_skill_id.value,
         "num_episodes": num_episodes,
         "seed": seed,
         "deterministic": deterministic,
         "success_rate": float(succeeded.mean()),
+        "mean_return": float(episode_return.mean()),
         "mean_episode_length": float(episode_length.mean()),
+        "precondition_lost_rate": float(precondition_lost.mean()),
+        "feasible_timeout_rate": float(feasible_timeout.mean()),
+        "environment_termination_rate": float(environment_terminated.mean()),
     }
 
 
