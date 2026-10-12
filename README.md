@@ -321,8 +321,7 @@ equal environment steps and multiple seeds.
 
 ### Final learning-scale comparison
 
-Open `notebooks/02_compare_learning_scaling.ipynb` and run all cells. It runs
-nine isolated training jobs:
+The final comparison ran nine isolated training jobs:
 
 - Environment counts: 64, 256, and 512.
 - Training seeds: 0, 1, and 2.
@@ -330,9 +329,21 @@ nine isolated training jobs:
 - Evaluation: 64 deterministic episodes using the same evaluation seed.
 - PPO hyperparameters: unchanged from the baseline.
 
-The experiment is resumable and writes partial results after each completed
-run. Aggregate JSON and CSV files are written under
-`runs/learning-scaling-comparison/`.
+| Environments | PPO updates | Mean training time | Evaluation return | Mean episode length |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 256 | 132.2 seconds | 3.636 ± 0.299 | 159.74 |
+| 256 | 64 | 87.5 seconds | 1.293 ± 0.240 | 148.05 |
+| 512 | 32 | 84.2 seconds | 0.803 ± 0.051 | 151.75 |
+
+Increasing to 256 environments saved 34% wall-clock time but reduced mean
+return by 64%. Increasing to 512 saved 36% wall-clock time but reduced return
+by 78%. Tiny-SIMA therefore retains 64 environments as the learning default.
+Larger batches remain useful for throughput-oriented rollout generation and
+evaluation.
+
+The comparison can be reproduced with
+`notebooks/02_compare_learning_scaling.ipynb`. Aggregate JSON and CSV files
+are written under `runs/learning-scaling-comparison/`.
 
 ## Development phases
 
@@ -374,6 +385,12 @@ Tasks:
 
 Initial skills will focus on gathering resources, restoring basic needs,
 placing structures, and crafting simple tools.
+
+The first benchmark stage uses nearby-target scenarios. Each scenario starts
+from a generated Craftax world, injects the minimum valid target and inventory
+state, disables hostile spawning, and continues to use the real Craftax
+transition logic. Episodes terminate on skill success, environment failure,
+or a skill-specific time limit and use a one-shot sparse completion reward.
 
 ### Phase 3: Goal-conditioned executor
 
@@ -491,7 +508,7 @@ tiny-sima/
 │   ├── 01_profile_executor_scaling.ipynb
 │   ├── 02_evaluate_baseline.ipynb
 │   ├── 02_compare_learning_scaling.ipynb
-│   ├── 03_train_skills.ipynb
+│   ├── 03_evaluate_skills.ipynb
 │   └── 04_hierarchical_evaluation.ipynb
 ├── src/
 │   └── tiny_sima/
@@ -508,7 +525,7 @@ tiny-sima/
 
 ## Current status
 
-**The Phase 1 baseline is complete and Phase 2 has started.**
+**Phase 1 is complete and the Phase 2 skill benchmark is in progress.**
 
 Implemented:
 
@@ -553,7 +570,7 @@ Verified on an NVIDIA L40S on October 11, 2026:
 
 Started on October 11, 2026:
 
-- All 38 automated tests pass locally.
+- All 48 automated tests pass locally.
 - Defined `collect_wood`, `collect_stone`, `drink_water`, `place_table`,
   `craft_wood_pickaxe`, and `craft_wood_sword`.
 - Added repeatable state-delta success predicates instead of relying on
@@ -561,8 +578,15 @@ Started on October 11, 2026:
 - Added feasibility preconditions, normalized progress, and one-shot sparse
   rewards.
 
-The executor scaling sweep is complete. GPU saturation starts near 1,024
-environments; 2,048 is the practical hardware-efficiency point and 4,096 is
-the maximum-throughput point. The resumable final comparison is ready to test
-whether 256 or 512 environments improve wall-clock learning without harming
-final policy quality.
+Completed on October 12, 2026:
+
+- The three-seed learning comparison selected 64 environments as the default.
+- Added nearby-target episodes for all six initial skills.
+- Added sparse completion rewards, eight-step time limits, and batched reset
+  and step functions.
+- Added scripted and random skill baselines.
+- Converted `notebooks/03_evaluate_skills.ipynb` into an executable Phase 2
+  benchmark.
+
+The next step is to add progressively less-structured starting states and
+condition the PPO executor on the selected skill.

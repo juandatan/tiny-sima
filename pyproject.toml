@@ -41,6 +41,7 @@ tiny-sima-evaluate = "tiny_sima.evaluation.policy:main"
 tiny-sima-benchmark = "tiny_sima.envs.craftax:main"
 tiny-sima-profile = "tiny_sima.profiling:main"
 tiny-sima-compare-learning = "tiny_sima.learning_comparison:main"
+tiny-sima-evaluate-skills = "tiny_sima.evaluation.skills:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tiny_sima"]

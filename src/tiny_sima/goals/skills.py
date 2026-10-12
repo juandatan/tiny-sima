@@ -184,8 +184,18 @@ def skill_progress(
     """Return normalized progress in the range zero to one."""
 
     initial = skill_metric(goal.skill_id, initial_state)
+    return skill_progress_from_metric(goal, initial, current_state)
+
+
+def skill_progress_from_metric(
+    goal: SkillGoal,
+    initial_metric: jax.Array,
+    current_state: Any,
+) -> jax.Array:
+    """Return normalized progress from a stored initial metric."""
+
     current = skill_metric(goal.skill_id, current_state)
-    gained = jnp.maximum(current - initial, 0)
+    gained = jnp.maximum(current - initial_metric, 0)
     return jnp.clip(gained / goal.quantity, 0.0, 1.0).astype(jnp.float32)
 
 
@@ -197,8 +207,18 @@ def skill_success(
     """Return whether the requested state change has occurred."""
 
     initial = skill_metric(goal.skill_id, initial_state)
+    return skill_success_from_metric(goal, initial, current_state)
+
+
+def skill_success_from_metric(
+    goal: SkillGoal,
+    initial_metric: jax.Array,
+    current_state: Any,
+) -> jax.Array:
+    """Return success from a stored initial metric."""
+
     current = skill_metric(goal.skill_id, current_state)
-    return current - initial >= goal.quantity
+    return current - initial_metric >= goal.quantity
 
 
 def sparse_skill_reward(
