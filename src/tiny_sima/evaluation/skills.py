@@ -18,10 +18,16 @@ from tiny_sima.envs.skills import (
     reset_skill_batch,
     step_skill_batch,
 )
+from tiny_sima.evaluation.skill_rollout import (
+    SkillEpisodeTracker,
+    SkillRolloutOutput,
+    finish_skill_tracker,
+    initialize_skill_tracker,
+    update_skill_tracker,
+)
 from tiny_sima.goals.skills import SKILL_REGISTRY, SkillId, get_skill_spec
 
 PolicyName = Literal["scripted", "random"]
-SkillRolloutOutput = tuple[jax.Array, jax.Array, jax.Array]
 
 
 class SkillRolloutCarry(NamedTuple):
@@ -29,10 +35,8 @@ class SkillRolloutCarry(NamedTuple):
 
     rng: jax.Array
     state: SkillEpisodeState
-    finished: jax.Array
-    succeeded: jax.Array
-    episode_return: jax.Array
-    episode_length: jax.Array
+    tracker: SkillEpisodeTracker
+
 
 _INTERACTION_SKILLS = {
     SkillId.COLLECT_WOOD,
@@ -82,10 +86,7 @@ def evaluate_skill_policy(
         initial_carry = SkillRolloutCarry(
             rng=rng,
             state=state,
-            finished=jnp.zeros((num_episodes,), dtype=jnp.bool_),
-            succeeded=jnp.zeros((num_episodes,), dtype=jnp.bool_),
-            episode_return=jnp.zeros((num_episodes,), dtype=jnp.float32),
-            episode_length=jnp.zeros((num_episodes,), dtype=jnp.int32),
+            tracker=initialize_skill_tracker(num_episodes),
         )
 
         def step(
@@ -109,19 +110,10 @@ def evaluate_skill_policy(
                 carry.state,
                 action,
             )
-            active = ~carry.finished
             next_carry = SkillRolloutCarry(
                 rng=rng,
                 state=result.state,
-                finished=carry.finished | result.done,
-                succeeded=(
-                    carry.succeeded
-                    | (active & result.info["skill_success"])
-                ),
-                episode_return=carry.episode_return + result.reward * active,
-                episode_length=(
-                    carry.episode_length + active.astype(jnp.int32)
-                ),
+                tracker=update_skill_tracker(carry.tracker, result),
             )
             return next_carry, None
 
@@ -131,18 +123,12 @@ def evaluate_skill_policy(
             None,
             length=horizon,
         )
-        return (
-            final_carry.succeeded,
-            final_carry.episode_return,
-            final_carry.episode_length,
-        )
+        return finish_skill_tracker(final_carry.tracker)
 
-    succeeded, episode_return, episode_length = jax.jit(rollout)(
-        jax.random.PRNGKey(seed)
-    )
-    succeeded = np.asarray(succeeded)
-    episode_return = np.asarray(episode_return)
-    episode_length = np.asarray(episode_length)
+    output = jax.jit(rollout)(jax.random.PRNGKey(seed))
+    succeeded = np.asarray(output.succeeded)
+    episode_return = np.asarray(output.episode_return)
+    episode_length = np.asarray(output.episode_length)
     return {
         "skill_id": SkillId(skill_id).value,
         "policy": policy,

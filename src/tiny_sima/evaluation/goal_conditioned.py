@@ -18,12 +18,20 @@ from tiny_sima.envs.skills import (
     reset_skill_batch,
     step_skill_batch,
 )
+from tiny_sima.evaluation.skill_rollout import (
+    SkillEpisodeTracker,
+    SkillRolloutOutput,
+    finish_skill_tracker,
+    initialize_skill_tracker,
+    update_skill_tracker,
+)
 from tiny_sima.executor.checkpoints import load_checkpoint
 from tiny_sima.executor.model import (
-    GoalConditionedActorCriticRNN,
     apply_goal_conditioned_actor_critic,
     initial_hidden,
     initialize_goal_conditioned_parameters,
+    make_goal_conditioned_actor_critic,
+    select_action,
 )
 from tiny_sima.goals import SKILL_IDS, SkillId, skill_index
 
@@ -35,16 +43,7 @@ class GoalEvaluationCarry(NamedTuple):
     state: SkillEpisodeState
     observation: jax.Array
     hidden: jax.Array
-    finished: jax.Array
-    succeeded: jax.Array
-    episode_length: jax.Array
-
-
-class GoalEvaluationOutput(NamedTuple):
-    """Per-episode results from one learned skill rollout."""
-
-    succeeded: jax.Array
-    episode_length: jax.Array
+    tracker: SkillEpisodeTracker
 
 
 def evaluate_goal_conditioned_skill(
@@ -66,7 +65,7 @@ def evaluate_goal_conditioned_skill(
         normalized_skill_id,
         horizon=config.skill_horizon,
     )
-    model = GoalConditionedActorCriticRNN(
+    model = make_goal_conditioned_actor_critic(
         num_actions=environment.bundle.spec.num_actions,
         num_skills=len(SKILL_IDS),
         hidden_size=config.hidden_size,
@@ -74,7 +73,7 @@ def evaluate_goal_conditioned_skill(
     )
     categorical_skill_id = skill_index(normalized_skill_id)
 
-    def rollout(rng: jax.Array) -> GoalEvaluationOutput:
+    def rollout(rng: jax.Array) -> SkillRolloutOutput:
         rng, reset_rng = jax.random.split(rng)
         reset = reset_skill_batch(environment, reset_rng, num_episodes)
         initial_carry = GoalEvaluationCarry(
@@ -82,9 +81,7 @@ def evaluate_goal_conditioned_skill(
             state=reset.state,
             observation=reset.observation,
             hidden=initial_hidden(num_episodes, config.hidden_size),
-            finished=jnp.zeros((num_episodes,), dtype=jnp.bool_),
-            succeeded=jnp.zeros((num_episodes,), dtype=jnp.bool_),
-            episode_length=jnp.zeros((num_episodes,), dtype=jnp.int32),
+            tracker=initialize_skill_tracker(num_episodes),
         )
         skill_ids = jnp.full(
             (num_episodes,),
@@ -104,14 +101,14 @@ def evaluate_goal_conditioned_skill(
                 (
                     carry.observation[None, ...],
                     skill_ids[None, ...],
-                    carry.finished[None, ...],
+                    carry.tracker.finished[None, ...],
                 ),
             )
             logits = model_output.logits[0]
-            action = (
-                jnp.argmax(logits, axis=-1)
-                if deterministic
-                else jax.random.categorical(action_rng, logits, axis=-1)
+            action = select_action(
+                logits,
+                action_rng,
+                deterministic=deterministic,
             )
             result = step_skill_batch(
                 environment,
@@ -119,21 +116,13 @@ def evaluate_goal_conditioned_skill(
                 carry.state,
                 action,
             )
-            active = ~carry.finished
             return (
                 GoalEvaluationCarry(
                     rng=rng,
                     state=result.state,
                     observation=result.observation,
                     hidden=model_output.hidden,
-                    finished=carry.finished | result.done,
-                    succeeded=(
-                        carry.succeeded
-                        | (active & result.info["skill_success"])
-                    ),
-                    episode_length=(
-                        carry.episode_length + active.astype(jnp.int32)
-                    ),
+                    tracker=update_skill_tracker(carry.tracker, result),
                 ),
                 None,
             )
@@ -144,10 +133,7 @@ def evaluate_goal_conditioned_skill(
             None,
             length=config.skill_horizon,
         )
-        return GoalEvaluationOutput(
-            succeeded=final_carry.succeeded,
-            episode_length=final_carry.episode_length,
-        )
+        return finish_skill_tracker(final_carry.tracker)
 
     output = jax.jit(rollout)(jax.random.PRNGKey(seed))
     succeeded = np.asarray(output.succeeded)
@@ -200,7 +186,7 @@ def evaluate_goal_conditioned_checkpoint(
         SKILL_IDS[0],
         horizon=config.skill_horizon,
     )
-    model = GoalConditionedActorCriticRNN(
+    model = make_goal_conditioned_actor_critic(
         num_actions=environment.bundle.spec.num_actions,
         num_skills=len(SKILL_IDS),
         hidden_size=config.hidden_size,

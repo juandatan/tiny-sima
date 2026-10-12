@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple, cast
@@ -12,7 +11,6 @@ from typing import Any, NamedTuple, cast
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 from flax.training.train_state import TrainState
 
 from tiny_sima.config import PPOConfig, load_config, save_config
@@ -24,15 +22,24 @@ from tiny_sima.evaluation.gpu_monitor import (
     NvidiaSmiMonitor,
     jax_allocator_summary,
 )
-from tiny_sima.executor.checkpoints import save_checkpoint
 from tiny_sima.executor.model import (
     ActorCriticRNN,
     apply_actor_critic,
-    categorical_entropy,
     categorical_log_probability,
     initial_hidden,
     initialize_parameters,
+    make_actor_critic,
 )
+from tiny_sima.executor.ppo_common import (
+    OptimizationCarry,
+    PPOLossBatch,
+    RecurrentMinibatch,
+    UpdateMetrics,
+    calculate_gae,
+    clipped_ppo_loss,
+    create_train_state,
+)
+from tiny_sima.executor.training import run_training_loop, save_final_run
 
 
 class Transition(NamedTuple):
@@ -61,59 +68,25 @@ class RunnerState(NamedTuple):
     completed_episodes: jax.Array
 
 
-class GAECarry(NamedTuple):
-    """Values propagated backward while calculating GAE."""
-
-    advantage: jax.Array
-    next_value: jax.Array
-    next_done: jax.Array
-
-
-class Minibatch(NamedTuple):
-    """One recurrent PPO minibatch."""
-
-    hidden: jax.Array
-    transitions: Transition
-    advantages: jax.Array
-    targets: jax.Array
-
-
-class OptimizationCarry(NamedTuple):
-    """Optimizer state and RNG carried between PPO epochs."""
-
-    train_state: TrainState
-    rng: jax.Array
-
-
-UpdateMetrics = dict[str, jax.Array]
 UpdateFunction = Callable[[RunnerState], tuple[RunnerState, UpdateMetrics]]
 
 
-def create_train_state(
-    model: ActorCriticRNN,
-    params: Any,
-    config: PPOConfig,
-) -> TrainState:
-    """Create the optimizer and Flax training state."""
+def _runner_params(runner: RunnerState) -> Any:
+    return runner.train_state.params
 
-    optimizer_steps = config.num_updates * config.update_epochs * config.num_minibatches
-    if config.anneal_learning_rate:
-        learning_rate: float | optax.Schedule = optax.linear_schedule(
-            init_value=config.learning_rate,
-            end_value=0.0,
-            transition_steps=max(1, optimizer_steps),
-        )
-    else:
-        learning_rate = config.learning_rate
 
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(config.max_grad_norm),
-        optax.adam(learning_rate=learning_rate, eps=1e-5),
-    )
-    return TrainState.create(
-        apply_fn=model.apply,
-        params=params,
-        tx=optimizer,
+def _format_progress(
+    update_index: int,
+    timesteps: int,
+    metrics: dict[str, float],
+    record: dict[str, Any],
+) -> str:
+    return (
+        f"update={update_index}/{record['total_updates']} "
+        f"steps={timesteps} "
+        f"reward={metrics['reward_mean']:.4f} "
+        f"sps={record['steps_per_second_including_compile']:.0f} "
+        f"steady_sps={record['steps_per_second_after_compile'] or 0:.0f}"
     )
 
 
@@ -148,49 +121,6 @@ def initialize_runner(
         completed_length_sum=jnp.array(0, dtype=jnp.int32),
         completed_episodes=jnp.array(0, dtype=jnp.int32),
     )
-
-
-def _calculate_gae(
-    transitions: Transition,
-    last_value: jax.Array,
-    last_done: jax.Array,
-    config: PPOConfig,
-) -> tuple[jax.Array, jax.Array]:
-    def step(
-        carry: GAECarry,
-        transition: Transition,
-    ) -> tuple[GAECarry, jax.Array]:
-        not_done = 1.0 - carry.next_done.astype(jnp.float32)
-        delta = (
-            transition.reward
-            + config.gamma * carry.next_value * not_done
-            - transition.value
-        )
-        advantage = (
-            delta
-            + config.gamma
-            * config.gae_lambda
-            * not_done
-            * carry.advantage
-        )
-        next_carry = GAECarry(
-            advantage=advantage,
-            next_value=transition.value,
-            next_done=transition.reset,
-        )
-        return next_carry, advantage
-
-    _, advantages = jax.lax.scan(
-        step,
-        GAECarry(
-            advantage=jnp.zeros_like(last_value),
-            next_value=last_value,
-            next_done=last_done,
-        ),
-        transitions,
-        reverse=True,
-    )
-    return advantages, advantages + transitions.value
 
 
 def make_update(
@@ -269,9 +199,7 @@ def make_update(
                 completed_length_sum=(
                     current.completed_length_sum + completed_length.sum()
                 ),
-                completed_episodes=(
-                    current.completed_episodes + env_step.done.sum()
-                ),
+                completed_episodes=(current.completed_episodes + env_step.done.sum()),
             )
             return next_runner, transition
 
@@ -292,8 +220,10 @@ def make_update(
             runner.hidden,
             network_input,
         )
-        advantages, targets = _calculate_gae(
-            transitions,
+        advantages, targets = calculate_gae(
+            transitions.reward,
+            transitions.value,
+            transitions.reset,
             last_model_output.value[0],
             runner.done,
             config,
@@ -315,68 +245,22 @@ def make_update(
                     minibatch_transitions.reset,
                 ),
             )
-            log_probability = categorical_log_probability(
+            return clipped_ppo_loss(
                 model_output.logits,
-                minibatch_transitions.action,
+                model_output.value,
+                PPOLossBatch(
+                    action=minibatch_transitions.action,
+                    old_value=minibatch_transitions.value,
+                    old_log_probability=(minibatch_transitions.log_probability),
+                    advantage=minibatch_advantages,
+                    target=minibatch_targets,
+                ),
+                config,
             )
-
-            value_clipped = minibatch_transitions.value + jnp.clip(
-                model_output.value - minibatch_transitions.value,
-                -config.clip_epsilon,
-                config.clip_epsilon,
-            )
-            value_loss_unclipped = jnp.square(
-                model_output.value - minibatch_targets
-            )
-            value_loss_clipped = jnp.square(value_clipped - minibatch_targets)
-            value_loss = (
-                0.5
-                * jnp.maximum(
-                    value_loss_unclipped,
-                    value_loss_clipped,
-                ).mean()
-            )
-
-            normalized_advantages = (
-                minibatch_advantages - minibatch_advantages.mean()
-            ) / (minibatch_advantages.std() + 1e-8)
-            log_ratio = log_probability - minibatch_transitions.log_probability
-            ratio = jnp.exp(log_ratio)
-            actor_loss_unclipped = -ratio * normalized_advantages
-            actor_loss_clipped = (
-                -jnp.clip(
-                    ratio,
-                    1.0 - config.clip_epsilon,
-                    1.0 + config.clip_epsilon,
-                )
-                * normalized_advantages
-            )
-            actor_loss = jnp.maximum(
-                actor_loss_unclipped,
-                actor_loss_clipped,
-            ).mean()
-
-            entropy = categorical_entropy(model_output.logits).mean()
-            total_loss = (
-                actor_loss
-                + config.value_coefficient * value_loss
-                - config.entropy_coefficient * entropy
-            )
-            approximate_kl = ((ratio - 1.0) - log_ratio).mean()
-            clip_fraction = (jnp.abs(ratio - 1.0) > config.clip_epsilon).mean()
-            metrics = {
-                "loss": total_loss,
-                "actor_loss": actor_loss,
-                "value_loss": value_loss,
-                "entropy": entropy,
-                "approximate_kl": approximate_kl,
-                "clip_fraction": clip_fraction,
-            }
-            return total_loss, metrics
 
         def update_minibatch(
             train_state: TrainState,
-            minibatch: Minibatch,
+            minibatch: RecurrentMinibatch[Transition],
         ) -> tuple[TrainState, UpdateMetrics]:
             gradient_function = jax.value_and_grad(loss, has_aux=True)
             (_, metrics), gradients = gradient_function(
@@ -422,7 +306,7 @@ def make_update(
             train_state, metrics = jax.lax.scan(
                 update_minibatch,
                 carry.train_state,
-                Minibatch(
+                RecurrentMinibatch(
                     hidden=minibatch_hidden,
                     transitions=minibatch_transitions,
                     advantages=minibatch_advantages,
@@ -467,10 +351,6 @@ def make_update(
     return cast(UpdateFunction, jax.jit(update))
 
 
-def _host_metrics(metrics: dict[str, jax.Array]) -> dict[str, float]:
-    return {name: float(np.asarray(value)) for name, value in metrics.items()}
-
-
 def train(
     config: PPOConfig,
     *,
@@ -496,113 +376,32 @@ def train(
         use_optimistic_resets=config.use_optimistic_resets,
         optimistic_reset_ratio=config.optimistic_reset_ratio,
     )
-    model = ActorCriticRNN(
+    model = make_actor_critic(
         num_actions=vector_env.spec.num_actions,
         hidden_size=config.hidden_size,
     )
     runner = initialize_runner(config, vector_env, model)
     update = make_update(config, vector_env, model)
 
-    metrics_path = run_dir / "metrics.jsonl"
-    start = time.perf_counter()
-
-    compile_start = time.perf_counter()
-    runner, device_metrics = update(runner)
-    jax.block_until_ready(device_metrics)
-    compile_and_first_update_seconds = time.perf_counter() - compile_start
-    steady_state_start_seconds = gpu_monitor.elapsed_seconds()
-    post_compile_start = time.perf_counter()
-
-    latest_metrics = _host_metrics(device_metrics)
-    previous_log_timesteps: int | None = None
-    previous_log_elapsed: float | None = None
-    previous_log_monitor_seconds: float | None = None
-    tail_steps_per_second: float | None = None
-    tail_gpu_start_seconds: float | None = None
-
-    with metrics_path.open("w", encoding="utf-8") as metrics_file:
-        for update_index in range(config.num_updates):
-            if update_index > 0:
-                runner, device_metrics = update(runner)
-
-            should_log = (
-                update_index == 0
-                or (update_index + 1) % config.log_every == 0
-                or update_index + 1 == config.num_updates
-            )
-            if should_log:
-                jax.block_until_ready(device_metrics)
-                latest_metrics = _host_metrics(device_metrics)
-
-                timesteps = (update_index + 1) * config.batch_size
-                elapsed = time.perf_counter() - start
-                post_compile_elapsed = time.perf_counter() - post_compile_start
-                post_compile_timesteps = update_index * config.batch_size
-                interval_steps_per_second = None
-                if (
-                    previous_log_timesteps is not None
-                    and previous_log_elapsed is not None
-                ):
-                    interval_steps_per_second = (
-                        timesteps - previous_log_timesteps
-                    ) / (elapsed - previous_log_elapsed)
-                    tail_steps_per_second = interval_steps_per_second
-
-                monitor_elapsed = gpu_monitor.elapsed_seconds()
-                if previous_log_monitor_seconds is not None:
-                    tail_gpu_start_seconds = previous_log_monitor_seconds
-                record = {
-                    "update": update_index + 1,
-                    "timesteps": timesteps,
-                    "elapsed_seconds": elapsed,
-                    "steps_per_second_including_compile": timesteps / elapsed,
-                    "steps_per_second_after_compile": (
-                        post_compile_timesteps / post_compile_elapsed
-                        if post_compile_timesteps
-                        else None
-                    ),
-                    "interval_steps_per_second": interval_steps_per_second,
-                    **latest_metrics,
-                }
-                metrics_file.write(json.dumps(record, sort_keys=True) + "\n")
-                metrics_file.flush()
-                print(
-                    f"update={update_index + 1}/{config.num_updates} "
-                    f"steps={timesteps} "
-                    f"reward={latest_metrics['reward_mean']:.4f} "
-                    f"sps={record['steps_per_second_including_compile']:.0f} "
-                    f"steady_sps={record['steps_per_second_after_compile'] or 0:.0f}"
-                )
-                previous_log_timesteps = timesteps
-                previous_log_elapsed = elapsed
-                previous_log_monitor_seconds = monitor_elapsed
-
-            if (
-                config.checkpoint_every > 0
-                and (update_index + 1) % config.checkpoint_every == 0
-            ):
-                checkpoint_name = f"step-{(update_index + 1) * config.batch_size}"
-                save_checkpoint(
-                    run_dir / "checkpoints" / checkpoint_name,
-                    runner.train_state.params,
-                    config,
-                    timesteps=(update_index + 1) * config.batch_size,
-                    metrics=latest_metrics,
-                )
-
-    jax.block_until_ready(runner.train_state.params)
+    loop = run_training_loop(
+        config=config,
+        run_dir=run_dir,
+        initial_runner=runner,
+        update=update,
+        monitor=gpu_monitor,
+        get_params=_runner_params,
+        format_progress=_format_progress,
+    )
+    runner = loop.runner
     jax_memory = jax_allocator_summary(jax.devices()[0])
     gpu_summary = gpu_monitor.stop(
         run_dir,
-        steady_state_start_seconds=steady_state_start_seconds,
-        tail_start_seconds=tail_gpu_start_seconds,
+        steady_state_start_seconds=loop.steady_state_start_seconds,
+        tail_start_seconds=loop.tail_gpu_start_seconds,
     )
     completed_return_sum = float(np.asarray(runner.completed_return_sum))
     completed_length_sum = float(np.asarray(runner.completed_length_sum))
     completed_episodes = int(np.asarray(runner.completed_episodes))
-    total_seconds = time.perf_counter() - start
-    post_compile_seconds = time.perf_counter() - post_compile_start
-    post_compile_timesteps = max(0, config.total_timesteps - config.batch_size)
     mean_episode_return = (
         completed_return_sum / completed_episodes if completed_episodes else None
     )
@@ -614,16 +413,14 @@ def train(
         "device": str(jax.devices()[0]),
         "timesteps": config.total_timesteps,
         "updates": config.num_updates,
-        "total_seconds": total_seconds,
-        "compile_and_first_update_seconds": compile_and_first_update_seconds,
-        "post_compile_seconds": post_compile_seconds,
-        "steps_per_second_including_compile": config.total_timesteps / total_seconds,
-        "steps_per_second_after_compile": (
-            post_compile_timesteps / post_compile_seconds
-            if post_compile_timesteps
-            else None
+        "total_seconds": loop.total_seconds,
+        "compile_and_first_update_seconds": (loop.compile_and_first_update_seconds),
+        "post_compile_seconds": loop.post_compile_seconds,
+        "steps_per_second_including_compile": (
+            config.total_timesteps / loop.total_seconds
         ),
-        "tail_steps_per_second": tail_steps_per_second,
+        "steps_per_second_after_compile": (loop.steps_per_second_after_compile),
+        "tail_steps_per_second": loop.tail_steps_per_second,
         "reset_mode": ("optimistic" if config.use_optimistic_resets else "automatic"),
         "optimistic_reset_ratio": (
             config.optimistic_reset_ratio if config.use_optimistic_resets else None
@@ -631,23 +428,17 @@ def train(
         "mean_completed_episode_return": mean_episode_return,
         "mean_completed_episode_length": mean_episode_length,
         "completed_episodes": completed_episodes,
-        "latest_metrics": latest_metrics,
+        "latest_metrics": loop.latest_metrics,
         "jax_memory": jax_memory,
         "gpu_monitor": gpu_summary,
     }
 
-    checkpoint_dir = save_checkpoint(
-        run_dir / "checkpoints" / "final",
-        runner.train_state.params,
-        config,
-        timesteps=config.total_timesteps,
-        metrics=summary,
+    return save_final_run(
+        run_dir=run_dir,
+        params=runner.train_state.params,
+        config=config,
+        summary=summary,
     )
-    summary["checkpoint"] = str(checkpoint_dir)
-    with (run_dir / "summary.json").open("w", encoding="utf-8") as file:
-        json.dump(summary, file, indent=2, sort_keys=True)
-        file.write("\n")
-    return summary
 
 
 def main() -> None:

@@ -16,10 +16,11 @@ from tiny_sima.config import PPOConfig, load_config
 from tiny_sima.envs.craftax import make_environment, reset_batch, step_batch
 from tiny_sima.executor.checkpoints import load_checkpoint
 from tiny_sima.executor.model import (
-    ActorCriticRNN,
     apply_actor_critic,
     initial_hidden,
     initialize_parameters,
+    make_actor_critic,
+    select_action,
 )
 
 
@@ -63,7 +64,7 @@ def evaluate_policy(
         auto_reset=True,
         max_episode_steps=config.max_episode_steps,
     )
-    model = ActorCriticRNN(
+    model = make_actor_critic(
         num_actions=bundle.spec.num_actions,
         hidden_size=config.hidden_size,
     )
@@ -98,10 +99,11 @@ def evaluate_policy(
                 ),
             )
             logits = model_output.logits[0]
-            if deterministic:
-                action = jnp.argmax(logits, axis=-1)
-            else:
-                action = jax.random.categorical(action_rng, logits, axis=-1)
+            action = select_action(
+                logits,
+                action_rng,
+                deterministic=deterministic,
+            )
 
             env_step = step_batch(
                 bundle,
@@ -195,7 +197,7 @@ def evaluate_checkpoint(
         auto_reset=True,
         max_episode_steps=config.max_episode_steps,
     )
-    model = ActorCriticRNN(
+    model = make_actor_critic(
         num_actions=bundle.spec.num_actions,
         hidden_size=config.hidden_size,
     )

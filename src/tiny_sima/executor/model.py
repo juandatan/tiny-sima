@@ -42,6 +42,67 @@ class ScannedGRU(nn.Module):
         return nn.GRUCell(features=self.hidden_size)(carry, features)
 
 
+def _encode_observation(
+    observations: jax.Array,
+    hidden_size: int,
+) -> jax.Array:
+    embedding = nn.Dense(
+        hidden_size,
+        kernel_init=orthogonal(jnp.sqrt(2.0)),
+        bias_init=constant(0.0),
+        name="observation_encoder",
+    )(observations)
+    return nn.relu(embedding)
+
+
+def _apply_recurrent_actor_critic(
+    hidden: jax.Array,
+    embedding: jax.Array,
+    resets: jax.Array,
+    *,
+    num_actions: int,
+    hidden_size: int,
+) -> ActorCriticOutput:
+    hidden, embedding = ScannedGRU(
+        hidden_size=hidden_size,
+        name="memory",
+    )(hidden, (embedding, resets))
+
+    actor = nn.Dense(
+        hidden_size,
+        kernel_init=orthogonal(jnp.sqrt(2.0)),
+        bias_init=constant(0.0),
+        name="actor_hidden",
+    )(embedding)
+    actor = nn.relu(actor)
+    logits = nn.Dense(
+        num_actions,
+        kernel_init=orthogonal(0.01),
+        bias_init=constant(0.0),
+        name="actor_logits",
+    )(actor)
+
+    critic = nn.Dense(
+        hidden_size,
+        kernel_init=orthogonal(jnp.sqrt(2.0)),
+        bias_init=constant(0.0),
+        name="critic_hidden",
+    )(embedding)
+    critic = nn.relu(critic)
+    value = nn.Dense(
+        1,
+        kernel_init=orthogonal(1.0),
+        bias_init=constant(0.0),
+        name="critic_value",
+    )(critic)
+
+    return ActorCriticOutput(
+        hidden=hidden,
+        logits=logits,
+        value=jnp.squeeze(value, axis=-1),
+    )
+
+
 class ActorCriticRNN(nn.Module):
     """A compact recurrent policy for flat symbolic Craftax observations."""
 
@@ -55,52 +116,16 @@ class ActorCriticRNN(nn.Module):
         inputs: tuple[jax.Array, jax.Array],
     ) -> ActorCriticOutput:
         observations, resets = inputs
-
-        embedding = nn.Dense(
+        embedding = _encode_observation(
+            observations,
             self.hidden_size,
-            kernel_init=orthogonal(jnp.sqrt(2.0)),
-            bias_init=constant(0.0),
-            name="observation_encoder",
-        )(observations)
-        embedding = nn.relu(embedding)
-
-        hidden, embedding = ScannedGRU(
+        )
+        return _apply_recurrent_actor_critic(
+            hidden,
+            embedding,
+            resets,
+            num_actions=self.num_actions,
             hidden_size=self.hidden_size,
-            name="memory",
-        )(hidden, (embedding, resets))
-
-        actor = nn.Dense(
-            self.hidden_size,
-            kernel_init=orthogonal(jnp.sqrt(2.0)),
-            bias_init=constant(0.0),
-            name="actor_hidden",
-        )(embedding)
-        actor = nn.relu(actor)
-        logits = nn.Dense(
-            self.num_actions,
-            kernel_init=orthogonal(0.01),
-            bias_init=constant(0.0),
-            name="actor_logits",
-        )(actor)
-
-        critic = nn.Dense(
-            self.hidden_size,
-            kernel_init=orthogonal(jnp.sqrt(2.0)),
-            bias_init=constant(0.0),
-            name="critic_hidden",
-        )(embedding)
-        critic = nn.relu(critic)
-        value = nn.Dense(
-            1,
-            kernel_init=orthogonal(1.0),
-            bias_init=constant(0.0),
-            name="critic_value",
-        )(critic)
-
-        return ActorCriticOutput(
-            hidden=hidden,
-            logits=logits,
-            value=jnp.squeeze(value, axis=-1),
         )
 
 
@@ -120,13 +145,10 @@ class GoalConditionedActorCriticRNN(nn.Module):
     ) -> ActorCriticOutput:
         observations, skill_ids, resets = inputs
 
-        observation_embedding = nn.Dense(
+        observation_embedding = _encode_observation(
+            observations,
             self.hidden_size,
-            kernel_init=orthogonal(jnp.sqrt(2.0)),
-            bias_init=constant(0.0),
-            name="observation_encoder",
-        )(observations)
-        observation_embedding = nn.relu(observation_embedding)
+        )
 
         skill_embedding = nn.Embed(
             num_embeddings=self.num_skills,
@@ -146,44 +168,52 @@ class GoalConditionedActorCriticRNN(nn.Module):
         )(embedding)
         embedding = nn.relu(embedding)
 
-        hidden, embedding = ScannedGRU(
+        return _apply_recurrent_actor_critic(
+            hidden,
+            embedding,
+            resets,
+            num_actions=self.num_actions,
             hidden_size=self.hidden_size,
-            name="memory",
-        )(hidden, (embedding, resets))
-
-        actor = nn.Dense(
-            self.hidden_size,
-            kernel_init=orthogonal(jnp.sqrt(2.0)),
-            bias_init=constant(0.0),
-            name="actor_hidden",
-        )(embedding)
-        actor = nn.relu(actor)
-        logits = nn.Dense(
-            self.num_actions,
-            kernel_init=orthogonal(0.01),
-            bias_init=constant(0.0),
-            name="actor_logits",
-        )(actor)
-
-        critic = nn.Dense(
-            self.hidden_size,
-            kernel_init=orthogonal(jnp.sqrt(2.0)),
-            bias_init=constant(0.0),
-            name="critic_hidden",
-        )(embedding)
-        critic = nn.relu(critic)
-        value = nn.Dense(
-            1,
-            kernel_init=orthogonal(1.0),
-            bias_init=constant(0.0),
-            name="critic_value",
-        )(critic)
-
-        return ActorCriticOutput(
-            hidden=hidden,
-            logits=logits,
-            value=jnp.squeeze(value, axis=-1),
         )
+
+
+def make_actor_critic(
+    *,
+    num_actions: int,
+    hidden_size: int,
+) -> ActorCriticRNN:
+    """Construct the baseline executor architecture."""
+
+    return ActorCriticRNN(
+        num_actions=num_actions,
+        hidden_size=hidden_size,
+    )
+
+
+def make_goal_conditioned_actor_critic(
+    *,
+    num_actions: int,
+    num_skills: int,
+    hidden_size: int,
+    skill_embedding_size: int,
+) -> GoalConditionedActorCriticRNN:
+    """Construct the categorical goal-conditioned executor architecture."""
+
+    return GoalConditionedActorCriticRNN(
+        num_actions=num_actions,
+        num_skills=num_skills,
+        hidden_size=hidden_size,
+        skill_embedding_size=skill_embedding_size,
+    )
+
+
+def _apply_model(
+    model: nn.Module,
+    params: Any,
+    hidden: jax.Array,
+    inputs: Any,
+) -> ActorCriticOutput:
+    return cast(ActorCriticOutput, model.apply(params, hidden, inputs))
 
 
 def apply_actor_critic(
@@ -194,7 +224,7 @@ def apply_actor_critic(
 ) -> ActorCriticOutput:
     """Apply a Flax model behind a precisely typed project boundary."""
 
-    return cast(ActorCriticOutput, model.apply(params, hidden, inputs))
+    return _apply_model(model, params, hidden, inputs)
 
 
 def apply_goal_conditioned_actor_critic(
@@ -205,13 +235,23 @@ def apply_goal_conditioned_actor_critic(
 ) -> ActorCriticOutput:
     """Apply a goal-conditioned Flax model through a typed boundary."""
 
-    return cast(ActorCriticOutput, model.apply(params, hidden, inputs))
+    return _apply_model(model, params, hidden, inputs)
 
 
 def initial_hidden(batch_size: int, hidden_size: int) -> jax.Array:
     """Create an all-zero recurrent state."""
 
     return jnp.zeros((batch_size, hidden_size), dtype=jnp.float32)
+
+
+def _dummy_observations(
+    observation_shape: tuple[int, ...],
+    batch_size: int,
+) -> jax.Array:
+    return jnp.zeros(
+        (1, batch_size, *observation_shape),
+        dtype=jnp.float32,
+    )
 
 
 def initialize_parameters(
@@ -223,10 +263,7 @@ def initialize_parameters(
 ) -> Any:
     """Initialize model parameters for a given environment observation shape."""
 
-    observations = jnp.zeros(
-        (1, batch_size, *observation_shape),
-        dtype=jnp.float32,
-    )
+    observations = _dummy_observations(observation_shape, batch_size)
     resets = jnp.zeros((1, batch_size), dtype=jnp.bool_)
     hidden = initial_hidden(batch_size, model.hidden_size)
     return model.init(rng, hidden, (observations, resets))
@@ -241,10 +278,7 @@ def initialize_goal_conditioned_parameters(
 ) -> Any:
     """Initialize goal-conditioned parameters for an observation shape."""
 
-    observations = jnp.zeros(
-        (1, batch_size, *observation_shape),
-        dtype=jnp.float32,
-    )
+    observations = _dummy_observations(observation_shape, batch_size)
     skill_ids = jnp.zeros((1, batch_size), dtype=jnp.int32)
     resets = jnp.zeros((1, batch_size), dtype=jnp.bool_)
     hidden = initial_hidden(batch_size, model.hidden_size)
@@ -271,3 +305,16 @@ def categorical_entropy(logits: jax.Array) -> jax.Array:
     log_probabilities = jax.nn.log_softmax(logits, axis=-1)
     probabilities = jnp.exp(log_probabilities)
     return -jnp.sum(probabilities * log_probabilities, axis=-1)
+
+
+def select_action(
+    logits: jax.Array,
+    rng: jax.Array,
+    *,
+    deterministic: bool,
+) -> jax.Array:
+    """Choose greedy or sampled categorical actions from policy logits."""
+
+    if deterministic:
+        return jnp.argmax(logits, axis=-1)
+    return jax.random.categorical(rng, logits, axis=-1)
