@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Self, TypeVar
 
 import yaml
 
@@ -50,7 +50,7 @@ class PPOConfig:
     def envs_per_minibatch(self) -> int:
         return self.num_envs // self.num_minibatches
 
-    def validate(self) -> PPOConfig:
+    def validate(self) -> Self:
         """Raise a helpful error for invalid training shapes or values."""
 
         if self.total_timesteps < self.batch_size:
@@ -87,7 +87,7 @@ class PPOConfig:
             raise ValueError("gpu_monitor_interval_seconds must be positive.")
         return self
 
-    def with_overrides(self, **overrides: Any) -> PPOConfig:
+    def with_overrides(self, **overrides: Any) -> Self:
         """Return a validated copy with selected values replaced."""
 
         known_fields = {field.name for field in fields(self)}
@@ -101,22 +101,54 @@ class PPOConfig:
         return asdict(self)
 
 
-def load_config(path: str | Path) -> PPOConfig:
-    """Load a PPO configuration from YAML."""
+@dataclass(frozen=True)
+class SkillPPOConfig(PPOConfig):
+    """Configuration for the categorical goal-conditioned executor."""
 
+    skill_horizon: int = 8
+    skill_embedding_size: int = 32
+
+    def validate(self) -> Self:
+        super().validate()
+        if self.skill_horizon < 2:
+            raise ValueError("skill_horizon must be at least 2.")
+        if self.skill_embedding_size < 1:
+            raise ValueError("skill_embedding_size must be positive.")
+        return self
+
+
+ConfigType = TypeVar("ConfigType", bound=PPOConfig)
+
+
+def _load_config(
+    path: str | Path,
+    config_type: type[ConfigType],
+) -> ConfigType:
     config_path = Path(path)
     with config_path.open("r", encoding="utf-8") as file:
         raw = yaml.safe_load(file) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"Expected a YAML mapping in {config_path}.")
 
-    known_fields = {field.name for field in fields(PPOConfig)}
+    known_fields = {field.name for field in fields(config_type)}
     unknown = set(raw) - known_fields
     if unknown:
         names = ", ".join(sorted(unknown))
         raise ValueError(f"Unknown fields in {config_path}: {names}")
 
-    return PPOConfig(**raw).validate()
+    return config_type(**raw).validate()
+
+
+def load_config(path: str | Path) -> PPOConfig:
+    """Load a baseline PPO configuration from YAML."""
+
+    return _load_config(path, PPOConfig)
+
+
+def load_skill_config(path: str | Path) -> SkillPPOConfig:
+    """Load a goal-conditioned PPO configuration from YAML."""
+
+    return _load_config(path, SkillPPOConfig)
 
 
 def save_config(config: PPOConfig, path: str | Path) -> None:

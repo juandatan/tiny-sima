@@ -1,5 +1,10 @@
 """Policy evaluation helpers."""
 
+from tiny_sima.evaluation.goal_conditioned import (
+    evaluate_goal_conditioned_checkpoint,
+    evaluate_goal_conditioned_policy,
+    evaluate_goal_conditioned_skill,
+)
 from tiny_sima.evaluation.gpu_monitor import (
     NvidiaSmiMonitor,
     jax_allocator_summary,
@@ -14,6 +19,9 @@ from tiny_sima.evaluation.skills import (
 __all__ = [
     "NvidiaSmiMonitor",
     "evaluate_checkpoint",
+    "evaluate_goal_conditioned_checkpoint",
+    "evaluate_goal_conditioned_policy",
+    "evaluate_goal_conditioned_skill",
     "evaluate_policy",
     "evaluate_skill_policy",
     "evaluate_skill_suite",

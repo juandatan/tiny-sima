@@ -13,6 +13,8 @@ from tiny_sima.goals import (
     SkillId,
     get_skill_spec,
     skill_catalog,
+    skill_id_from_index,
+    skill_index,
     skill_precondition,
     skill_progress,
     skill_success,
@@ -134,3 +136,9 @@ def test_skill_goal_validates_quantity_and_horizon() -> None:
         SkillGoal(SkillId.COLLECT_WOOD, quantity=0)
     with pytest.raises(ValueError, match="horizon"):
         SkillGoal(SkillId.COLLECT_WOOD, horizon=0)
+
+
+def test_skill_indices_are_stable_and_reversible() -> None:
+    for expected_index, skill_id in enumerate(SKILL_REGISTRY):
+        assert skill_index(skill_id) == expected_index
+        assert skill_id_from_index(expected_index) is skill_id

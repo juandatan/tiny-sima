@@ -3,10 +3,13 @@ import jax.numpy as jnp
 
 from tiny_sima.executor.model import (
     ActorCriticRNN,
+    GoalConditionedActorCriticRNN,
     apply_actor_critic,
+    apply_goal_conditioned_actor_critic,
     categorical_entropy,
     categorical_log_probability,
     initial_hidden,
+    initialize_goal_conditioned_parameters,
     initialize_parameters,
 )
 
@@ -48,3 +51,32 @@ def test_categorical_helpers() -> None:
     assert entropy.shape == (1,)
     assert log_probability[0] <= 0.0
     assert entropy[0] > 0.0
+
+
+def test_goal_conditioned_actor_critic_shapes() -> None:
+    model = GoalConditionedActorCriticRNN(
+        num_actions=17,
+        num_skills=6,
+        hidden_size=32,
+        skill_embedding_size=8,
+    )
+    params = initialize_goal_conditioned_parameters(
+        model,
+        jax.random.PRNGKey(0),
+        (19,),
+        batch_size=3,
+    )
+    output = apply_goal_conditioned_actor_critic(
+        model,
+        params,
+        initial_hidden(3, 32),
+        (
+            jnp.zeros((5, 3, 19), dtype=jnp.float32),
+            jnp.array([[0, 1, 2]] * 5, dtype=jnp.int32),
+            jnp.zeros((5, 3), dtype=jnp.bool_),
+        ),
+    )
+
+    assert output.hidden.shape == (3, 32)
+    assert output.logits.shape == (5, 3, 17)
+    assert output.value.shape == (5, 3)

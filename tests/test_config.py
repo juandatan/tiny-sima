@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from tiny_sima.config import PPOConfig, load_config, save_config
+from tiny_sima.config import (
+    PPOConfig,
+    SkillPPOConfig,
+    load_config,
+    load_skill_config,
+    save_config,
+)
 
 
 def test_default_config_is_valid() -> None:
@@ -61,3 +67,24 @@ def test_config_allows_disabling_optimistic_resets() -> None:
 def test_config_rejects_invalid_gpu_monitor_interval() -> None:
     with pytest.raises(ValueError, match="gpu_monitor_interval_seconds"):
         PPOConfig(gpu_monitor_interval_seconds=0).validate()
+
+
+def test_skill_config_round_trip(tmp_path: Path) -> None:
+    path = tmp_path / "skill_config.yaml"
+    expected = SkillPPOConfig(
+        seed=3,
+        skill_horizon=12,
+        skill_embedding_size=24,
+    ).validate()
+
+    save_config(expected, path)
+    actual = load_skill_config(path)
+
+    assert actual == expected
+
+
+def test_skill_config_rejects_invalid_skill_shape() -> None:
+    with pytest.raises(ValueError, match="skill_horizon"):
+        SkillPPOConfig(skill_horizon=1).validate()
+    with pytest.raises(ValueError, match="skill_embedding_size"):
+        SkillPPOConfig(skill_embedding_size=0).validate()

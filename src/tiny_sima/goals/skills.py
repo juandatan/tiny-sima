@@ -106,11 +106,31 @@ SKILL_REGISTRY: dict[SkillId, SkillSpec] = {
     ),
 }
 
+SKILL_IDS: tuple[SkillId, ...] = tuple(SKILL_REGISTRY)
+SKILL_TO_INDEX: dict[SkillId, int] = {
+    skill_id: index for index, skill_id in enumerate(SKILL_IDS)
+}
+
 
 def get_skill_spec(skill_id: SkillId | str) -> SkillSpec:
     """Return metadata for a known skill."""
 
     return SKILL_REGISTRY[SkillId(skill_id)]
+
+
+def skill_index(skill_id: SkillId | str) -> int:
+    """Return the stable categorical index used by the executor."""
+
+    return SKILL_TO_INDEX[SkillId(skill_id)]
+
+
+def skill_id_from_index(index: int) -> SkillId:
+    """Return the skill associated with a categorical executor index."""
+
+    try:
+        return SKILL_IDS[index]
+    except IndexError as error:
+        raise ValueError(f"Unknown skill index: {index}") from error
 
 
 def skill_catalog() -> list[dict[str, Any]]:
@@ -119,6 +139,7 @@ def skill_catalog() -> list[dict[str, Any]]:
     return [
         {
             "skill_id": spec.skill_id.value,
+            "skill_index": skill_index(spec.skill_id),
             "instruction": spec.instruction,
             "description": spec.description,
             "default_horizon": spec.default_horizon,

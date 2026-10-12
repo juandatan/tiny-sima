@@ -10,10 +10,16 @@ import jax.numpy as jnp
 from craftax.craftax_classic.constants import DIRECTIONS, Action, BlockType
 from craftax.craftax_classic.envs.craftax_state import Inventory
 
-from tiny_sima.envs.craftax import CraftaxBundle, make_environment
+from tiny_sima.envs.craftax import (
+    CraftaxBundle,
+    EnvironmentSpec,
+    make_environment,
+)
 from tiny_sima.goals.skills import (
+    SKILL_IDS,
     SkillGoal,
     SkillId,
+    skill_index,
     skill_metric,
     skill_precondition,
     skill_progress_from_metric,
@@ -52,6 +58,25 @@ class PreparedSkillScenario(NamedTuple):
 
     state: Any
     target_direction: jax.Array
+
+
+class GoalConditionedSkillReset(NamedTuple):
+    """Batched observations, state, and categorical goals after reset."""
+
+    observation: jax.Array
+    state: SkillEpisodeState
+    skill_id: jax.Array
+
+
+class GoalConditionedSkillStep(NamedTuple):
+    """Batched transition returned during goal-conditioned training."""
+
+    observation: jax.Array
+    state: SkillEpisodeState
+    skill_id: jax.Array
+    reward: jax.Array
+    done: jax.Array
+    info: dict[str, jax.Array]
 
 
 @dataclass(frozen=True)
@@ -274,3 +299,152 @@ def step_skill_batch(
 
     step_keys = jax.random.split(rng, action.shape[0])
     return jax.vmap(environment.step)(step_keys, state, action)
+
+
+def _concatenate_pytrees(*values: Any) -> Any:
+    return jax.tree_util.tree_map(
+        lambda *leaves: jnp.concatenate(leaves, axis=0),
+        *values,
+    )
+
+
+def _select_completed(
+    done: jax.Array,
+    reset_value: Any,
+    stepped_value: Any,
+) -> Any:
+    def select_leaf(reset_leaf: jax.Array, stepped_leaf: jax.Array) -> jax.Array:
+        mask_shape = (done.shape[0],) + (1,) * (reset_leaf.ndim - 1)
+        return jnp.where(done.reshape(mask_shape), reset_leaf, stepped_leaf)
+
+    return jax.tree_util.tree_map(select_leaf, reset_value, stepped_value)
+
+
+@dataclass(frozen=True)
+class VectorizedSkillEnvironment:
+    """Balanced multi-skill environment with automatic episode resets."""
+
+    environments: tuple[SkillEnvironment, ...]
+    envs_per_skill: int
+
+    @property
+    def num_envs(self) -> int:
+        return len(self.environments) * self.envs_per_skill
+
+    @property
+    def num_skills(self) -> int:
+        return len(self.environments)
+
+    @property
+    def spec(self) -> EnvironmentSpec:
+        return self.environments[0].bundle.spec
+
+    @property
+    def skill_ids(self) -> jax.Array:
+        return jnp.repeat(
+            jnp.arange(self.num_skills, dtype=jnp.int32),
+            self.envs_per_skill,
+        )
+
+    def reset(self, rng: jax.Array) -> GoalConditionedSkillReset:
+        reset_keys = jax.random.split(rng, self.num_skills)
+        resets = tuple(
+            reset_skill_batch(environment, reset_keys[index], self.envs_per_skill)
+            for index, environment in enumerate(self.environments)
+        )
+        return GoalConditionedSkillReset(
+            observation=jnp.concatenate(
+                tuple(reset.observation for reset in resets),
+                axis=0,
+            ),
+            state=_concatenate_pytrees(*(reset.state for reset in resets)),
+            skill_id=self.skill_ids,
+        )
+
+    def step(
+        self,
+        rng: jax.Array,
+        state: SkillEpisodeState,
+        action: jax.Array,
+    ) -> GoalConditionedSkillStep:
+        keys = jax.random.split(rng, self.num_skills * 2)
+        steps: list[SkillStep] = []
+        next_states: list[SkillEpisodeState] = []
+        next_observations: list[jax.Array] = []
+
+        for index, environment in enumerate(self.environments):
+            start = index * self.envs_per_skill
+            stop = start + self.envs_per_skill
+
+            def slice_group(
+                value: jax.Array,
+                group_start: int = start,
+                group_stop: int = stop,
+            ) -> jax.Array:
+                return value[group_start:group_stop]
+
+            group_state = jax.tree_util.tree_map(
+                slice_group,
+                state,
+            )
+            result = step_skill_batch(
+                environment,
+                keys[2 * index],
+                group_state,
+                action[start:stop],
+            )
+            reset = reset_skill_batch(
+                environment,
+                keys[2 * index + 1],
+                self.envs_per_skill,
+            )
+            steps.append(result)
+            next_states.append(
+                _select_completed(result.done, reset.state, result.state)
+            )
+            next_observations.append(
+                _select_completed(
+                    result.done,
+                    reset.observation,
+                    result.observation,
+                )
+            )
+
+        skill_ids = self.skill_ids
+        info = _concatenate_pytrees(*(step.info for step in steps))
+        info = {**info, "skill_index": skill_ids}
+        return GoalConditionedSkillStep(
+            observation=jnp.concatenate(tuple(next_observations), axis=0),
+            state=_concatenate_pytrees(*next_states),
+            skill_id=skill_ids,
+            reward=jnp.concatenate(tuple(step.reward for step in steps), axis=0),
+            done=jnp.concatenate(tuple(step.done for step in steps), axis=0),
+            info=info,
+        )
+
+
+def make_vectorized_skill_environment(
+    *,
+    num_envs: int,
+    horizon: int = 8,
+) -> VectorizedSkillEnvironment:
+    """Create a balanced batch covering every registered skill."""
+
+    num_skills = len(SKILL_IDS)
+    if num_envs < num_skills or num_envs % num_skills:
+        raise ValueError(
+            f"num_envs must be divisible by the {num_skills} registered skills."
+        )
+    environments = tuple(
+        make_skill_environment(skill_id, horizon=horizon)
+        for skill_id in SKILL_IDS
+    )
+    expected_indices = tuple(
+        skill_index(environment.goal.skill_id) for environment in environments
+    )
+    if expected_indices != tuple(range(num_skills)):
+        raise AssertionError("Skill environment order does not match skill indices.")
+    return VectorizedSkillEnvironment(
+        environments=environments,
+        envs_per_skill=num_envs // num_skills,
+    )

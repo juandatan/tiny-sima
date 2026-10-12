@@ -38,7 +38,9 @@ cuda12 = [
 
 [project.scripts]
 tiny-sima-train = "tiny_sima.executor.ppo:main"
+tiny-sima-train-skills = "tiny_sima.executor.skill_ppo:main"
 tiny-sima-evaluate = "tiny_sima.evaluation.policy:main"
+tiny-sima-evaluate-trained-skills = "tiny_sima.evaluation.goal_conditioned:main"
 tiny-sima-benchmark = "tiny_sima.envs.craftax:main"
 tiny-sima-profile = "tiny_sima.profiling:main"
 tiny-sima-compare-learning = "tiny_sima.learning_comparison:main"

@@ -2,7 +2,9 @@
 
 from tiny_sima.envs.craftax import (
     CraftaxBundle,
+    EnvironmentReset,
     EnvironmentSpec,
+    EnvironmentStep,
     VectorizedCraftax,
     benchmark_environment,
     make_environment,
@@ -10,9 +12,15 @@ from tiny_sima.envs.craftax import (
     render_state,
 )
 from tiny_sima.envs.skills import (
+    GoalConditionedSkillReset,
+    GoalConditionedSkillStep,
     SkillEnvironment,
     SkillEpisodeState,
+    SkillReset,
+    SkillStep,
+    VectorizedSkillEnvironment,
     make_skill_environment,
+    make_vectorized_skill_environment,
     prepare_skill_scenario,
     reset_skill_batch,
     step_skill_batch,
@@ -20,13 +28,21 @@ from tiny_sima.envs.skills import (
 
 __all__ = [
     "CraftaxBundle",
+    "EnvironmentReset",
     "EnvironmentSpec",
+    "EnvironmentStep",
+    "GoalConditionedSkillReset",
+    "GoalConditionedSkillStep",
     "SkillEnvironment",
     "SkillEpisodeState",
+    "SkillReset",
+    "SkillStep",
+    "VectorizedSkillEnvironment",
     "VectorizedCraftax",
     "benchmark_environment",
     "make_environment",
     "make_skill_environment",
+    "make_vectorized_skill_environment",
     "make_vectorized_environment",
     "prepare_skill_scenario",
     "render_state",

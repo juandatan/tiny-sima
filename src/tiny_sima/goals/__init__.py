@@ -1,12 +1,16 @@
 """Skill definitions and reward predicates."""
 
 from tiny_sima.goals.skills import (
+    SKILL_IDS,
     SKILL_REGISTRY,
+    SKILL_TO_INDEX,
     SkillGoal,
     SkillId,
     SkillSpec,
     get_skill_spec,
     skill_catalog,
+    skill_id_from_index,
+    skill_index,
     skill_metric,
     skill_precondition,
     skill_progress,
@@ -18,11 +22,15 @@ from tiny_sima.goals.skills import (
 
 __all__ = [
     "SKILL_REGISTRY",
+    "SKILL_IDS",
+    "SKILL_TO_INDEX",
     "SkillGoal",
     "SkillId",
     "SkillSpec",
     "get_skill_spec",
     "skill_catalog",
+    "skill_id_from_index",
+    "skill_index",
     "skill_metric",
     "skill_precondition",
     "skill_progress",

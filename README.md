@@ -170,7 +170,17 @@ Evaluate its final checkpoint:
 tiny-sima-evaluate runs/ppo-debug/checkpoints/final
 ```
 
+Train and evaluate the categorical goal-conditioned executor:
+
+```bash
+tiny-sima-train-skills --config configs/skill_ppo_debug.yaml
+tiny-sima-evaluate-trained-skills \
+  runs/skill-ppo-debug/checkpoints/final \
+  --episodes-per-skill 64
+```
+
 The larger Phase 1 configuration is available at `configs/ppo_1m.yaml`.
+The longer Phase 3 configuration is available at `configs/skill_ppo_1m.yaml`.
 Generated runs and checkpoints are written under `runs/` and are not tracked
 by Git.
 
@@ -510,7 +520,8 @@ tiny-sima/
 │   ├── 02_evaluate_baseline.ipynb
 │   ├── 02_compare_learning_scaling.ipynb
 │   ├── 03_evaluate_skills.ipynb
-│   └── 04_hierarchical_evaluation.ipynb
+│   ├── 04_train_goal_conditioned.ipynb
+│   └── 05_hierarchical_evaluation.ipynb
 ├── src/
 │   └── tiny_sima/
 │       ├── envs/
@@ -526,7 +537,8 @@ tiny-sima/
 
 ## Current status
 
-**Phase 1 is complete and the Phase 2 skill benchmark is in progress.**
+**Phases 1 and 2 are complete. Phase 3 goal-conditioned training is in
+progress.**
 
 Implemented:
 
@@ -589,5 +601,16 @@ Completed on October 12, 2026:
 - Converted `notebooks/03_evaluate_skills.ipynb` into an executable Phase 2
   benchmark.
 
-The next step is to add progressively less-structured starting states and
-condition the PPO executor on the selected skill.
+Started on October 12, 2026:
+
+- Added a balanced multi-skill environment with automatic short-episode
+  resets.
+- Added a recurrent actor-critic conditioned on learned categorical skill
+  embeddings.
+- Added a separate goal-conditioned PPO trainer and checkpoint evaluator.
+- Added debug and one-million-step configurations.
+- Added `notebooks/04_train_goal_conditioned.ipynb` for notebook-based
+  training and per-skill evaluation.
+
+The next step is to run the goal-conditioned baseline, record per-skill
+success rates, and then add progressively less-structured starting states.

@@ -7,6 +7,7 @@ from craftax.craftax_classic.constants import Action
 from tiny_sima.envs.skills import (
     SkillStep,
     make_skill_environment,
+    make_vectorized_skill_environment,
     reset_skill_batch,
 )
 from tiny_sima.evaluation.skills import (
@@ -100,3 +101,27 @@ def test_random_skill_baseline_returns_valid_metrics() -> None:
 
     assert 0.0 <= result["success_rate"] <= 1.0
     assert 1.0 <= result["mean_episode_length"] <= 4.0
+
+
+def test_vectorized_skill_environment_is_balanced_and_auto_resets() -> None:
+    environment = make_vectorized_skill_environment(num_envs=12, horizon=4)
+    reset = environment.reset(jax.random.PRNGKey(0))
+
+    assert reset.observation.shape == (
+        12,
+        *environment.spec.observation_shape,
+    )
+    assert np.bincount(np.asarray(reset.skill_id), minlength=6).tolist() == [2] * 6
+
+    action = jnp.zeros((12,), dtype=jnp.int32)
+    result = environment.step(jax.random.PRNGKey(1), reset.state, action)
+
+    assert result.observation.shape == reset.observation.shape
+    assert result.state.steps.shape == (12,)
+    assert result.reward.shape == (12,)
+    assert result.done.shape == (12,)
+
+
+def test_vectorized_skill_environment_requires_balanced_groups() -> None:
+    with pytest.raises(ValueError, match="divisible"):
+        make_vectorized_skill_environment(num_envs=8)
