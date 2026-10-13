@@ -1,21 +1,69 @@
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 
+from tiny_sima.config import SkillPPOConfig
 from tiny_sima.envs.chains import make_skill_chain_environment
 from tiny_sima.evaluation.chains import (
     WOOD_TO_STONE_CHAIN,
     ChainTermination,
+    LearnedSkillExecutor,
     ScriptedSkillExecutor,
+    SkillChainSpec,
+    _record_skill_failures,
+    evaluate_learned_skill_chain_batched,
     evaluate_skill_chain,
 )
-from tiny_sima.goals import SkillId
+from tiny_sima.executor.model import (
+    initialize_goal_conditioned_parameters,
+    make_goal_conditioned_actor_critic,
+)
+from tiny_sima.goals import SKILL_IDS, SkillId
 from tiny_sima.planner.saycan import (
     PlannerContext,
     SayCanPlanner,
     SequentialUtilityScorer,
     SkillOutcome,
 )
+
+
+def _make_random_learned_executor() -> LearnedSkillExecutor:
+    config = SkillPPOConfig(
+        total_timesteps=12,
+        num_envs=6,
+        num_steps=2,
+        num_minibatches=1,
+        use_optimistic_resets=False,
+        hidden_size=16,
+        skill_embedding_size=4,
+        monitor_gpu=False,
+    ).validate()
+    environment = make_skill_chain_environment()
+    model = make_goal_conditioned_actor_critic(
+        num_actions=environment.bundle.spec.num_actions,
+        num_skills=len(SKILL_IDS),
+        hidden_size=config.hidden_size,
+        skill_embedding_size=config.skill_embedding_size,
+    )
+    params = initialize_goal_conditioned_parameters(
+        model,
+        jax.random.PRNGKey(0),
+        environment.bundle.spec.observation_shape,
+    )
+    return LearnedSkillExecutor(
+        params=params,
+        config=config,
+        model=model,
+    )
+
+
+def _always_complete(_state: Any) -> bool:
+    return True
+
+
+def _always_complete_jax(_state: Any) -> jax.Array:
+    return jnp.asarray(True)
 
 
 def test_saycan_scores_utility_times_feasibility() -> None:
@@ -93,3 +141,84 @@ def test_alternative_valid_plan_satisfies_state_based_objective() -> None:
     )
 
     assert result["success_rate"] == 1.0
+
+
+def test_batched_learned_chain_evaluation_runs_in_jax() -> None:
+    executor = _make_random_learned_executor()
+
+    result = evaluate_learned_skill_chain_batched(
+        executor,
+        num_episodes=2,
+        seed=0,
+        skill_horizon=2,
+        max_decisions=2,
+    )
+
+    assert result["batched"] is True
+    assert result["num_episodes"] == 2
+    assert 0.0 <= result["success_rate"] <= 1.0
+    assert sum(result["termination_counts"].values()) == 2
+    assert result["mean_environment_steps"] <= 4
+
+    cached_result = evaluate_learned_skill_chain_batched(
+        executor,
+        num_episodes=2,
+        seed=1,
+        skill_horizon=2,
+        max_decisions=2,
+    )
+    assert cached_result["compile_cache_hit"] is True
+
+
+def test_batched_chain_uses_state_based_completion_and_stops_early() -> None:
+    chain = SkillChainSpec(
+        name="already_complete",
+        objective="Objective already holds.",
+        reference_skills=(SkillId.COLLECT_WOOD,),
+        is_complete=_always_complete,
+        is_complete_jax=_always_complete_jax,
+    )
+
+    result = evaluate_learned_skill_chain_batched(
+        _make_random_learned_executor(),
+        chain=chain,
+        num_episodes=2,
+        seed=0,
+        skill_horizon=2,
+        max_decisions=2,
+    )
+
+    assert result["success_rate"] == 1.0
+    assert result["mean_completed_skills"] == 0.0
+    assert result["mean_decisions"] == 0.0
+    assert result["mean_environment_steps"] == 0.0
+    assert result["termination_counts"]["success"] == 2
+
+
+def test_batched_failure_counts_persist_across_successful_options() -> None:
+    skill_ids = jnp.asarray(
+        [SKILL_IDS.index(SkillId.COLLECT_WOOD)],
+        dtype=jnp.int32,
+    )
+    failures = jnp.zeros((1, len(SKILL_IDS)), dtype=jnp.int32)
+
+    failures, selected = _record_skill_failures(
+        failures,
+        skill_ids,
+        jnp.asarray([True]),
+    )
+    assert int(selected[0]) == 1
+
+    failures, selected = _record_skill_failures(
+        failures,
+        skill_ids,
+        jnp.asarray([False]),
+    )
+    assert int(selected[0]) == 1
+
+    _, selected = _record_skill_failures(
+        failures,
+        skill_ids,
+        jnp.asarray([True]),
+    )
+    assert int(selected[0]) == 2

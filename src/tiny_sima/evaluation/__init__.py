@@ -6,6 +6,7 @@ from tiny_sima.evaluation.chains import (
     LearnedSkillExecutor,
     ScriptedSkillExecutor,
     evaluate_chain_episode,
+    evaluate_learned_skill_chain_batched,
     evaluate_skill_chain,
     learned_skill_executor_from_checkpoint,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "diagnose_goal_conditioned_skill",
     "evaluate_checkpoint",
     "evaluate_chain_episode",
+    "evaluate_learned_skill_chain_batched",
     "evaluate_goal_conditioned_checkpoint",
     "evaluate_goal_conditioned_policy",
     "evaluate_goal_conditioned_skill",

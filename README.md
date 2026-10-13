@@ -508,6 +508,12 @@ termination, native return, candidate factors, and repeated-failure penalties.
 This provides a typed feedback channel for planner memory and avoids silently
 attributing executor failures to the planner.
 
+Fixed-plan learned-executor evaluations batch persistent worlds into one
+compiled JAX state machine. Completed environments are masked while each
+world tracks its current option, horizon, retries, and termination reason. The
+generic Python evaluator remains available for arbitrary planners and detailed
+per-decision traces.
+
 Tasks:
 
 - Define the planner input and output schemas.
