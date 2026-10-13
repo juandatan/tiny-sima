@@ -151,6 +151,30 @@ def test_vectorized_skill_environment_requires_balanced_groups() -> None:
         make_vectorized_skill_environment(num_envs=8)
 
 
+def test_vectorized_local_training_keeps_place_table_nearby() -> None:
+    environment = make_vectorized_skill_environment(
+        num_envs=12,
+        horizon=32,
+        scenario=SkillScenario.LOCAL_NAVIGATION,
+        min_distance=3,
+        max_distance=4,
+        distractor_count=5,
+    )
+
+    scenarios = {
+        skill_environment.goal.skill_id: skill_environment.scenario
+        for skill_environment in environment.environments
+    }
+    for skill_id in LOCAL_NAVIGATION_SKILLS:
+        assert scenarios[skill_id] == SkillScenarioConfig(
+            SkillScenario.LOCAL_NAVIGATION,
+            min_distance=3,
+            max_distance=4,
+            distractor_count=5,
+        )
+    assert scenarios[SkillId.PLACE_TABLE].kind is SkillScenario.NEARBY
+
+
 @pytest.mark.parametrize("skill_id", LOCAL_NAVIGATION_SKILLS)
 def test_local_navigation_scripted_policy_succeeds(
     skill_id: SkillId,

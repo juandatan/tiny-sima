@@ -75,6 +75,10 @@ def test_skill_config_round_trip(tmp_path: Path) -> None:
         seed=3,
         skill_horizon=12,
         skill_embedding_size=24,
+        skill_scenario="local_navigation",
+        skill_min_distance=3,
+        skill_max_distance=5,
+        skill_distractor_count=4,
     ).validate()
 
     save_config(expected, path)
@@ -88,3 +92,14 @@ def test_skill_config_rejects_invalid_skill_shape() -> None:
         SkillPPOConfig(skill_horizon=1).validate()
     with pytest.raises(ValueError, match="skill_embedding_size"):
         SkillPPOConfig(skill_embedding_size=0).validate()
+    with pytest.raises(ValueError, match="skill_scenario"):
+        SkillPPOConfig(skill_scenario="unknown").validate()
+    with pytest.raises(ValueError, match="skill_min_distance"):
+        SkillPPOConfig(skill_min_distance=0).validate()
+    with pytest.raises(ValueError, match="skill_max_distance"):
+        SkillPPOConfig(
+            skill_min_distance=4,
+            skill_max_distance=3,
+        ).validate()
+    with pytest.raises(ValueError, match="skill_distractor_count"):
+        SkillPPOConfig(skill_distractor_count=33).validate()

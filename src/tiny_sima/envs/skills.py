@@ -712,16 +712,37 @@ def make_vectorized_skill_environment(
     *,
     num_envs: int,
     horizon: int = 8,
+    scenario: SkillScenario | str = SkillScenario.NEARBY,
+    min_distance: int = 2,
+    max_distance: int = 4,
+    distractor_count: int = 6,
 ) -> VectorizedSkillEnvironment:
-    """Create a balanced batch covering every registered skill."""
+    """Create a balanced batch covering every registered skill.
+
+    Local navigation applies to skills with a visible target. ``place_table``
+    remains a nearby scenario because it has no destination to navigate to.
+    """
 
     num_skills = len(SKILL_IDS)
     if num_envs < num_skills or num_envs % num_skills:
         raise ValueError(
             f"num_envs must be divisible by the {num_skills} registered skills."
         )
+    normalized_scenario = SkillScenario(scenario)
     environments = tuple(
-        make_skill_environment(skill_id, horizon=horizon) for skill_id in SKILL_IDS
+        make_skill_environment(
+            skill_id,
+            horizon=horizon,
+            scenario=(
+                normalized_scenario
+                if skill_id in LOCAL_NAVIGATION_SKILLS
+                else SkillScenario.NEARBY
+            ),
+            min_distance=min_distance,
+            max_distance=max_distance,
+            distractor_count=distractor_count,
+        )
+        for skill_id in SKILL_IDS
     )
     expected_indices = tuple(
         skill_index(environment.goal.skill_id) for environment in environments

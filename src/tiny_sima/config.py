@@ -108,6 +108,10 @@ class SkillPPOConfig(PPOConfig):
     skill_horizon: int = 8
     skill_embedding_size: int = 32
     normalize_advantages_per_skill: bool = False
+    skill_scenario: str = "nearby"
+    skill_min_distance: int = 2
+    skill_max_distance: int = 4
+    skill_distractor_count: int = 6
 
     def validate(self) -> Self:
         super().validate()
@@ -115,6 +119,20 @@ class SkillPPOConfig(PPOConfig):
             raise ValueError("skill_horizon must be at least 2.")
         if self.skill_embedding_size < 1:
             raise ValueError("skill_embedding_size must be positive.")
+        if self.skill_scenario not in {"nearby", "local_navigation"}:
+            raise ValueError(
+                "skill_scenario must be 'nearby' or 'local_navigation'."
+            )
+        if self.skill_min_distance < 1:
+            raise ValueError("skill_min_distance must be positive.")
+        if self.skill_max_distance < self.skill_min_distance:
+            raise ValueError(
+                "skill_max_distance must be at least skill_min_distance."
+            )
+        if not 0 <= self.skill_distractor_count <= 32:
+            raise ValueError(
+                "skill_distractor_count must be between 0 and 32."
+            )
         return self
 
 

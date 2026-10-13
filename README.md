@@ -186,6 +186,18 @@ tiny-sima-evaluate-trained-skills \
   --episodes-per-skill 64
 ```
 
+Train from scratch on the static local-navigation distribution:
+
+```bash
+tiny-sima-train-skills --config configs/skill_ppo_local_debug.yaml
+# After the debug run succeeds:
+tiny-sima-train-skills --config configs/skill_ppo_local_1m.yaml
+```
+
+The local-navigation trainer uses randomized visible targets and controlled
+distractors for the five spatial skills. `place_table` remains a balanced
+nearby-target task because it has no destination to navigate toward.
+
 Evaluate a trained executor on randomized local-navigation scenarios:
 
 ```bash
@@ -207,7 +219,8 @@ tiny-sima-evaluate-chain \
 ```
 
 The larger Phase 1 configuration is available at `configs/ppo_1m.yaml`.
-The longer Phase 3 configuration is available at `configs/skill_ppo_1m.yaml`.
+The longer Phase 3 configurations are available at
+`configs/skill_ppo_1m.yaml` and `configs/skill_ppo_local_1m.yaml`.
 Generated runs and checkpoints are written under `runs/` and are not tracked
 by Git.
 

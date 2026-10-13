@@ -525,6 +525,10 @@ def train_goal_conditioned(
     environment = make_vectorized_skill_environment(
         num_envs=config.num_envs,
         horizon=config.skill_horizon,
+        scenario=config.skill_scenario,
+        min_distance=config.skill_min_distance,
+        max_distance=config.skill_max_distance,
+        distractor_count=config.skill_distractor_count,
     )
     model = make_goal_conditioned_actor_critic(
         num_actions=environment.spec.num_actions,
@@ -586,13 +590,21 @@ def train_goal_conditioned(
     total_completed_episodes = int(episodes.sum())
     total_completed_successes = int(successes.sum())
     summary = {
-        "environment": "Tiny-SIMA-Nearby-Skills-v0",
+        "environment": (
+            "Tiny-SIMA-Local-Navigation-Skills-v0"
+            if config.skill_scenario == "local_navigation"
+            else "Tiny-SIMA-Nearby-Skills-v0"
+        ),
         "device": str(jax.devices()[0]),
         "timesteps": config.total_timesteps,
         "updates": config.num_updates,
         "num_envs": config.num_envs,
         "num_skills": len(SKILL_IDS),
         "skill_horizon": config.skill_horizon,
+        "skill_scenario": config.skill_scenario,
+        "skill_min_distance": config.skill_min_distance,
+        "skill_max_distance": config.skill_max_distance,
+        "skill_distractor_count": config.skill_distractor_count,
         "stratified_minibatches": True,
         "normalize_advantages_per_skill": (config.normalize_advantages_per_skill),
         "total_seconds": loop.total_seconds,
