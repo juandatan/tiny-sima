@@ -1,5 +1,11 @@
 """Environment creation and benchmarking."""
 
+from tiny_sima.envs.chains import (
+    SkillChainEnvironment,
+    SkillChainReset,
+    make_skill_chain_environment,
+    prepare_chain_scenario,
+)
 from tiny_sima.envs.craftax import (
     CraftaxBundle,
     EnvironmentReset,
@@ -12,17 +18,21 @@ from tiny_sima.envs.craftax import (
     render_state,
 )
 from tiny_sima.envs.skills import (
+    LOCAL_NAVIGATION_SKILLS,
     GoalConditionedSkillReset,
     GoalConditionedSkillStep,
     SkillEnvironment,
     SkillEpisodeState,
     SkillReset,
+    SkillScenario,
+    SkillScenarioConfig,
     SkillStep,
     VectorizedSkillEnvironment,
     make_skill_environment,
     make_vectorized_skill_environment,
     prepare_skill_scenario,
     reset_skill_batch,
+    skills_for_scenario,
     step_skill_batch,
 )
 
@@ -33,19 +43,27 @@ __all__ = [
     "EnvironmentStep",
     "GoalConditionedSkillReset",
     "GoalConditionedSkillStep",
+    "LOCAL_NAVIGATION_SKILLS",
     "SkillEnvironment",
     "SkillEpisodeState",
+    "SkillChainEnvironment",
+    "SkillChainReset",
     "SkillReset",
+    "SkillScenario",
+    "SkillScenarioConfig",
     "SkillStep",
     "VectorizedSkillEnvironment",
     "VectorizedCraftax",
     "benchmark_environment",
     "make_environment",
     "make_skill_environment",
+    "make_skill_chain_environment",
     "make_vectorized_skill_environment",
     "make_vectorized_environment",
     "prepare_skill_scenario",
+    "prepare_chain_scenario",
     "render_state",
     "reset_skill_batch",
+    "skills_for_scenario",
     "step_skill_batch",
 ]

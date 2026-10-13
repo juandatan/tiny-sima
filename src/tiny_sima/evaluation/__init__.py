@@ -1,5 +1,14 @@
 """Policy evaluation helpers."""
 
+from tiny_sima.evaluation.chains import (
+    WOOD_TO_STONE_CHAIN,
+    ChainTermination,
+    LearnedSkillExecutor,
+    ScriptedSkillExecutor,
+    evaluate_chain_episode,
+    evaluate_skill_chain,
+    learned_skill_executor_from_checkpoint,
+)
 from tiny_sima.evaluation.goal_conditioned import (
     diagnose_goal_conditioned_checkpoint,
     diagnose_goal_conditioned_policy,
@@ -7,6 +16,7 @@ from tiny_sima.evaluation.goal_conditioned import (
     evaluate_goal_conditioned_checkpoint,
     evaluate_goal_conditioned_policy,
     evaluate_goal_conditioned_skill,
+    load_goal_conditioned_checkpoint,
 )
 from tiny_sima.evaluation.gpu_monitor import (
     NvidiaSmiMonitor,
@@ -21,16 +31,24 @@ from tiny_sima.evaluation.skills import (
 
 __all__ = [
     "NvidiaSmiMonitor",
+    "LearnedSkillExecutor",
+    "ScriptedSkillExecutor",
+    "ChainTermination",
+    "WOOD_TO_STONE_CHAIN",
     "diagnose_goal_conditioned_checkpoint",
     "diagnose_goal_conditioned_policy",
     "diagnose_goal_conditioned_skill",
     "evaluate_checkpoint",
+    "evaluate_chain_episode",
     "evaluate_goal_conditioned_checkpoint",
     "evaluate_goal_conditioned_policy",
     "evaluate_goal_conditioned_skill",
     "evaluate_policy",
     "evaluate_skill_policy",
+    "evaluate_skill_chain",
     "evaluate_skill_suite",
     "jax_allocator_summary",
+    "learned_skill_executor_from_checkpoint",
+    "load_goal_conditioned_checkpoint",
     "scripted_skill_action",
 ]

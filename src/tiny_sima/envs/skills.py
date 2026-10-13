@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
-from craftax.craftax_classic.constants import DIRECTIONS, Action, BlockType
+from craftax.craftax_classic.constants import (
+    DIRECTIONS,
+    OBS_DIM,
+    Action,
+    BlockType,
+)
 from craftax.craftax_classic.envs.craftax_state import Inventory
 
 from tiny_sima.envs.craftax import (
@@ -34,6 +40,8 @@ class SkillEpisodeState(NamedTuple):
     initial_metric: jax.Array
     steps: jax.Array
     target_direction: jax.Array
+    target_position: jax.Array
+    approach_position: jax.Array
 
 
 class SkillReset(NamedTuple):
@@ -58,6 +66,8 @@ class PreparedSkillScenario(NamedTuple):
 
     state: Any
     target_direction: jax.Array
+    target_position: jax.Array
+    approach_position: jax.Array
 
 
 class GoalConditionedSkillReset(NamedTuple):
@@ -79,12 +89,57 @@ class GoalConditionedSkillStep(NamedTuple):
     info: dict[str, jax.Array]
 
 
+class SkillScenario(str, Enum):
+    """Supported controlled distributions for short skill episodes."""
+
+    NEARBY = "nearby"
+    LOCAL_NAVIGATION = "local_navigation"
+
+
+@dataclass(frozen=True, init=False)
+class SkillScenarioConfig:
+    """Static controls for reproducible skill-scenario generation."""
+
+    kind: SkillScenario
+    min_distance: int
+    max_distance: int
+    distractor_count: int
+
+    def __init__(
+        self,
+        kind: SkillScenario | str = SkillScenario.NEARBY,
+        *,
+        min_distance: int = 2,
+        max_distance: int = 4,
+        distractor_count: int = 6,
+    ) -> None:
+        normalized_kind = SkillScenario(kind)
+        if min_distance < 1:
+            raise ValueError("min_distance must be positive.")
+        if max_distance < min_distance:
+            raise ValueError("max_distance must be at least min_distance.")
+        max_visible_distance = OBS_DIM[0] // 2 + OBS_DIM[1] // 2
+        if max_distance > max_visible_distance:
+            raise ValueError(
+                "max_distance must keep targets inside the initial observation."
+            )
+        if distractor_count < 0:
+            raise ValueError("distractor_count cannot be negative.")
+        if distractor_count > 32:
+            raise ValueError("distractor_count cannot exceed 32.")
+        object.__setattr__(self, "kind", normalized_kind)
+        object.__setattr__(self, "min_distance", min_distance)
+        object.__setattr__(self, "max_distance", max_distance)
+        object.__setattr__(self, "distractor_count", distractor_count)
+
+
 @dataclass(frozen=True)
 class SkillEnvironment:
     """A Craftax environment configured for one short objective."""
 
     bundle: CraftaxBundle
     goal: SkillGoal
+    scenario: SkillScenarioConfig
 
     def reset(self, rng: jax.Array) -> SkillReset:
         world_rng, scenario_rng = jax.random.split(rng)
@@ -93,6 +148,7 @@ class SkillEnvironment:
             state,
             self.goal,
             scenario_rng,
+            config=self.scenario,
         )
         observation = self.bundle.env.get_obs(scenario.state)
         episode_state = SkillEpisodeState(
@@ -100,6 +156,8 @@ class SkillEnvironment:
             initial_metric=skill_metric(self.goal.skill_id, scenario.state),
             steps=jnp.array(0, dtype=jnp.int32),
             target_direction=scenario.target_direction,
+            target_position=scenario.target_position,
+            approach_position=scenario.approach_position,
         )
         return SkillReset(observation=observation, state=episode_state)
 
@@ -164,16 +222,106 @@ def _clear_mobs(state: Any) -> Any:
     )
 
 
-def prepare_skill_scenario(
+LOCAL_NAVIGATION_SKILLS: tuple[SkillId, ...] = (
+    SkillId.COLLECT_WOOD,
+    SkillId.COLLECT_STONE,
+    SkillId.DRINK_WATER,
+    SkillId.CRAFT_WOOD_PICKAXE,
+    SkillId.CRAFT_WOOD_SWORD,
+)
+
+
+def skills_for_scenario(
+    scenario: SkillScenario | str,
+) -> tuple[SkillId, ...]:
+    """Return the skills to which a controlled scenario meaningfully applies."""
+
+    if SkillScenario(scenario) is SkillScenario.LOCAL_NAVIGATION:
+        return LOCAL_NAVIGATION_SKILLS
+    return SKILL_IDS
+
+
+def _target_block(skill_id: SkillId) -> BlockType | None:
+    if skill_id is SkillId.COLLECT_WOOD:
+        return BlockType.TREE
+    if skill_id is SkillId.COLLECT_STONE:
+        return BlockType.STONE
+    if skill_id is SkillId.DRINK_WATER:
+        return BlockType.WATER
+    if skill_id in {
+        SkillId.CRAFT_WOOD_PICKAXE,
+        SkillId.CRAFT_WOOD_SWORD,
+    }:
+        return BlockType.CRAFTING_TABLE
+    if skill_id is SkillId.PLACE_TABLE:
+        return None
+    raise AssertionError(f"Unhandled skill: {skill_id}")
+
+
+def _scenario_inventory(skill_id: SkillId) -> Inventory:
+    inventory = Inventory()
+    if skill_id is SkillId.COLLECT_STONE:
+        return replace(inventory, wood_pickaxe=1)
+    if skill_id is SkillId.PLACE_TABLE:
+        return replace(inventory, wood=2)
+    if skill_id in {
+        SkillId.CRAFT_WOOD_PICKAXE,
+        SkillId.CRAFT_WOOD_SWORD,
+    }:
+        return replace(inventory, wood=1)
+    return inventory
+
+
+def _local_offsets(config: SkillScenarioConfig) -> jax.Array:
+    row_radius = OBS_DIM[0] // 2
+    column_radius = OBS_DIM[1] // 2
+    offsets = [
+        (row, column)
+        for row in range(-row_radius, row_radius + 1)
+        for column in range(-column_radius, column_radius + 1)
+        if config.min_distance
+        <= abs(row) + abs(column)
+        <= config.max_distance
+    ]
+    if not offsets:
+        raise ValueError("No local target positions satisfy the distance bounds.")
+    return jnp.asarray(offsets, dtype=jnp.int32)
+
+
+def _direction_to_target(offset: jax.Array) -> jax.Array:
+    row, column = offset[0], offset[1]
+    use_horizontal = (column != 0) & (jnp.abs(column) >= jnp.abs(row))
+    horizontal = jnp.where(column < 0, Action.LEFT.value, Action.RIGHT.value)
+    vertical = jnp.where(row < 0, Action.UP.value, Action.DOWN.value)
+    return jnp.where(use_horizontal, horizontal, vertical).astype(jnp.int32)
+
+
+def _between(value: jax.Array, start: jax.Array, stop: jax.Array) -> jax.Array:
+    lower = jnp.minimum(start, stop)
+    upper = jnp.maximum(start, stop)
+    return (value >= lower) & (value <= upper)
+
+
+def _distractor_blocks(target: BlockType | None) -> jax.Array:
+    candidates = (
+        BlockType.TREE,
+        BlockType.STONE,
+        BlockType.WATER,
+        BlockType.COAL,
+        BlockType.SAND,
+        BlockType.FURNACE,
+    )
+    return jnp.asarray(
+        [block.value for block in candidates if block is not target],
+        dtype=jnp.int32,
+    )
+
+
+def _prepare_nearby_scenario(
     state: Any,
     goal: SkillGoal,
     rng: jax.Array,
 ) -> PreparedSkillScenario:
-    """Inject a valid nearby target while retaining real Craftax dynamics."""
-
-    if goal.quantity != 1:
-        raise ValueError("The nearby-target curriculum currently supports quantity=1.")
-
     target_direction = jax.random.randint(
         rng,
         shape=(),
@@ -198,46 +346,163 @@ def prepare_skill_scenario(
         clean_map = clean_map.at[position[0], position[1]].set(BlockType.GRASS.value)
 
     target_position = player_position + DIRECTIONS[target_direction]
-    skill_id = goal.skill_id
-    inventory = Inventory()
-    player_drink = 9
+    target = _target_block(goal.skill_id)
+    if target is not None:
+        clean_map = clean_map.at[target_position[0], target_position[1]].set(
+            target.value
+        )
+
     player_direction = target_direction
-
-    if skill_id is SkillId.COLLECT_WOOD:
-        clean_map = clean_map.at[target_position[0], target_position[1]].set(
-            BlockType.TREE.value
-        )
-        player_direction = target_direction % 4 + 1
-    elif skill_id is SkillId.COLLECT_STONE:
-        clean_map = clean_map.at[target_position[0], target_position[1]].set(
-            BlockType.STONE.value
-        )
-        inventory = replace(inventory, wood_pickaxe=1)
-        player_direction = target_direction % 4 + 1
-    elif skill_id is SkillId.DRINK_WATER:
-        clean_map = clean_map.at[target_position[0], target_position[1]].set(
-            BlockType.WATER.value
-        )
-        player_drink = 5
-        player_direction = target_direction % 4 + 1
-    elif skill_id is SkillId.PLACE_TABLE:
-        inventory = replace(inventory, wood=2)
-    elif skill_id in {
-        SkillId.CRAFT_WOOD_PICKAXE,
-        SkillId.CRAFT_WOOD_SWORD,
+    if goal.skill_id in {
+        SkillId.COLLECT_WOOD,
+        SkillId.COLLECT_STONE,
+        SkillId.DRINK_WATER,
     }:
-        clean_map = clean_map.at[target_position[0], target_position[1]].set(
-            BlockType.CRAFTING_TABLE.value
-        )
-        inventory = replace(inventory, wood=1)
-    else:
-        raise AssertionError(f"Unhandled skill: {skill_id}")
+        player_direction = target_direction % 4 + 1
 
-    state = _clear_mobs(state)
-    state = state.replace(
-        map=clean_map,
-        player_position=player_position,
-        player_direction=player_direction,
+    return PreparedSkillScenario(
+        state=state.replace(
+            map=clean_map,
+            player_position=player_position,
+            player_direction=player_direction,
+            inventory=_scenario_inventory(goal.skill_id),
+        ),
+        target_direction=target_direction,
+        target_position=target_position,
+        approach_position=player_position,
+    )
+
+
+def _prepare_local_navigation_scenario(
+    state: Any,
+    goal: SkillGoal,
+    rng: jax.Array,
+    config: SkillScenarioConfig,
+) -> PreparedSkillScenario:
+    target_rng, direction_rng, distractor_rng = jax.random.split(rng, 3)
+    player_position = jnp.array(
+        [state.map.shape[0] // 2, state.map.shape[1] // 2],
+        dtype=jnp.int32,
+    )
+    offsets = _local_offsets(config)
+    target_offset = offsets[
+        jax.random.randint(target_rng, (), 0, offsets.shape[0])
+    ]
+    target_direction = _direction_to_target(target_offset)
+    target_position = player_position + target_offset
+    approach_position = target_position - DIRECTIONS[target_direction]
+
+    row_radius = OBS_DIM[0] // 2
+    column_radius = OBS_DIM[1] // 2
+    row_start = state.map.shape[0] // 2 - row_radius
+    row_stop = state.map.shape[0] // 2 + row_radius + 1
+    column_start = state.map.shape[1] // 2 - column_radius
+    column_stop = state.map.shape[1] // 2 + column_radius + 1
+    clean_map = state.map.at[row_start:row_stop, column_start:column_stop].set(
+        BlockType.GRASS.value
+    )
+
+    candidate_offsets = jnp.asarray(
+        [
+            (row, column)
+            for row in range(-row_radius, row_radius + 1)
+            for column in range(-column_radius, column_radius + 1)
+            if row != 0 or column != 0
+        ],
+        dtype=jnp.int32,
+    )
+    approach_offset = approach_position - player_position
+    candidate_rows = candidate_offsets[:, 0]
+    candidate_columns = candidate_offsets[:, 1]
+    vertical_path = (candidate_columns == 0) & _between(
+        candidate_rows,
+        jnp.asarray(0),
+        approach_offset[0],
+    )
+    horizontal_path = (candidate_rows == approach_offset[0]) & _between(
+        candidate_columns,
+        jnp.asarray(0),
+        approach_offset[1],
+    )
+    reserved = (
+        vertical_path
+        | horizontal_path
+        | jnp.all(candidate_offsets == target_offset, axis=-1)
+        | jnp.all(candidate_offsets == approach_offset, axis=-1)
+    )
+    random_scores = jax.random.uniform(
+        distractor_rng,
+        shape=(candidate_offsets.shape[0],),
+    )
+    selected = jnp.argsort(jnp.where(reserved, jnp.inf, random_scores))[
+        : config.distractor_count
+    ]
+    distractor_positions = player_position + candidate_offsets[selected]
+    distractor_blocks = _distractor_blocks(_target_block(goal.skill_id))
+    for index in range(config.distractor_count):
+        position = distractor_positions[index]
+        block = distractor_blocks[index % distractor_blocks.shape[0]]
+        clean_map = clean_map.at[position[0], position[1]].set(block)
+
+    target = _target_block(goal.skill_id)
+    if target is not None:
+        clean_map = clean_map.at[target_position[0], target_position[1]].set(
+            target.value
+        )
+
+    player_direction = jax.random.randint(
+        direction_rng,
+        shape=(),
+        minval=Action.LEFT.value,
+        maxval=Action.DOWN.value + 1,
+        dtype=jnp.int32,
+    )
+    return PreparedSkillScenario(
+        state=state.replace(
+            map=clean_map,
+            player_position=player_position,
+            player_direction=player_direction,
+            inventory=_scenario_inventory(goal.skill_id),
+        ),
+        target_direction=target_direction,
+        target_position=target_position,
+        approach_position=approach_position,
+    )
+
+
+def prepare_skill_scenario(
+    state: Any,
+    goal: SkillGoal,
+    rng: jax.Array,
+    *,
+    config: SkillScenarioConfig | None = None,
+) -> PreparedSkillScenario:
+    """Inject a controlled target while retaining real Craftax dynamics."""
+
+    if goal.quantity != 1:
+        raise ValueError("Controlled skill scenarios currently support quantity=1.")
+
+    scenario_config = config or SkillScenarioConfig()
+    if (
+        scenario_config.kind is SkillScenario.LOCAL_NAVIGATION
+        and goal.skill_id not in LOCAL_NAVIGATION_SKILLS
+    ):
+        raise ValueError(
+            f"{goal.skill_id.value} does not define a local-navigation target."
+        )
+    if scenario_config.kind is SkillScenario.NEARBY:
+        scenario = _prepare_nearby_scenario(state, goal, rng)
+    else:
+        scenario = _prepare_local_navigation_scenario(
+            state,
+            goal,
+            rng,
+            scenario_config,
+        )
+
+    player_drink = 5 if goal.skill_id is SkillId.DRINK_WATER else 9
+    prepared_state = _clear_mobs(scenario.state)
+    prepared_state = prepared_state.replace(
         player_health=9,
         player_food=9,
         player_drink=player_drink,
@@ -247,22 +512,38 @@ def prepare_skill_scenario(
         player_hunger=0.0,
         player_thirst=0.0,
         player_fatigue=0.0,
-        inventory=inventory,
         achievements=jnp.zeros_like(state.achievements),
         timestep=0,
         light_level=1.0,
     )
-    return PreparedSkillScenario(state=state, target_direction=target_direction)
+    return scenario._replace(state=prepared_state)
 
 
 def make_skill_environment(
     skill_id: SkillId | str,
     *,
     horizon: int = 8,
+    scenario: SkillScenario | str = SkillScenario.NEARBY,
+    min_distance: int = 2,
+    max_distance: int = 4,
+    distractor_count: int = 6,
 ) -> SkillEnvironment:
-    """Create the first-stage nearby-target benchmark for one skill."""
+    """Create one controlled skill benchmark environment."""
 
     goal = SkillGoal(SkillId(skill_id), horizon=horizon)
+    scenario_config = SkillScenarioConfig(
+        scenario,
+        min_distance=min_distance,
+        max_distance=max_distance,
+        distractor_count=distractor_count,
+    )
+    if (
+        scenario_config.kind is SkillScenario.LOCAL_NAVIGATION
+        and goal.skill_id not in LOCAL_NAVIGATION_SKILLS
+    ):
+        raise ValueError(
+            f"{goal.skill_id.value} does not define a local-navigation target."
+        )
     bundle = make_environment(
         "Craftax-Classic-Symbolic-v1",
         auto_reset=False,
@@ -275,7 +556,11 @@ def make_skill_environment(
         spawn_zombie_night_chance=0.0,
         spawn_skeleton_chance=0.0,
     )
-    return SkillEnvironment(bundle=replace(bundle, params=params), goal=goal)
+    return SkillEnvironment(
+        bundle=replace(bundle, params=params),
+        goal=goal,
+        scenario=scenario_config,
+    )
 
 
 def reset_skill_batch(

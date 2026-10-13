@@ -186,6 +186,26 @@ tiny-sima-evaluate-trained-skills \
   --episodes-per-skill 64
 ```
 
+Evaluate a trained executor on randomized local-navigation scenarios:
+
+```bash
+tiny-sima-evaluate-trained-skills \
+  runs/skill-ppo-1m/checkpoints/final \
+  --scenario local_navigation \
+  --horizon 32 \
+  --episodes-per-skill 128
+```
+
+Validate the persistent skill chain with the scripted oracle, then substitute
+the learned executor:
+
+```bash
+tiny-sima-evaluate-chain --executor scripted
+tiny-sima-evaluate-chain \
+  --executor learned \
+  --checkpoint runs/skill-ppo-1m/checkpoints/final
+```
+
 The larger Phase 1 configuration is available at `configs/ppo_1m.yaml`.
 The longer Phase 3 configuration is available at `configs/skill_ppo_1m.yaml`.
 Generated runs and checkpoints are written under `runs/` and are not tracked
@@ -410,6 +430,15 @@ state, disables hostile spawning, and continues to use the real Craftax
 transition logic. Episodes terminate on skill success, environment failure,
 or a skill-specific time limit and use a one-shot sparse completion reward.
 
+The second evaluation stage uses `local_navigation` scenarios. Targets are
+randomly placed two to four tiles away inside the initial observation. The
+generator clears a guaranteed route, randomizes the player's direction, and
+adds irrelevant resource and structure distractors outside the route. A
+shortest-path scripted policy must retain 100% success; this distinguishes
+malformed scenarios from learned-policy generalization failures.
+`place_table` is excluded because it has no visible destination to navigate
+toward; it remains covered by the nearby-target benchmark.
+
 ### Phase 3: Goal-conditioned executor
 
 Goal: train one policy that can perform multiple skills.
@@ -434,6 +463,37 @@ Tasks:
 ### Phase 4: Hierarchical planner
 
 Goal: connect the executor to an open-weight VLM.
+
+The first Phase 4 harness composes skills before introducing the VLM. It uses a
+persistent controlled world and the chain:
+
+```text
+collect wood -> collect wood -> place table
+-> collect wood -> craft wood pickaxe -> collect stone
+```
+
+The planner ranks every registered candidate using:
+
+```text
+combined score = utility * feasibility * failure penalty
+```
+
+Utility is currently supplied by the scripted objective. Feasibility is an
+explicit symbolic precondition and will later be replaced or augmented by a
+calibrated executor success estimate. The VLM will replace the utility scorer
+without changing the executor or evaluation loop.
+
+The ordered sequence is private to the scripted baseline. Planner-visible
+context contains only the objective and prior execution outcomes, and chain
+success is determined from the resulting Craftax state. This allows a future
+planner to discover a different valid ordering without being shown or graded
+against the reference answer.
+
+Unlike an open-loop plan, the harness replans after every skill outcome. It
+records success, timeout, lost precondition, infeasibility, environment
+termination, native return, candidate factors, and repeated-failure penalties.
+This provides a typed feedback channel for planner memory and avoids silently
+attributing executor failures to the planner.
 
 Tasks:
 
@@ -552,8 +612,8 @@ tiny-sima/
 
 ## Current status
 
-**Phases 1 and 2 are complete. Phase 3 goal-conditioned training is in
-progress.**
+**Phases 1 through 3 are complete. Phase 4 planner scaffolding and persistent
+skill-chain evaluation are in progress.**
 
 Implemented:
 
@@ -566,6 +626,10 @@ Implemented:
 - Automatic `nvidia-smi` sampling and JAX allocator peak-memory reporting.
 - An initial six-skill registry with preconditions, progress, success, and
   sparse-reward predicates.
+- Randomized local-navigation evaluation with controlled distractors and
+  guaranteed paths.
+- Persistent SayCan-style skill ranking and closed-loop chain evaluation.
+- Scripted and checkpoint-backed chain executors with per-decision traces.
 
 Verified locally on October 8, 2026:
 

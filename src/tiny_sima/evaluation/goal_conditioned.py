@@ -15,8 +15,10 @@ from craftax.craftax_classic.constants import Action
 from tiny_sima.config import SkillPPOConfig, load_skill_config
 from tiny_sima.envs.skills import (
     SkillEpisodeState,
+    SkillScenario,
     make_skill_environment,
     reset_skill_batch,
+    skills_for_scenario,
     step_skill_batch,
 )
 from tiny_sima.evaluation.skill_rollout import (
@@ -321,6 +323,11 @@ def evaluate_goal_conditioned_skill(
     num_episodes: int = 256,
     seed: int = 1,
     deterministic: bool = True,
+    scenario: SkillScenario | str = SkillScenario.NEARBY,
+    horizon: int | None = None,
+    min_distance: int = 2,
+    max_distance: int = 4,
+    distractor_count: int = 6,
 ) -> dict[str, Any]:
     """Evaluate one requested skill over independently generated scenarios."""
 
@@ -328,9 +335,14 @@ def evaluate_goal_conditioned_skill(
         raise ValueError("num_episodes must be positive.")
 
     normalized_skill_id = SkillId(skill_id)
+    evaluation_horizon = config.skill_horizon if horizon is None else horizon
     environment = make_skill_environment(
         normalized_skill_id,
-        horizon=config.skill_horizon,
+        horizon=evaluation_horizon,
+        scenario=scenario,
+        min_distance=min_distance,
+        max_distance=max_distance,
+        distractor_count=distractor_count,
     )
     model = make_goal_conditioned_actor_critic(
         num_actions=environment.bundle.spec.num_actions,
@@ -398,7 +410,7 @@ def evaluate_goal_conditioned_skill(
             step,
             initial_carry,
             None,
-            length=config.skill_horizon,
+            length=evaluation_horizon,
         )
         return finish_skill_tracker(final_carry.tracker)
 
@@ -414,7 +426,12 @@ def evaluate_goal_conditioned_skill(
     )
     return {
         "skill_id": normalized_skill_id.value,
+        "scenario": environment.scenario.kind.value,
         "num_episodes": num_episodes,
+        "horizon": evaluation_horizon,
+        "min_distance": environment.scenario.min_distance,
+        "max_distance": environment.scenario.max_distance,
+        "distractor_count": environment.scenario.distractor_count,
         "seed": seed,
         "deterministic": deterministic,
         "success_rate": float(succeeded.mean()),
@@ -433,9 +450,15 @@ def evaluate_goal_conditioned_policy(
     num_episodes_per_skill: int = 256,
     seed: int = 1,
     deterministic: bool = True,
+    scenario: SkillScenario | str = SkillScenario.NEARBY,
+    horizon: int | None = None,
+    min_distance: int = 2,
+    max_distance: int = 4,
+    distractor_count: int = 6,
 ) -> list[dict[str, Any]]:
     """Evaluate every requested skill independently."""
 
+    scenario_skills = skills_for_scenario(scenario)
     return [
         evaluate_goal_conditioned_skill(
             params,
@@ -444,8 +467,13 @@ def evaluate_goal_conditioned_policy(
             num_episodes=num_episodes_per_skill,
             seed=seed + index,
             deterministic=deterministic,
+            scenario=scenario,
+            horizon=horizon,
+            min_distance=min_distance,
+            max_distance=max_distance,
+            distractor_count=distractor_count,
         )
-        for index, skill_id in enumerate(SKILL_IDS)
+        for index, skill_id in enumerate(scenario_skills)
     ]
 
 
@@ -455,16 +483,26 @@ def evaluate_goal_conditioned_checkpoint(
     num_episodes_per_skill: int = 256,
     seed: int = 1,
     deterministic: bool = True,
+    scenario: SkillScenario | str = SkillScenario.NEARBY,
+    horizon: int | None = None,
+    min_distance: int = 2,
+    max_distance: int = 4,
+    distractor_count: int = 6,
 ) -> list[dict[str, Any]]:
     """Load and evaluate a saved goal-conditioned executor."""
 
-    checkpoint = _load_goal_conditioned_checkpoint(checkpoint_dir)
+    checkpoint = load_goal_conditioned_checkpoint(checkpoint_dir)
     return evaluate_goal_conditioned_policy(
         checkpoint.params,
         checkpoint.config,
         num_episodes_per_skill=num_episodes_per_skill,
         seed=seed,
         deterministic=deterministic,
+        scenario=scenario,
+        horizon=horizon,
+        min_distance=min_distance,
+        max_distance=max_distance,
+        distractor_count=distractor_count,
     )
 
 
@@ -476,7 +514,7 @@ def diagnose_goal_conditioned_checkpoint(
 ) -> list[dict[str, Any]]:
     """Load a checkpoint and probe its action ranking for every skill."""
 
-    checkpoint = _load_goal_conditioned_checkpoint(checkpoint_dir)
+    checkpoint = load_goal_conditioned_checkpoint(checkpoint_dir)
     return diagnose_goal_conditioned_policy(
         checkpoint.params,
         checkpoint.config,
@@ -485,9 +523,11 @@ def diagnose_goal_conditioned_checkpoint(
     )
 
 
-def _load_goal_conditioned_checkpoint(
+def load_goal_conditioned_checkpoint(
     checkpoint_dir: str | Path,
 ) -> LoadedGoalConditionedCheckpoint:
+    """Load executor parameters and configuration for custom evaluations."""
+
     checkpoint_path = Path(checkpoint_dir)
     config = load_skill_config(checkpoint_path / "config.yaml")
     environment = make_skill_environment(
@@ -518,6 +558,20 @@ def main() -> None:
     parser.add_argument("--episodes-per-skill", type=int, default=256)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
+        "--scenario",
+        choices=tuple(scenario.value for scenario in SkillScenario),
+        default=SkillScenario.NEARBY.value,
+    )
+    parser.add_argument(
+        "--horizon",
+        type=int,
+        default=None,
+        help="Override the checkpoint's skill horizon for evaluation.",
+    )
+    parser.add_argument("--min-distance", type=int, default=2)
+    parser.add_argument("--max-distance", type=int, default=4)
+    parser.add_argument("--distractor-count", type=int, default=6)
+    parser.add_argument(
         "--stochastic",
         action="store_true",
         help="Sample actions instead of selecting the most likely action.",
@@ -528,6 +582,11 @@ def main() -> None:
         num_episodes_per_skill=args.episodes_per_skill,
         seed=args.seed,
         deterministic=not args.stochastic,
+        scenario=args.scenario,
+        horizon=args.horizon,
+        min_distance=args.min_distance,
+        max_distance=args.max_distance,
+        distractor_count=args.distractor_count,
     )
     print(json.dumps(results, indent=2, sort_keys=True))
 

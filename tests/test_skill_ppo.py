@@ -1,5 +1,6 @@
 import jax
 import numpy as np
+import pytest
 
 from tiny_sima.config import SkillPPOConfig
 from tiny_sima.envs.skills import make_vectorized_skill_environment
@@ -102,6 +103,15 @@ def test_single_goal_conditioned_ppo_update() -> None:
     assert direct_diagnostic["skill_structure"] == "direct"
     assert direct_diagnostic["initial"]["target"] == "place_table"
     assert direct_diagnostic["after_oracle_turn"] is None
+
+    with pytest.raises(ValueError, match="horizon"):
+        evaluate_goal_conditioned_skill(
+            updated_runner.train_state.params,
+            config,
+            "collect_wood",
+            num_episodes=2,
+            horizon=0,
+        )
 
 
 def test_stratified_minibatches_include_every_skill() -> None:
