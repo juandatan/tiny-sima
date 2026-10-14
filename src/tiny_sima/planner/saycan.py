@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -63,8 +63,53 @@ class PlannerDecision:
     scores: tuple[SkillScore, ...]
 
 
+class PlannerSelectionStatus(str, Enum):
+    """Reason a planner did or did not return a skill."""
+
+    SELECTED = "selected"
+    INVALID_UTILITY = "invalid_utility"
+    NO_VIABLE_SKILL = "no_viable_skill"
+
+
+@dataclass(frozen=True)
+class PlannerSelection:
+    """Planner decision together with utility-model diagnostics."""
+
+    decision: PlannerDecision | None
+    status: PlannerSelectionStatus
+    utility_error: str | None = None
+    utility_ranking: tuple[SkillId, ...] = ()
+    utility_raw_response: str | None = None
+
+
+@dataclass(frozen=True)
+class UtilityScoreBatch:
+    """Whole-catalog utility scores and their validation status."""
+
+    utilities: dict[SkillId, float]
+    valid: bool = True
+    error: str | None = None
+    ranking: tuple[SkillId, ...] = ()
+    raw_response: str | None = None
+
+
 UtilityScorer = Callable[[Any, PlannerContext, SkillId], float]
 FeasibilityScorer = Callable[[Any, PlannerContext, SkillId], float]
+
+
+@runtime_checkable
+class BatchedUtilityScorer(Protocol):
+    """Score the complete skill catalog in one planner-model invocation."""
+
+    def score_all(
+        self,
+        state: Any,
+        context: PlannerContext,
+        candidate_skills: tuple[SkillId, ...],
+    ) -> UtilityScoreBatch:
+        """Return utility in the range zero to one for each candidate."""
+
+        ...
 
 
 def zero_utility(
@@ -75,6 +120,26 @@ def zero_utility(
     """Provide a safe default until a planner utility model is configured."""
 
     return 0.0
+
+
+def constant_utility(
+    _state: Any,
+    _context: PlannerContext,
+    _skill_id: SkillId,
+) -> float:
+    """Give every skill equal utility for feasibility-only ablations."""
+
+    return 1.0
+
+
+def constant_feasibility(
+    _state: Any,
+    _context: PlannerContext,
+    _skill_id: SkillId,
+) -> float:
+    """Treat every skill as feasible for utility-only ablations."""
+
+    return 1.0
 
 
 @dataclass(frozen=True)
@@ -117,20 +182,34 @@ def symbolic_feasibility(
 class SayCanPlanner:
     """Rank skills by utility times feasibility and re-rank after outcomes."""
 
-    utility_scorer: UtilityScorer = zero_utility
+    utility_scorer: UtilityScorer | BatchedUtilityScorer = zero_utility
     feasibility_scorer: FeasibilityScorer = symbolic_feasibility
     candidate_skills: tuple[SkillId, ...] = SKILL_IDS
 
-    def score(
+    def _score_with_utility_status(
         self,
         state: Any,
         context: PlannerContext,
-    ) -> tuple[SkillScore, ...]:
-        """Return a descending candidate ranking with inspectable factors."""
+    ) -> tuple[tuple[SkillScore, ...], UtilityScoreBatch]:
+        if isinstance(self.utility_scorer, BatchedUtilityScorer):
+            utility_batch = self.utility_scorer.score_all(
+                state,
+                context,
+                self.candidate_skills,
+            )
+        else:
+            utility_batch = UtilityScoreBatch(
+                utilities={
+                    skill_id: float(
+                        self.utility_scorer(state, context, skill_id)
+                    )
+                    for skill_id in self.candidate_skills
+                }
+            )
 
         scores = []
         for skill_id in self.candidate_skills:
-            utility = float(self.utility_scorer(state, context, skill_id))
+            utility = float(utility_batch.utilities.get(skill_id, 0.0))
             feasibility = float(self.feasibility_scorer(state, context, skill_id))
             failures = sum(
                 attempt.skill_id is skill_id and not attempt.succeeded
@@ -146,12 +225,56 @@ class SayCanPlanner:
                     combined=utility * feasibility * failure_penalty,
                 )
             )
-        return tuple(
+        ranking = tuple(
             sorted(
                 scores,
                 key=lambda score: score.combined,
                 reverse=True,
             )
+        )
+        return ranking, utility_batch
+
+    def score(
+        self,
+        state: Any,
+        context: PlannerContext,
+    ) -> tuple[SkillScore, ...]:
+        """Return a descending candidate ranking with inspectable factors."""
+
+        scores, _ = self._score_with_utility_status(state, context)
+        return scores
+
+    def select_with_diagnostics(
+        self,
+        state: Any,
+        context: PlannerContext,
+    ) -> PlannerSelection:
+        """Select a skill while preserving utility-model failure details."""
+
+        scores, utility_batch = self._score_with_utility_status(state, context)
+        if not utility_batch.valid:
+            return PlannerSelection(
+                decision=None,
+                status=PlannerSelectionStatus.INVALID_UTILITY,
+                utility_error=utility_batch.error,
+                utility_ranking=utility_batch.ranking,
+                utility_raw_response=utility_batch.raw_response,
+            )
+        if not scores or scores[0].combined <= 0.0:
+            return PlannerSelection(
+                decision=None,
+                status=PlannerSelectionStatus.NO_VIABLE_SKILL,
+                utility_ranking=utility_batch.ranking,
+                utility_raw_response=utility_batch.raw_response,
+            )
+        return PlannerSelection(
+            decision=PlannerDecision(
+                skill_id=scores[0].skill_id,
+                scores=scores,
+            ),
+            status=PlannerSelectionStatus.SELECTED,
+            utility_ranking=utility_batch.ranking,
+            utility_raw_response=utility_batch.raw_response,
         )
 
     def select(
@@ -161,7 +284,4 @@ class SayCanPlanner:
     ) -> PlannerDecision | None:
         """Select the best grounded skill, or stop when none is viable."""
 
-        scores = self.score(state, context)
-        if not scores or scores[0].combined <= 0.0:
-            return None
-        return PlannerDecision(skill_id=scores[0].skill_id, scores=scores)
+        return self.select_with_diagnostics(state, context).decision

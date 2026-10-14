@@ -39,12 +39,12 @@ The planner selects from a fixed set of skills instead of producing arbitrary
 instructions. This keeps its decisions grounded in actions that the executor
 has learned.
 
-The current Phase 3 implementation tests the executor in isolation. There is
-not yet a VLM choosing skills. The training environment assigns one requested
-skill to each environment slot at reset, guarantees that its initial
-preconditions hold, and supplies the corresponding skill ID to the shared
-policy at every action step. A new episode for the same requested skill starts
-after success, timeout, or environment termination.
+The goal-conditioned executor and persistent skill-chain harness are now
+working. Phase 4 adds a frozen VLM that observes a rendered Craftax frame,
+structured inventory and survival values, the objective, and recent skill
+outcomes. It scores the fixed skill catalog once at each option boundary.
+Symbolic preconditions independently filter infeasible choices before the
+selected skill is passed to the JAX executor.
 
 ```text
 Long-term objective
@@ -151,6 +151,12 @@ On a Linux machine with an NVIDIA GPU, install the CUDA-enabled JAX extra:
 pip install -e ".[dev,notebook,cuda12]"
 ```
 
+To run the optional open-weight VLM planner:
+
+```bash
+pip install -e ".[dev,notebook,cuda12,vlm]"
+```
+
 Run the automated checks:
 
 ```bash
@@ -216,6 +222,21 @@ tiny-sima-evaluate-chain --executor scripted
 tiny-sima-evaluate-chain \
   --executor learned \
   --checkpoint runs/skill-ppo-1m/checkpoints/final
+```
+
+Validate the complete rendered-state-to-grounded-decision VLM path before
+running the longer planner evaluations:
+
+```bash
+pip install -e ".[vlm]"
+tiny-sima-smoke-vlm --config configs/vlm_planner_qwen3_2b.yaml --seed 51
+```
+
+The same real-model check is available as an opt-in integration test:
+
+```bash
+TINY_SIMA_RUN_VLM_SMOKE=1 \
+  pytest -q tests/test_vlm_backend_smoke.py
 ```
 
 The larger Phase 1 configuration is available at `configs/ppo_1m.yaml`.
@@ -477,8 +498,8 @@ Tasks:
 
 Goal: connect the executor to an open-weight VLM.
 
-The first Phase 4 harness composes skills before introducing the VLM. It uses a
-persistent controlled world and the chain:
+The first Phase 4 harness composes skills in a persistent controlled world
+using the chain:
 
 ```text
 collect wood -> collect wood -> place table
@@ -491,10 +512,12 @@ The planner ranks every registered candidate using:
 combined score = utility * feasibility * failure penalty
 ```
 
-Utility is currently supplied by the scripted objective. Feasibility is an
-explicit symbolic precondition and will later be replaced or augmented by a
-calibrated executor success estimate. The VLM will replace the utility scorer
-without changing the executor or evaluation loop.
+Utility can be supplied by the scripted objective or by a frozen open-weight
+VLM. The first VLM backend uses `Qwen/Qwen3-VL-2B-Instruct` through
+Transformers. It emits one structured score for every candidate skill in a
+single generation. Feasibility remains an explicit symbolic precondition and
+will later be replaced or augmented by a calibrated executor success
+estimate. The executor and chain loop are unchanged.
 
 The ordered sequence is private to the scripted baseline. Planner-visible
 context contains only the objective and prior execution outcomes, and chain
@@ -516,8 +539,8 @@ per-decision traces.
 
 Tasks:
 
-- Define the planner input and output schemas.
-- Add a small quantized VLM.
+- Define the planner input and output schemas. **Implemented.**
+- Add a small frozen VLM backend. **Implemented; evaluation pending.**
 - Rank candidate skills using usefulness and predicted feasibility.
 - Replan after success, failure, danger, or timeout.
 - Compare scripted, VLM-only, feasibility-only, and combined planners.
@@ -615,7 +638,8 @@ tiny-sima/
 │   ├── 02_compare_learning_scaling.ipynb
 │   ├── 03_evaluate_skills.ipynb
 │   ├── 04_train_goal_conditioned.ipynb
-│   └── 05_hierarchical_evaluation.ipynb
+│   ├── 05_hierarchical_evaluation.ipynb
+│   └── 06_evaluate_vlm_planner.ipynb
 ├── src/
 │   └── tiny_sima/
 │       ├── envs/
@@ -631,8 +655,8 @@ tiny-sima/
 
 ## Current status
 
-**Phases 1 through 3 are complete. Phase 4 planner scaffolding and persistent
-skill-chain evaluation are in progress.**
+**Phases 1 through 3 are complete. Phase 4 VLM integration and hierarchical
+evaluation are in progress.**
 
 Implemented:
 
@@ -649,6 +673,9 @@ Implemented:
   guaranteed paths.
 - Persistent SayCan-style skill ranking and closed-loop chain evaluation.
 - Scripted and checkpoint-backed chain executors with per-decision traces.
+- A model-independent VLM backend interface, Outlines-constrained skill
+  rankings, strict validation, and one-call whole-catalog utility scoring.
+- Planning-only controlled-prefix evaluation, separate from executor errors.
 
 Verified locally on October 8, 2026:
 
@@ -721,5 +748,51 @@ Started on October 12, 2026:
   follow-up interaction accuracy after an oracle turn, direct-action accuracy,
   target-action probability, and per-stage policy entropy.
 
-The next step is to rerun the goal-conditioned baseline with balanced metrics,
-then add progressively less-structured starting states.
+Progress recorded on October 14, 2026:
+
+- A one-million-step executor trained from scratch on local-navigation
+  scenarios reached deterministic success rates of 0.953 for wood, 0.648 for
+  stone, 0.555 for water, and 1.000 for both wood-tool crafting skills in the
+  persistent-world evaluation.
+- The matched chain ablation below used 64 episodes per condition, identical
+  seeds and retry limits, and the same local-navigation checkpoint.
+
+| Plan order | Policy | Chain success | Mean skills | Mean steps |
+| --- | --- | ---: | ---: | ---: |
+| Default | Deterministic | 0.094 | 3.39 | 130.6 |
+| Default | Stochastic | 0.344 | 4.11 | 119.0 |
+| Collect-first | Deterministic | 0.266 | 4.25 | 117.0 |
+| Collect-first | Stochastic | **0.578** | **4.88** | **91.8** |
+
+The result shows that both plan order and stochastic low-level execution
+materially affect chain success. Remaining failures are concentrated in
+`collect_wood` and `collect_stone`, so the next executor work should improve
+recovery and navigation rather than expanding the skill catalog immediately.
+The compiled batched evaluator also reduces cached matched conditions from
+tens of seconds to roughly 0.3 seconds.
+
+Phase 4 implementation started on October 14, 2026:
+
+- Added a frozen VLM utility scorer that sees the screenshot, structured
+  state, objective, candidate catalog, and recent outcomes without seeing the
+  private reference plan.
+- Split stable instructions into a true system message and state-dependent
+  context into a user message.
+- Replaced self-reported floating-point utilities with a constrained complete
+  ranking and deterministic reciprocal-square rank utilities. The wider score
+  separation prevents one executor timeout from immediately displacing the
+  planner's top prerequisite.
+- Added complete-catalog JSON validation and fail-closed handling for
+  malformed, incomplete, or invented skills.
+- Cached the compiled Outlines generator for each candidate catalog instead
+  of rebuilding its structured-decoding index at every skill boundary.
+- Added an end-to-end smoke runner and opt-in real-model integration test for
+  rendering, multimodal generation, response validation, and grounded SayCan
+  selection. Notebook 06 runs this smoke check before the longer ablations.
+- Kept VLM dependencies optional and isolated from JAX training.
+- Added planner-prefix metrics for accepted objective-progressing choices,
+  complete utility responses, and grounded choices. Closed-loop evaluation
+  reports invalid planner output separately from a legitimate lack of viable
+  skills, alongside objective success, skill failures, steps, and return.
+- All 88 regular automated tests pass locally; the real-model VLM smoke test
+  is opt-in. Ruff and Pyright report no issues.

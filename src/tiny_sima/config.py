@@ -136,6 +136,36 @@ class SkillPPOConfig(PPOConfig):
         return self
 
 
+@dataclass(frozen=True)
+class VLMPlannerConfig:
+    """Configuration for a frozen image-text planner backend."""
+
+    model_id: str = "Qwen/Qwen3-VL-2B-Instruct"
+    environment_name: str = "Craftax-Classic-Symbolic-v1"
+    max_new_tokens: int = 256
+    dtype: str = "bfloat16"
+    device_map: str = "auto"
+    block_pixel_size: int = 16
+
+    def validate(self) -> Self:
+        """Raise a helpful error for unsupported inference settings."""
+
+        if not self.model_id.strip():
+            raise ValueError("model_id cannot be empty.")
+        if self.max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be positive.")
+        if self.dtype not in {"auto", "bfloat16", "float16", "float32"}:
+            raise ValueError(
+                "dtype must be auto, bfloat16, float16, or float32."
+            )
+        if self.block_pixel_size not in {7, 16, 64}:
+            raise ValueError("block_pixel_size must be 7, 16, or 64.")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 ConfigType = TypeVar("ConfigType", bound=PPOConfig)
 
 
@@ -170,7 +200,27 @@ def load_skill_config(path: str | Path) -> SkillPPOConfig:
     return _load_config(path, SkillPPOConfig)
 
 
-def save_config(config: PPOConfig, path: str | Path) -> None:
+def load_vlm_planner_config(path: str | Path) -> VLMPlannerConfig:
+    """Load a frozen VLM planner configuration from YAML."""
+
+    config_path = Path(path)
+    with config_path.open("r", encoding="utf-8") as file:
+        raw = yaml.safe_load(file) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"Expected a YAML mapping in {config_path}.")
+
+    known_fields = {field.name for field in fields(VLMPlannerConfig)}
+    unknown = set(raw) - known_fields
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise ValueError(f"Unknown fields in {config_path}: {names}")
+    return VLMPlannerConfig(**raw).validate()
+
+
+def save_config(
+    config: PPOConfig | VLMPlannerConfig,
+    path: str | Path,
+) -> None:
     """Write a configuration as stable, human-readable YAML."""
 
     output_path = Path(path)

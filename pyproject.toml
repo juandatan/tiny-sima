@@ -35,6 +35,14 @@ notebook = [
 cuda12 = [
     "jax[cuda12]==0.10.2",
 ]
+vlm = [
+    "accelerate>=1.10,<2",
+    "outlines>=1.3.2,<2",
+    "pillow>=11,<13",
+    "torch>=2.7,<3",
+    "torchvision>=0.22,<1",
+    "transformers>=5.17,<6",
+]
 
 [project.scripts]
 tiny-sima-train = "tiny_sima.executor.ppo:main"
@@ -46,6 +54,7 @@ tiny-sima-profile = "tiny_sima.profiling:main"
 tiny-sima-compare-learning = "tiny_sima.learning_comparison:main"
 tiny-sima-evaluate-skills = "tiny_sima.evaluation.skills:main"
 tiny-sima-evaluate-chain = "tiny_sima.evaluation.chains:main"
+tiny-sima-smoke-vlm = "tiny_sima.evaluation.vlm_smoke:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tiny_sima"]

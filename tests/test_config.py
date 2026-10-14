@@ -5,8 +5,10 @@ import pytest
 from tiny_sima.config import (
     PPOConfig,
     SkillPPOConfig,
+    VLMPlannerConfig,
     load_config,
     load_skill_config,
+    load_vlm_planner_config,
     save_config,
 )
 
@@ -103,3 +105,26 @@ def test_skill_config_rejects_invalid_skill_shape() -> None:
         ).validate()
     with pytest.raises(ValueError, match="skill_distractor_count"):
         SkillPPOConfig(skill_distractor_count=33).validate()
+
+
+def test_vlm_planner_config_round_trip(tmp_path: Path) -> None:
+    path = tmp_path / "vlm_config.yaml"
+    expected = VLMPlannerConfig(
+        model_id="example/model",
+        max_new_tokens=64,
+        block_pixel_size=7,
+    ).validate()
+
+    save_config(expected, path)
+    actual = load_vlm_planner_config(path)
+
+    assert actual == expected
+
+
+def test_vlm_planner_config_rejects_invalid_values() -> None:
+    with pytest.raises(ValueError, match="model_id"):
+        VLMPlannerConfig(model_id=" ").validate()
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        VLMPlannerConfig(max_new_tokens=0).validate()
+    with pytest.raises(ValueError, match="dtype"):
+        VLMPlannerConfig(dtype="int8").validate()

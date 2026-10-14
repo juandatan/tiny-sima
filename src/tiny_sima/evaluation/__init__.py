@@ -23,15 +23,22 @@ from tiny_sima.evaluation.gpu_monitor import (
     NvidiaSmiMonitor,
     jax_allocator_summary,
 )
+from tiny_sima.evaluation.planner import (
+    PlannerBoundaryTrace,
+    evaluate_planner_prefixes,
+)
 from tiny_sima.evaluation.policy import evaluate_checkpoint, evaluate_policy
 from tiny_sima.evaluation.skills import (
     evaluate_skill_policy,
     evaluate_skill_suite,
     scripted_skill_action,
 )
+from tiny_sima.evaluation.vlm_smoke import VLMSmokeResult, run_vlm_smoke_test
 
 __all__ = [
     "NvidiaSmiMonitor",
+    "PlannerBoundaryTrace",
+    "VLMSmokeResult",
     "LearnedSkillExecutor",
     "ScriptedSkillExecutor",
     "ChainTermination",
@@ -46,11 +53,13 @@ __all__ = [
     "evaluate_goal_conditioned_policy",
     "evaluate_goal_conditioned_skill",
     "evaluate_policy",
+    "evaluate_planner_prefixes",
     "evaluate_skill_policy",
     "evaluate_skill_chain",
     "evaluate_skill_suite",
     "jax_allocator_summary",
     "learned_skill_executor_from_checkpoint",
     "load_goal_conditioned_checkpoint",
+    "run_vlm_smoke_test",
     "scripted_skill_action",
 ]

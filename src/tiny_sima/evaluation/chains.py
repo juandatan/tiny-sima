@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -56,6 +56,7 @@ from tiny_sima.goals import (
 )
 from tiny_sima.planner.saycan import (
     PlannerContext,
+    PlannerSelectionStatus,
     SayCanPlanner,
     SequentialUtilityScorer,
     SkillAttempt,
@@ -65,6 +66,7 @@ from tiny_sima.planner.saycan import (
 
 ObjectivePredicate = Callable[[Any], bool]
 JaxObjectivePredicate = Callable[[Any], jax.Array]
+ValidNextSkills = Callable[[Any], tuple[SkillId, ...]]
 
 
 class SkillChainSpec(NamedTuple):
@@ -75,6 +77,7 @@ class SkillChainSpec(NamedTuple):
     reference_skills: tuple[SkillId, ...]
     is_complete: ObjectivePredicate
     is_complete_jax: JaxObjectivePredicate | None = None
+    valid_next_skills: ValidNextSkills | None = None
 
 
 def _wood_to_stone_complete_jax(state: Any) -> jax.Array:
@@ -86,6 +89,31 @@ def _wood_to_stone_complete_jax(state: Any) -> jax.Array:
 
 def _wood_to_stone_complete(state: Any) -> bool:
     return bool(np.asarray(_wood_to_stone_complete_jax(state)))
+
+
+def _wood_to_stone_valid_next_skills(state: Any) -> tuple[SkillId, ...]:
+    """Return objective-progressing skills, including valid plan reorderings."""
+
+    inventory = state.inventory
+    wood = int(np.asarray(inventory.wood))
+    stone = int(np.asarray(inventory.stone))
+    wood_pickaxe = int(np.asarray(inventory.wood_pickaxe))
+    has_table = bool(
+        np.any(np.asarray(state.map) == BlockType.CRAFTING_TABLE.value)
+    )
+    if wood_pickaxe > 0 and stone > 0:
+        return ()
+    if wood_pickaxe > 0:
+        return (SkillId.COLLECT_STONE,)
+    if has_table:
+        if wood >= 1:
+            return (SkillId.CRAFT_WOOD_PICKAXE,)
+        return (SkillId.COLLECT_WOOD,)
+    if wood >= 3:
+        return (SkillId.PLACE_TABLE,)
+    if wood == 2:
+        return (SkillId.COLLECT_WOOD, SkillId.PLACE_TABLE)
+    return (SkillId.COLLECT_WOOD,)
 
 
 WOOD_TO_STONE_CHAIN = SkillChainSpec(
@@ -101,6 +129,7 @@ WOOD_TO_STONE_CHAIN = SkillChainSpec(
     ),
     is_complete=_wood_to_stone_complete,
     is_complete_jax=_wood_to_stone_complete_jax,
+    valid_next_skills=_wood_to_stone_valid_next_skills,
 )
 
 
@@ -111,6 +140,7 @@ class ChainTermination(str, Enum):
     NO_VIABLE_SKILL = "no_viable_skill"
     FAILURE_LIMIT = "failure_limit"
     DECISION_LIMIT = "decision_limit"
+    INVALID_PLANNER_OUTPUT = "invalid_planner_output"
 
 
 @dataclass(frozen=True)
@@ -137,6 +167,8 @@ class ChainStepTrace:
     feasibility: float
     combined_score: float
     candidate_scores: tuple[SkillScore, ...]
+    planner_ranking: tuple[SkillId, ...]
+    planner_raw_response: str | None
 
 
 @dataclass(frozen=True)
@@ -149,6 +181,8 @@ class ChainEpisodeResult:
     environment_steps: int
     native_return: float
     termination: ChainTermination
+    planner_error: str | None
+    planner_raw_response: str | None
     trace: tuple[ChainStepTrace, ...]
 
 
@@ -1053,14 +1087,23 @@ def evaluate_chain_episode(
     environment_steps = 0
     native_return = 0.0
     termination = ChainTermination.DECISION_LIMIT
+    planner_error: str | None = None
+    planner_raw_response: str | None = None
 
     for decision_index in range(max_decisions):
         if chain.is_complete(state):
             termination = ChainTermination.SUCCESS
             break
-        decision = planner.select(state, context)
+        selection = planner.select_with_diagnostics(state, context)
+        decision = selection.decision
         if decision is None:
-            termination = ChainTermination.NO_VIABLE_SKILL
+            planner_error = selection.utility_error
+            planner_raw_response = selection.utility_raw_response
+            termination = (
+                ChainTermination.INVALID_PLANNER_OUTPUT
+                if selection.status is PlannerSelectionStatus.INVALID_UTILITY
+                else ChainTermination.NO_VIABLE_SKILL
+            )
             break
         episode_rng, execution_rng = jax.random.split(episode_rng)
         result = executor.execute(
@@ -1086,6 +1129,8 @@ def evaluate_chain_episode(
                 feasibility=selected_score.feasibility,
                 combined_score=selected_score.combined,
                 candidate_scores=decision.scores,
+                planner_ranking=selection.utility_ranking,
+                planner_raw_response=selection.utility_raw_response,
             )
         )
         state = result.state
@@ -1119,6 +1164,8 @@ def evaluate_chain_episode(
         environment_steps=environment_steps,
         native_return=native_return,
         termination=termination,
+        planner_error=planner_error,
+        planner_raw_response=planner_raw_response,
         trace=tuple(trace),
     )
 
@@ -1166,6 +1213,13 @@ def evaluate_skill_chain(
         )
         for termination in ChainTermination
     }
+    planner_error_counts = dict(
+        Counter(
+            episode.planner_error
+            for episode in episodes
+            if episode.planner_error is not None
+        )
+    )
     return {
         "chain": chain.name,
         "objective": chain.objective,
@@ -1184,6 +1238,7 @@ def evaluate_skill_chain(
             np.mean([episode.native_return for episode in episodes])
         ),
         "termination_counts": termination_counts,
+        "planner_error_counts": planner_error_counts,
         "episodes": episodes,
     }
 
@@ -1199,6 +1254,8 @@ def _json_ready_result(result: dict[str, Any]) -> dict[str, Any]:
                 "environment_steps": episode.environment_steps,
                 "native_return": episode.native_return,
                 "termination": episode.termination.value,
+                "planner_error": episode.planner_error,
+                "planner_raw_response": episode.planner_raw_response,
                 "trace": [
                     {
                         "decision_index": trace.decision_index,
@@ -1209,6 +1266,11 @@ def _json_ready_result(result: dict[str, Any]) -> dict[str, Any]:
                         "utility": trace.utility,
                         "feasibility": trace.feasibility,
                         "combined_score": trace.combined_score,
+                        "planner_ranking": [
+                            skill_id.value
+                            for skill_id in trace.planner_ranking
+                        ],
+                        "planner_raw_response": trace.planner_raw_response,
                         "candidate_scores": [
                             {
                                 "skill_id": score.skill_id.value,

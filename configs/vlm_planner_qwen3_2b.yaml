@@ -1,0 +1,6 @@
+model_id: Qwen/Qwen3-VL-2B-Instruct
+environment_name: Craftax-Classic-Symbolic-v1
+max_new_tokens: 256
+dtype: bfloat16
+device_map: auto
+block_pixel_size: 16
