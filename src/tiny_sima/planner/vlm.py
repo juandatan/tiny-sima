@@ -11,10 +11,11 @@ from hashlib import sha256
 from typing import Any, NamedTuple, Protocol
 
 import numpy as np
+from craftax.craftax_classic.constants import BlockType
 
 from tiny_sima.config import VLMPlannerConfig
 from tiny_sima.envs.craftax import render_state
-from tiny_sima.goals import SKILL_REGISTRY, SkillId
+from tiny_sima.goals import SKILL_REGISTRY, SkillId, skill_metric
 from tiny_sima.planner.saycan import PlannerContext, UtilityScoreBatch
 
 
@@ -49,7 +50,7 @@ class ParsedVLMResponse:
     utilities: dict[SkillId, float]
     ranking: tuple[SkillId, ...]
     selected_skill: SkillId | None
-    rationale: str
+    progress_assessment: str
     raw_response: str
     valid: bool
     error: str | None = None
@@ -81,6 +82,23 @@ def _json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _invalid_vlm_response(
+    response: str,
+    error: str,
+) -> ParsedVLMResponse:
+    """Return one fail-closed response with stable empty values."""
+
+    return ParsedVLMResponse(
+        utilities={},
+        ranking=(),
+        selected_skill=None,
+        progress_assessment="",
+        raw_response=response,
+        valid=False,
+        error=error,
+    )
+
+
 def parse_vlm_response(
     response: str,
     candidate_skills: tuple[SkillId, ...],
@@ -89,25 +107,43 @@ def parse_vlm_response(
 
     payload = _json_object(response)
     if payload is None:
-        return ParsedVLMResponse(
-            {},
-            (),
-            None,
-            "",
+        return _invalid_vlm_response(
             response,
-            False,
             "malformed_json",
+        )
+
+    progress_assessment = payload.get("progress_assessment")
+    if not isinstance(progress_assessment, str):
+        return _invalid_vlm_response(
+            response,
+            "progress_assessment_not_a_string",
+        )
+
+    raw_selected = payload.get("selected_skill")
+    selected_skill: SkillId | None = None
+    if raw_selected is not None:
+        try:
+            selected_skill = SkillId(str(raw_selected))
+        except ValueError:
+            return _invalid_vlm_response(
+                response,
+                "unknown_selected_skill",
+            )
+        if selected_skill not in candidate_skills:
+            return _invalid_vlm_response(
+                response,
+                "unknown_selected_skill",
+            )
+    elif candidate_skills:
+        return _invalid_vlm_response(
+            response,
+            "selected_skill_missing",
         )
 
     raw_ranking = payload.get("ranking")
     if not isinstance(raw_ranking, list):
-        return ParsedVLMResponse(
-            {},
-            (),
-            None,
-            "",
+        return _invalid_vlm_response(
             response,
-            False,
             "ranking_not_an_array",
         )
 
@@ -127,42 +163,29 @@ def parse_vlm_response(
 
     if invalid_skills:
         names = ",".join(sorted(invalid_skills))
-        return ParsedVLMResponse(
-            {},
-            (),
-            None,
-            "",
+        return _invalid_vlm_response(
             response,
-            False,
             f"unknown_ranking_skills:{names}",
         )
 
     if len(ranking) != len(candidate_skills):
-        return ParsedVLMResponse(
-            {},
-            (),
-            None,
-            "",
+        return _invalid_vlm_response(
             response,
-            False,
             "ranking_wrong_length",
         )
 
     if len(set(ranking)) != len(ranking) or set(ranking) != candidate_set:
-        return ParsedVLMResponse(
-            {},
-            (),
-            None,
-            "",
+        return _invalid_vlm_response(
             response,
-            False,
             "ranking_not_a_permutation",
         )
 
-    rationale = payload.get("rationale", "")
-    if not isinstance(rationale, str):
-        rationale = str(rationale)
     ranking_tuple = tuple(ranking)
+    if ranking_tuple and selected_skill != ranking_tuple[0]:
+        return _invalid_vlm_response(
+            response,
+            "selected_skill_ranking_mismatch",
+        )
     utilities = {
         skill_id: _rank_utility(index)
         for index, skill_id in enumerate(ranking_tuple)
@@ -170,15 +193,15 @@ def parse_vlm_response(
     return ParsedVLMResponse(
         utilities=utilities,
         ranking=ranking_tuple,
-        selected_skill=ranking_tuple[0] if ranking_tuple else None,
-        rationale=rationale,
+        selected_skill=selected_skill,
+        progress_assessment=progress_assessment,
         raw_response=response,
         valid=True,
     )
 
 
 def summarize_state(state: Any) -> str:
-    """Return planner-visible inventory and survival values."""
+    """Return planner-visible inventory, survival, and world-progress values."""
 
     inventory = state.inventory
     inventory_fields = (
@@ -203,8 +226,29 @@ def summarize_state(state: Any) -> str:
         "drink": int(np.asarray(state.player_drink).item()),
         "energy": int(np.asarray(state.player_energy).item()),
     }
+    world_values = {
+        "crafting_table_present": bool(
+            np.any(
+                np.asarray(state.map)
+                == BlockType.CRAFTING_TABLE.value
+            )
+        ),
+        "tree_available": bool(
+            np.any(np.asarray(state.map) == BlockType.TREE.value)
+        ),
+        "stone_available": bool(
+            np.any(np.asarray(state.map) == BlockType.STONE.value)
+        ),
+        "water_available": bool(
+            np.any(np.asarray(state.map) == BlockType.WATER.value)
+        ),
+    }
     return json.dumps(
-        {"inventory": inventory_values, "survival": survival_values},
+        {
+            "inventory": inventory_values,
+            "survival": survival_values,
+            "world": world_values,
+        },
         sort_keys=True,
     )
 
@@ -212,10 +256,16 @@ def summarize_state(state: Any) -> str:
 PLANNER_SYSTEM_PROMPT = "\n".join(
     (
         "You are the high-level planner for a Craftax survival agent.",
-        "Rank only the supplied skills by how useful they are for the objective.",
-        "A separate affordance model checks whether each skill is executable.",
-        "Do not treat current infeasibility as low long-term usefulness.",
-        "Prefer prerequisite actions that make later objective steps possible.",
+        "At each option boundary, rank only the supplied skills by how useful "
+        "they are as the next requested skill from the current state.",
+        "The ranking is recomputed after every completed or failed skill.",
+        "Prioritize unmet prerequisites in execution order. Once a prerequisite "
+        "is achieved, promote the next unmet objective step and demote redundant "
+        "repetitions unless another repetition is necessary.",
+        "A separate affordance model checks whether each skill is executable, "
+        "but state progress and recent outcomes must still affect usefulness.",
+        "First assess current objective progress, then choose the best next "
+        "skill, then rank the complete catalog consistently with that choice.",
     )
 )
 
@@ -246,6 +296,9 @@ def build_planner_prompt(
         {
             "skill": skill_id.value,
             "description": SKILL_REGISTRY[skill_id].description,
+            "current_value": int(
+                np.asarray(skill_metric(skill_id, state)).item()
+            ),
         }
         for skill_id in candidate_skills
     ]
@@ -255,9 +308,14 @@ def build_planner_prompt(
             f"Current structured state: {summarize_state(state)}",
             f"Recent skill outcomes: {json.dumps(history)}",
             f"Candidate skills: {json.dumps(catalog)}",
-            "Inspect the screenshot. Rank every candidate exactly once from "
-            "most useful to least useful for completing the objective.",
-            "Give a brief rationale for the ordering.",
+            "Inspect the screenshot and structured state. Rank every candidate "
+            "exactly once from most useful to least useful as the next skill.",
+            "The first skill must be the best next step given progress already "
+            "made, not merely the skill most associated with the overall goal.",
+            "Rank completed or redundant prerequisites below the next unmet "
+            "objective step unless repeating them is necessary.",
+            "First give a progress assessment of at most 96 characters. Then "
+            "select the best next skill and rank it first in the full ordering.",
         )
     )
 
@@ -288,7 +346,7 @@ class VLMUtilityScorer:
                 utilities={},
                 ranking=(),
                 selected_skill=None,
-                rationale="No candidate skills were supplied.",
+                progress_assessment="No candidate skills were supplied.",
                 raw_response="",
                 valid=True,
             )
@@ -367,6 +425,11 @@ def _ranking_output_type(
     return create_model(
         "SkillRankingOutput",
         __config__=ConfigDict(extra="forbid"),
+        progress_assessment=(str, Field(max_length=96)),
+        selected_skill=(
+            candidate_enum,  # pyright: ignore[reportArgumentType]
+            ...,
+        ),
         ranking=(
             ranking_type,
             Field(
@@ -374,7 +437,6 @@ def _ranking_output_type(
                 max_length=len(candidate_skills),
             ),
         ),
-        rationale=(str, Field(max_length=256)),
     )
 
 

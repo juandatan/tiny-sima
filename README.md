@@ -789,10 +789,21 @@ Phase 4 implementation started on October 14, 2026:
 - Added an end-to-end smoke runner and opt-in real-model integration test for
   rendering, multimodal generation, response validation, and grounded SayCan
   selection. Notebook 06 runs this smoke check before the longer ablations.
+- Changed VLM utility ranking from global goal association to the best next
+  skill given the updated state and recent outcomes, matching SayCan's
+  closed-loop re-planning pattern more closely.
+- Added per-skill current values and concise world-progress facts to the
+  planner context, and limited progress assessments to 96 characters so
+  structured generations finish cleanly.
+- Ordered structured generation as progress assessment, explicit next-skill
+  selection, then full ranking. Validation rejects responses where the
+  selected skill is not ranked first.
+- Added final failed-skill and failure-outcome counts to closed-loop
+  evaluation results and notebook 06.
 - Kept VLM dependencies optional and isolated from JAX training.
 - Added planner-prefix metrics for accepted objective-progressing choices,
   complete utility responses, and grounded choices. Closed-loop evaluation
   reports invalid planner output separately from a legitimate lack of viable
   skills, alongside objective success, skill failures, steps, and return.
-- All 88 regular automated tests pass locally; the real-model VLM smoke test
+- All 91 regular automated tests pass locally; the real-model VLM smoke test
   is opt-in. Ruff and Pyright report no issues.

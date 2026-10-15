@@ -29,7 +29,10 @@ from tiny_sima.planner.vlm import (
     TransformersVLMBackend,
     VLMRequest,
     VLMUtilityScorer,
+    build_planner_prompt,
+    build_planner_system_prompt,
     parse_vlm_response,
+    summarize_state,
 )
 
 
@@ -55,17 +58,87 @@ def _ranking(*leading_skills: SkillId) -> list[str]:
     ]
 
 
+def _response(
+    *leading_skills: SkillId,
+    progress_assessment: str = "Ready for the next skill.",
+) -> str:
+    ranking = _ranking(*leading_skills)
+    return json.dumps(
+        {
+            "progress_assessment": progress_assessment,
+            "selected_skill": ranking[0],
+            "ranking": ranking,
+        }
+    )
+
+
+def test_planner_prompt_requests_state_dependent_next_skill() -> None:
+    state = make_skill_chain_environment().reset(jax.random.PRNGKey(0)).state
+    context = PlannerContext(
+        objective="Craft a wood pickaxe and collect stone.",
+    )
+
+    system_prompt = build_planner_system_prompt()
+    user_prompt = build_planner_prompt(state, context, SKILL_IDS)
+    state_summary = json.loads(summarize_state(state))
+    catalog_line = next(
+        line
+        for line in user_prompt.splitlines()
+        if line.startswith("Candidate skills: ")
+    )
+    catalog = json.loads(catalog_line.removeprefix("Candidate skills: "))
+
+    assert "next requested skill" in system_prompt
+    assert "recomputed after every completed or failed skill" in system_prompt
+    assert "Do not treat current infeasibility" not in system_prompt
+    assert "progress already made" in user_prompt
+    assert "at most 96 characters" in user_prompt
+    assert state_summary["world"] == {
+        "crafting_table_present": False,
+        "stone_available": True,
+        "tree_available": True,
+        "water_available": True,
+    }
+    assert next(
+        item["current_value"]
+        for item in catalog
+        if item["skill"] == SkillId.CRAFT_WOOD_PICKAXE.value
+    ) == 0
+
+
+def test_planner_prompt_exposes_updated_skill_progress() -> None:
+    state = make_skill_chain_environment().reset(jax.random.PRNGKey(0)).state
+    updated_state = state.replace(
+        inventory=state.inventory.replace(
+            wood_pickaxe=state.inventory.wood_pickaxe + 1,
+        )
+    )
+    prompt = build_planner_prompt(
+        updated_state,
+        PlannerContext(objective="Collect stone with a wood pickaxe."),
+        SKILL_IDS,
+    )
+    catalog_line = next(
+        line
+        for line in prompt.splitlines()
+        if line.startswith("Candidate skills: ")
+    )
+    catalog = json.loads(catalog_line.removeprefix("Candidate skills: "))
+
+    assert next(
+        item["current_value"]
+        for item in catalog
+        if item["skill"] == SkillId.CRAFT_WOOD_PICKAXE.value
+    ) == 1
+
+
 def test_parse_vlm_response_derives_utilities_from_complete_ranking() -> None:
     parsed = parse_vlm_response(
         "```json\n"
-        + json.dumps(
-            {
-                "ranking": _ranking(
-                    SkillId.COLLECT_WOOD,
-                    SkillId.PLACE_TABLE,
-                ),
-                "rationale": "Wood is required first.",
-            }
+        + _response(
+            SkillId.COLLECT_WOOD,
+            SkillId.PLACE_TABLE,
+            progress_assessment="Wood is the unmet prerequisite.",
         )
         + "\n```",
         SKILL_IDS,
@@ -80,14 +153,10 @@ def test_parse_vlm_response_derives_utilities_from_complete_ranking() -> None:
 
 def test_rank_utilities_keep_the_top_skill_after_one_failure() -> None:
     backend = FakeBackend(
-        response=json.dumps(
-            {
-                "ranking": _ranking(
-                    SkillId.COLLECT_WOOD,
-                    SkillId.COLLECT_STONE,
-                ),
-                "rationale": "Wood remains the required prerequisite.",
-            }
+        response=_response(
+            SkillId.COLLECT_WOOD,
+            SkillId.COLLECT_STONE,
+            progress_assessment="Wood remains the required prerequisite.",
         )
     )
     planner = SayCanPlanner(
@@ -117,8 +186,9 @@ def test_parse_vlm_response_rejects_incomplete_rankings() -> None:
     parsed = parse_vlm_response(
         json.dumps(
             {
+                "progress_assessment": "Wood is still required.",
+                "selected_skill": "collect_wood",
                 "ranking": ["collect_wood", "place_table"],
-                "rationale": "Wood first.",
             }
         ),
         SKILL_IDS,
@@ -139,7 +209,10 @@ def test_parse_vlm_response_fails_closed_for_malformed_output() -> None:
 
 def test_parse_vlm_response_accepts_an_empty_candidate_catalog() -> None:
     parsed = parse_vlm_response(
-        '{"ranking":[],"rationale":"No skills remain."}',
+        (
+            '{"progress_assessment":"No skills remain.",'
+            '"selected_skill":null,"ranking":[]}'
+        ),
         (),
     )
 
@@ -147,6 +220,22 @@ def test_parse_vlm_response_accepts_an_empty_candidate_catalog() -> None:
     assert parsed.utilities == {}
     assert parsed.ranking == ()
     assert parsed.selected_skill is None
+
+
+def test_parse_vlm_response_rejects_inconsistent_selection_and_ranking() -> None:
+    parsed = parse_vlm_response(
+        json.dumps(
+            {
+                "progress_assessment": "Stone is the next unmet step.",
+                "selected_skill": "collect_stone",
+                "ranking": _ranking(SkillId.COLLECT_WOOD),
+            }
+        ),
+        SKILL_IDS,
+    )
+
+    assert not parsed.valid
+    assert parsed.error == "selected_skill_ranking_mismatch"
 
 
 def test_empty_candidate_catalog_returns_no_selection_without_generation() -> None:
@@ -204,14 +293,10 @@ def test_transformers_backend_caches_constrained_generators(
 
 def test_vlm_smoke_test_validates_one_generation_and_grounded_selection() -> None:
     backend = FakeBackend(
-        response=json.dumps(
-            {
-                "ranking": _ranking(
-                    SkillId.CRAFT_WOOD_PICKAXE,
-                    SkillId.COLLECT_WOOD,
-                ),
-                "rationale": "Collect wood before crafting.",
-            }
+        response=_response(
+            SkillId.CRAFT_WOOD_PICKAXE,
+            SkillId.COLLECT_WOOD,
+            progress_assessment="Wood must be collected before crafting.",
         )
     )
 
@@ -226,6 +311,7 @@ def test_vlm_smoke_test_validates_one_generation_and_grounded_selection() -> Non
     assert result.grounded_selected_skill == "collect_wood"
     assert result.grounded_feasibility == 1.0
     assert result.ranking[0] == "craft_wood_pickaxe"
+    assert result.progress_assessment == "Wood must be collected before crafting."
 
 
 def test_vlm_scores_once_and_symbolic_feasibility_grounds_selection() -> None:
@@ -236,14 +322,10 @@ def test_vlm_scores_once_and_symbolic_feasibility_grounds_selection() -> None:
         objective="Craft a wood pickaxe and collect stone.",
     )
     backend = FakeBackend(
-        response=json.dumps(
-            {
-                "ranking": _ranking(
-                    SkillId.CRAFT_WOOD_PICKAXE,
-                    SkillId.COLLECT_WOOD,
-                ),
-                "rationale": "Craft first.",
-            }
+        response=_response(
+            SkillId.CRAFT_WOOD_PICKAXE,
+            SkillId.COLLECT_WOOD,
+            progress_assessment="The pickaxe is useful after collecting wood.",
         )
     )
     scorer = VLMUtilityScorer(backend)

@@ -33,7 +33,7 @@ class VLMSmokeResult:
     utility_selected_skill: str
     grounded_selected_skill: str
     grounded_feasibility: float
-    rationale: str
+    progress_assessment: str
     raw_response: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -105,7 +105,7 @@ def run_vlm_smoke_test(
         utility_selected_skill=utility_selected.value,
         grounded_selected_skill=selection.decision.skill_id.value,
         grounded_feasibility=selected_score.feasibility,
-        rationale=parsed.rationale,
+        progress_assessment=parsed.progress_assessment,
         raw_response=parsed.raw_response,
     )
 

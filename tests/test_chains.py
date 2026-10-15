@@ -98,6 +98,8 @@ def test_scripted_executor_completes_persistent_chain() -> None:
     assert result["mean_completed_skills"] == len(
         WOOD_TO_STONE_CHAIN.reference_skills
     )
+    assert result["final_failed_skill_counts"] == {}
+    assert result["final_failure_outcome_counts"] == {}
     for episode in result["episodes"]:
         assert episode.succeeded
         assert episode.termination is ChainTermination.SUCCESS

@@ -1220,6 +1220,31 @@ def evaluate_skill_chain(
             if episode.planner_error is not None
         )
     )
+    final_failure_traces = [
+        failed_trace
+        for episode in episodes
+        if not episode.succeeded
+        for failed_trace in [
+            next(
+                (
+                    trace
+                    for trace in reversed(episode.trace)
+                    if trace.outcome is not SkillOutcome.SUCCESS
+                ),
+                None,
+            )
+        ]
+        if failed_trace is not None
+    ]
+    final_failed_skill_counts = dict(
+        Counter(
+            trace.requested_skill.value
+            for trace in final_failure_traces
+        )
+    )
+    final_failure_outcome_counts = dict(
+        Counter(trace.outcome.value for trace in final_failure_traces)
+    )
     return {
         "chain": chain.name,
         "objective": chain.objective,
@@ -1239,6 +1264,8 @@ def evaluate_skill_chain(
         ),
         "termination_counts": termination_counts,
         "planner_error_counts": planner_error_counts,
+        "final_failed_skill_counts": final_failed_skill_counts,
+        "final_failure_outcome_counts": final_failure_outcome_counts,
         "episodes": episodes,
     }
 
