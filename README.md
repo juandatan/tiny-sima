@@ -798,6 +798,11 @@ Phase 4 implementation started on October 14, 2026:
 - Ordered structured generation as progress assessment, explicit next-skill
   selection, then full ranking. Validation rejects responses where the
   selected skill is not ranked first.
+- Added a typed mechanics contract for every skill and supply its requirements,
+  resource costs, and successful effects as authoritative static planner
+  knowledge. Dynamic inventory, world state, and recent outcomes remain in the
+  per-decision user message, while executor-only action IDs and training
+  horizons are excluded from the VLM context.
 - Added final failed-skill and failure-outcome counts to closed-loop
   evaluation results and notebook 06.
 - Kept VLM dependencies optional and isolated from JAX training.
@@ -805,5 +810,5 @@ Phase 4 implementation started on October 14, 2026:
   complete utility responses, and grounded choices. Closed-loop evaluation
   reports invalid planner output separately from a legitimate lack of viable
   skills, alongside objective success, skill failures, steps, and return.
-- All 91 regular automated tests pass locally; the real-model VLM smoke test
+- All 92 regular automated tests pass locally; the real-model VLM smoke test
   is opt-in. Ruff and Pyright report no issues.

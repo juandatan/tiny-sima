@@ -90,6 +90,7 @@ def test_planner_prompt_requests_state_dependent_next_skill() -> None:
 
     assert "next requested skill" in system_prompt
     assert "recomputed after every completed or failed skill" in system_prompt
+    assert "game-mechanics catalog" in system_prompt
     assert "Do not treat current infeasibility" not in system_prompt
     assert "progress already made" in user_prompt
     assert "at most 96 characters" in user_prompt
@@ -104,6 +105,18 @@ def test_planner_prompt_requests_state_dependent_next_skill() -> None:
         for item in catalog
         if item["skill"] == SkillId.CRAFT_WOOD_PICKAXE.value
     ) == 0
+    mechanics_json = system_prompt.split("Known game mechanics: ", maxsplit=1)[1]
+    mechanics_catalog = json.loads(mechanics_json)
+    pickaxe = next(
+        item
+        for item in mechanics_catalog
+        if item["skill"] == SkillId.CRAFT_WOOD_PICKAXE.value
+    )
+    assert {
+        requirement["field"]
+        for requirement in pickaxe["requires"]
+    } == {"inventory.wood", "world.crafting_table_present"}
+    assert "description" not in catalog[0]
 
 
 def test_planner_prompt_exposes_updated_skill_progress() -> None:

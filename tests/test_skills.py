@@ -12,6 +12,7 @@ from tiny_sima.goals import (
     SkillGoal,
     SkillId,
     get_skill_spec,
+    planner_skill_catalog,
     skill_catalog,
     skill_id_from_index,
     skill_index,
@@ -127,6 +128,38 @@ def test_skill_catalog_covers_registry_and_actions() -> None:
         skill_id.value for skill_id in SKILL_REGISTRY
     }
     assert get_skill_spec(SkillId.PLACE_TABLE).interaction_action is Action.PLACE_TABLE
+    pickaxe = next(
+        item
+        for item in catalog
+        if item["skill_id"] == SkillId.CRAFT_WOOD_PICKAXE.value
+    )
+    assert {
+        requirement["field"]
+        for requirement in pickaxe["mechanics"]["requires"]
+    } == {"inventory.wood", "world.crafting_table_present"}
+    assert {
+        (effect["field"], effect["operation"], effect["value"])
+        for effect in pickaxe["mechanics"]["effects"]
+    } == {
+        ("inventory.wood", "decrease", 1),
+        ("inventory.wood_pickaxe", "increase", 1),
+    }
+
+
+def test_planner_skill_catalog_excludes_executor_implementation_details() -> None:
+    catalog = planner_skill_catalog()
+    pickaxe = next(
+        item
+        for item in catalog
+        if item["skill"] == SkillId.CRAFT_WOOD_PICKAXE.value
+    )
+
+    assert "skill_index" not in pickaxe
+    assert "default_horizon" not in pickaxe
+    assert "interaction_action" not in pickaxe
+    assert {
+        requirement["field"] for requirement in pickaxe["requires"]
+    } == {"inventory.wood", "world.crafting_table_present"}
 
 
 def test_skill_goal_validates_quantity_and_horizon() -> None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
@@ -22,6 +22,67 @@ class SkillId(str, Enum):
     CRAFT_WOOD_SWORD = "craft_wood_sword"
 
 
+RequirementComparison = Literal["at_least", "less_than", "equals"]
+EffectOperation = Literal["increase", "decrease", "set"]
+StateValue = int | bool
+
+
+@dataclass(frozen=True)
+class StateRequirement:
+    """One typed precondition expressed over planner-visible state."""
+
+    field: str
+    comparison: RequirementComparison
+    value: StateValue
+
+    def to_dict(self) -> dict[str, StateValue | str]:
+        """Return a JSON-friendly representation."""
+
+        return {
+            "field": self.field,
+            "comparison": self.comparison,
+            "value": self.value,
+        }
+
+
+@dataclass(frozen=True)
+class StateEffect:
+    """One expected state change after successful skill execution."""
+
+    field: str
+    operation: EffectOperation
+    value: StateValue
+
+    def to_dict(self) -> dict[str, StateValue | str]:
+        """Return a JSON-friendly representation."""
+
+        return {
+            "field": self.field,
+            "operation": self.operation,
+            "value": self.value,
+        }
+
+
+@dataclass(frozen=True)
+class SkillMechanics:
+    """Static game knowledge supplied to the high-level planner."""
+
+    requires: tuple[StateRequirement, ...]
+    effects: tuple[StateEffect, ...]
+    repeatable: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-friendly representation."""
+
+        return {
+            "requires": [
+                requirement.to_dict() for requirement in self.requires
+            ],
+            "effects": [effect.to_dict() for effect in self.effects],
+            "repeatable": self.repeatable,
+        }
+
+
 @dataclass(frozen=True)
 class SkillSpec:
     """Static metadata for one skill exposed to an agent."""
@@ -29,6 +90,7 @@ class SkillSpec:
     skill_id: SkillId
     instruction: str
     description: str
+    mechanics: SkillMechanics
     default_horizon: int
     interaction_action: Action
 
@@ -66,13 +128,34 @@ SKILL_REGISTRY: dict[SkillId, SkillSpec] = {
         skill_id=SkillId.COLLECT_WOOD,
         instruction="Collect wood from a tree.",
         description="Increase the wood inventory by interacting with trees.",
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("world.tree_available", "equals", True),
+            ),
+            effects=(
+                StateEffect("inventory.wood", "increase", 1),
+            ),
+        ),
         default_horizon=64,
         interaction_action=Action.DO,
     ),
     SkillId.COLLECT_STONE: SkillSpec(
         skill_id=SkillId.COLLECT_STONE,
         instruction="Collect stone with a wood pickaxe.",
-        description="Increase the stone inventory by mining stone.",
+        description="Mine stone using a wooden pickaxe.",
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement(
+                    "inventory.wood_pickaxe",
+                    "at_least",
+                    1,
+                ),
+                StateRequirement("world.stone_available", "equals", True),
+            ),
+            effects=(
+                StateEffect("inventory.stone", "increase", 1),
+            ),
+        ),
         default_horizon=96,
         interaction_action=Action.DO,
     ),
@@ -80,6 +163,15 @@ SKILL_REGISTRY: dict[SkillId, SkillSpec] = {
         skill_id=SkillId.DRINK_WATER,
         instruction="Drink water.",
         description="Increase the player's drink level at a water tile.",
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("world.water_available", "equals", True),
+                StateRequirement("survival.drink", "less_than", 9),
+            ),
+            effects=(
+                StateEffect("survival.drink", "increase", 1),
+            ),
+        ),
         default_horizon=64,
         interaction_action=Action.DO,
     ),
@@ -87,20 +179,65 @@ SKILL_REGISTRY: dict[SkillId, SkillSpec] = {
         skill_id=SkillId.PLACE_TABLE,
         instruction="Place a crafting table.",
         description="Spend two wood to place a crafting table.",
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("inventory.wood", "at_least", 2),
+            ),
+            effects=(
+                StateEffect("inventory.wood", "decrease", 2),
+                StateEffect(
+                    "world.crafting_table_present",
+                    "set",
+                    True,
+                ),
+            ),
+        ),
         default_horizon=48,
         interaction_action=Action.PLACE_TABLE,
     ),
     SkillId.CRAFT_WOOD_PICKAXE: SkillSpec(
         skill_id=SkillId.CRAFT_WOOD_PICKAXE,
         instruction="Craft a wood pickaxe at a crafting table.",
-        description="Spend one wood to craft a wood pickaxe.",
+        description="Spend one wood at a crafting table to make a wood pickaxe.",
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("inventory.wood", "at_least", 1),
+                StateRequirement(
+                    "world.crafting_table_present",
+                    "equals",
+                    True,
+                ),
+            ),
+            effects=(
+                StateEffect("inventory.wood", "decrease", 1),
+                StateEffect(
+                    "inventory.wood_pickaxe",
+                    "increase",
+                    1,
+                ),
+            ),
+        ),
         default_horizon=64,
         interaction_action=Action.MAKE_WOOD_PICKAXE,
     ),
     SkillId.CRAFT_WOOD_SWORD: SkillSpec(
         skill_id=SkillId.CRAFT_WOOD_SWORD,
         instruction="Craft a wood sword at a crafting table.",
-        description="Spend one wood to craft a wood sword.",
+        description="Spend one wood at a crafting table to make a wood sword.",
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("inventory.wood", "at_least", 1),
+                StateRequirement(
+                    "world.crafting_table_present",
+                    "equals",
+                    True,
+                ),
+            ),
+            effects=(
+                StateEffect("inventory.wood", "decrease", 1),
+                StateEffect("inventory.wood_sword", "increase", 1),
+            ),
+        ),
         default_horizon=64,
         interaction_action=Action.MAKE_WOOD_SWORD,
     ),
@@ -142,8 +279,22 @@ def skill_catalog() -> list[dict[str, Any]]:
             "skill_index": skill_index(spec.skill_id),
             "instruction": spec.instruction,
             "description": spec.description,
+            "mechanics": spec.mechanics.to_dict(),
             "default_horizon": spec.default_horizon,
             "interaction_action": spec.interaction_action.value,
+        }
+        for spec in SKILL_REGISTRY.values()
+    ]
+
+
+def planner_skill_catalog() -> list[dict[str, Any]]:
+    """Return only the static semantics needed for high-level planning."""
+
+    return [
+        {
+            "skill": spec.skill_id.value,
+            "description": spec.description,
+            **spec.mechanics.to_dict(),
         }
         for spec in SKILL_REGISTRY.values()
     ]

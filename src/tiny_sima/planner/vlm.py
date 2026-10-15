@@ -15,7 +15,7 @@ from craftax.craftax_classic.constants import BlockType
 
 from tiny_sima.config import VLMPlannerConfig
 from tiny_sima.envs.craftax import render_state
-from tiny_sima.goals import SKILL_REGISTRY, SkillId, skill_metric
+from tiny_sima.goals import SkillId, planner_skill_catalog, skill_metric
 from tiny_sima.planner.saycan import PlannerContext, UtilityScoreBatch
 
 
@@ -256,6 +256,9 @@ def summarize_state(state: Any) -> str:
 PLANNER_SYSTEM_PROMPT = "\n".join(
     (
         "You are the high-level planner for a Craftax survival agent.",
+        "You may rely on the supplied game-mechanics catalog as authoritative "
+        "knowledge of skill requirements, resource costs, and successful "
+        "effects.",
         "At each option boundary, rank only the supplied skills by how useful "
         "they are as the next requested skill from the current state.",
         "The ranking is recomputed after every completed or failed skill.",
@@ -266,6 +269,12 @@ PLANNER_SYSTEM_PROMPT = "\n".join(
         "but state progress and recent outcomes must still affect usefulness.",
         "First assess current objective progress, then choose the best next "
         "skill, then rank the complete catalog consistently with that choice.",
+        "Known game mechanics: "
+        + json.dumps(
+            planner_skill_catalog(),
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
     )
 )
 
@@ -295,7 +304,6 @@ def build_planner_prompt(
     catalog = [
         {
             "skill": skill_id.value,
-            "description": SKILL_REGISTRY[skill_id].description,
             "current_value": int(
                 np.asarray(skill_metric(skill_id, state)).item()
             ),
