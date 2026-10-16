@@ -15,7 +15,19 @@ from craftax.craftax_classic.constants import BlockType
 
 from tiny_sima.config import VLMPlannerConfig
 from tiny_sima.envs.craftax import render_state
-from tiny_sima.goals import SkillId, planner_skill_catalog, skill_metric
+from tiny_sima.goals import (
+    DEFAULT_REACHABILITY,
+    ReachabilityConfig,
+    SkillGoal,
+    SkillId,
+    block_mask,
+    interaction_distance,
+    planner_skill_catalog,
+    skill_interaction_distance,
+    skill_metric,
+    travel_distance_map,
+    walkable_mask,
+)
 from tiny_sima.planner.saycan import PlannerContext, UtilityScoreBatch
 
 
@@ -200,8 +212,67 @@ def parse_vlm_response(
     )
 
 
-def summarize_state(state: Any) -> str:
-    """Return planner-visible inventory, survival, and world-progress values."""
+def _reachability_values(
+    state: Any,
+    config: ReachabilityConfig,
+) -> dict[str, Any]:
+    """Return reachability facts keyed exactly as the mechanics contract.
+
+    Each ``*_reachable`` flag answers whether the player can stand next to the
+    resource and interact with it inside the skill horizon, searching only the
+    visible window. The matching ``*_steps`` value is a lower bound on how many
+    environment steps that takes, or ``None`` when it is out of range. The
+    previous implementation reported whether a block existed anywhere on the
+    64x64 map, which was true in essentially every state and told the planner
+    nothing.
+    """
+
+    distances = travel_distance_map(state, config)
+    targets: dict[str, Any] = {
+        "tree": block_mask(state, BlockType.TREE),
+        "stone": block_mask(state, BlockType.STONE),
+        "water": block_mask(state, BlockType.WATER),
+        "placement_space": walkable_mask(state),
+    }
+    values: dict[str, Any] = {}
+    for name, target_mask in targets.items():
+        bound = int(
+            np.asarray(
+                interaction_distance(
+                    state,
+                    target_mask,
+                    config,
+                    distances=distances,
+                )
+            ).item()
+        )
+        reachable = bound < config.unreachable
+        values[f"{name}_reachable"] = reachable
+        values[f"{name}_steps"] = bound if reachable else None
+
+    # Crafting uses the eight surrounding tiles rather than the faced tile, so
+    # it is derived from a skill goal instead of a raw block mask.
+    table_bound = int(
+        np.asarray(
+            skill_interaction_distance(
+                SkillGoal(SkillId.CRAFT_WOOD_PICKAXE),
+                state,
+                config,
+                distances=distances,
+            )
+        ).item()
+    )
+    table_reachable = table_bound < config.unreachable
+    values["crafting_table_reachable"] = table_reachable
+    values["crafting_table_steps"] = table_bound if table_reachable else None
+    return values
+
+
+def summarize_state(
+    state: Any,
+    reachability: ReachabilityConfig = DEFAULT_REACHABILITY,
+) -> str:
+    """Return planner-visible inventory, survival, and reachability values."""
 
     inventory = state.inventory
     inventory_fields = (
@@ -226,23 +297,7 @@ def summarize_state(state: Any) -> str:
         "drink": int(np.asarray(state.player_drink).item()),
         "energy": int(np.asarray(state.player_energy).item()),
     }
-    world_values = {
-        "crafting_table_present": bool(
-            np.any(
-                np.asarray(state.map)
-                == BlockType.CRAFTING_TABLE.value
-            )
-        ),
-        "tree_available": bool(
-            np.any(np.asarray(state.map) == BlockType.TREE.value)
-        ),
-        "stone_available": bool(
-            np.any(np.asarray(state.map) == BlockType.STONE.value)
-        ),
-        "water_available": bool(
-            np.any(np.asarray(state.map) == BlockType.WATER.value)
-        ),
-    }
+    world_values = _reachability_values(state, reachability)
     return json.dumps(
         {
             "inventory": inventory_values,
@@ -267,6 +322,14 @@ PLANNER_SYSTEM_PROMPT = "\n".join(
         "repetitions unless another repetition is necessary.",
         "A separate affordance model checks whether each skill is executable, "
         "but state progress and recent outcomes must still affect usefulness.",
+        "A requirement named world.<resource>_reachable means the player can "
+        "walk to that resource and interact with it within the skill horizon, "
+        "searching only the area currently visible. The matching "
+        "world.<resource>_steps value is the fewest steps that needs, or null "
+        "when the resource is out of range. A resource that is not reachable "
+        "cannot be collected from where the player stands now, so prefer a "
+        "skill that makes progress immediately; choose an out-of-range resource "
+        "only when nothing nearer advances the objective.",
         "First assess current objective progress, then choose the best next "
         "skill, then rank the complete catalog consistently with that choice.",
         "Known game mechanics: "
@@ -289,6 +352,7 @@ def build_planner_prompt(
     state: Any,
     context: PlannerContext,
     candidate_skills: tuple[SkillId, ...],
+    reachability: ReachabilityConfig = DEFAULT_REACHABILITY,
 ) -> str:
     """Build a reference-plan-free prompt for one skill boundary."""
 
@@ -301,23 +365,43 @@ def build_planner_prompt(
         }
         for attempt in context.history[-8:]
     ]
-    catalog = [
-        {
-            "skill": skill_id.value,
-            "current_value": int(
-                np.asarray(skill_metric(skill_id, state)).item()
-            ),
-        }
-        for skill_id in candidate_skills
-    ]
+    distances = travel_distance_map(state, reachability)
+    catalog = []
+    for skill_id in candidate_skills:
+        bound = int(
+            np.asarray(
+                skill_interaction_distance(
+                    SkillGoal(skill_id),
+                    state,
+                    reachability,
+                    distances=distances,
+                )
+            ).item()
+        )
+        catalog.append(
+            {
+                "skill": skill_id.value,
+                "current_value": int(
+                    np.asarray(skill_metric(skill_id, state)).item()
+                ),
+                "steps_to_target": (
+                    bound if bound < reachability.unreachable else None
+                ),
+            }
+        )
     return "\n".join(
         (
             f"Objective: {context.objective}",
-            f"Current structured state: {summarize_state(state)}",
+            "Current structured state: "
+            + summarize_state(state, reachability),
             f"Recent skill outcomes: {json.dumps(history)}",
             f"Candidate skills: {json.dumps(catalog)}",
             "Inspect the screenshot and structured state. Rank every candidate "
             "exactly once from most useful to least useful as the next skill.",
+            "A candidate whose steps_to_target is null has no reachable target "
+            "in view, so requesting it means walking off to search. Rank such "
+            "candidates below any skill that can make progress now, and prefer "
+            "a smaller steps_to_target when two skills are equally useful.",
             "The first skill must be the best next step given progress already "
             "made, not merely the skill most associated with the overall goal.",
             "Rank completed or redundant prerequisites below the next unmet "
@@ -334,6 +418,7 @@ class VLMUtilityScorer:
 
     backend: VisionLanguageBackend
     config: VLMPlannerConfig = VLMPlannerConfig()
+    reachability: ReachabilityConfig = DEFAULT_REACHABILITY
     last_response: ParsedVLMResponse | None = None
     _cache: dict[str, ParsedVLMResponse] = field(
         default_factory=dict,
@@ -367,7 +452,12 @@ class VLMUtilityScorer:
             block_pixel_size=self.config.block_pixel_size,
         )
         system_prompt = build_planner_system_prompt()
-        user_prompt = build_planner_prompt(state, context, candidate_skills)
+        user_prompt = build_planner_prompt(
+            state,
+            context,
+            candidate_skills,
+            self.reachability,
+        )
         cache_key = sha256(
             system_prompt.encode("utf-8")
             + user_prompt.encode("utf-8")

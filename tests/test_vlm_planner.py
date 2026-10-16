@@ -95,10 +95,16 @@ def test_planner_prompt_requests_state_dependent_next_skill() -> None:
     assert "progress already made" in user_prompt
     assert "at most 96 characters" in user_prompt
     assert state_summary["world"] == {
-        "crafting_table_present": False,
-        "stone_available": True,
-        "tree_available": True,
-        "water_available": True,
+        "crafting_table_reachable": False,
+        "crafting_table_steps": None,
+        "placement_space_reachable": True,
+        "placement_space_steps": 1,
+        "stone_reachable": True,
+        "stone_steps": 2,
+        "tree_reachable": True,
+        "tree_steps": 3,
+        "water_reachable": True,
+        "water_steps": 2,
     }
     assert next(
         item["current_value"]
@@ -115,7 +121,7 @@ def test_planner_prompt_requests_state_dependent_next_skill() -> None:
     assert {
         requirement["field"]
         for requirement in pickaxe["requires"]
-    } == {"inventory.wood", "world.crafting_table_present"}
+    } == {"inventory.wood", "world.crafting_table_reachable"}
     assert "description" not in catalog[0]
 
 

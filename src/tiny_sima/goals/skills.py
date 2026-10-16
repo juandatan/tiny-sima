@@ -130,7 +130,7 @@ SKILL_REGISTRY: dict[SkillId, SkillSpec] = {
         description="Increase the wood inventory by interacting with trees.",
         mechanics=SkillMechanics(
             requires=(
-                StateRequirement("world.tree_available", "equals", True),
+                StateRequirement("world.tree_reachable", "equals", True),
             ),
             effects=(
                 StateEffect("inventory.wood", "increase", 1),
@@ -150,7 +150,7 @@ SKILL_REGISTRY: dict[SkillId, SkillSpec] = {
                     "at_least",
                     1,
                 ),
-                StateRequirement("world.stone_available", "equals", True),
+                StateRequirement("world.stone_reachable", "equals", True),
             ),
             effects=(
                 StateEffect("inventory.stone", "increase", 1),
@@ -165,7 +165,7 @@ SKILL_REGISTRY: dict[SkillId, SkillSpec] = {
         description="Increase the player's drink level at a water tile.",
         mechanics=SkillMechanics(
             requires=(
-                StateRequirement("world.water_available", "equals", True),
+                StateRequirement("world.water_reachable", "equals", True),
                 StateRequirement("survival.drink", "less_than", 9),
             ),
             effects=(
@@ -182,11 +182,16 @@ SKILL_REGISTRY: dict[SkillId, SkillSpec] = {
         mechanics=SkillMechanics(
             requires=(
                 StateRequirement("inventory.wood", "at_least", 2),
+                StateRequirement(
+                    "world.placement_space_reachable",
+                    "equals",
+                    True,
+                ),
             ),
             effects=(
                 StateEffect("inventory.wood", "decrease", 2),
                 StateEffect(
-                    "world.crafting_table_present",
+                    "world.crafting_table_reachable",
                     "set",
                     True,
                 ),
@@ -203,7 +208,7 @@ SKILL_REGISTRY: dict[SkillId, SkillSpec] = {
             requires=(
                 StateRequirement("inventory.wood", "at_least", 1),
                 StateRequirement(
-                    "world.crafting_table_present",
+                    "world.crafting_table_reachable",
                     "equals",
                     True,
                 ),
@@ -228,7 +233,7 @@ SKILL_REGISTRY: dict[SkillId, SkillSpec] = {
             requires=(
                 StateRequirement("inventory.wood", "at_least", 1),
                 StateRequirement(
-                    "world.crafting_table_present",
+                    "world.crafting_table_reachable",
                     "equals",
                     True,
                 ),

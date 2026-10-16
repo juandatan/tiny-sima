@@ -136,7 +136,7 @@ def test_skill_catalog_covers_registry_and_actions() -> None:
     assert {
         requirement["field"]
         for requirement in pickaxe["mechanics"]["requires"]
-    } == {"inventory.wood", "world.crafting_table_present"}
+    } == {"inventory.wood", "world.crafting_table_reachable"}
     assert {
         (effect["field"], effect["operation"], effect["value"])
         for effect in pickaxe["mechanics"]["effects"]
@@ -159,7 +159,7 @@ def test_planner_skill_catalog_excludes_executor_implementation_details() -> Non
     assert "interaction_action" not in pickaxe
     assert {
         requirement["field"] for requirement in pickaxe["requires"]
-    } == {"inventory.wood", "world.crafting_table_present"}
+    } == {"inventory.wood", "world.crafting_table_reachable"}
 
 
 def test_skill_goal_validates_quantity_and_horizon() -> None:
