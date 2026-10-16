@@ -106,6 +106,9 @@ The planner will consider both:
 
 - **Usefulness:** Does this skill help with the long-term objective?
 - **Feasibility:** Can the executor complete this skill from the current state?
+  This is three separate questions, answered separately: are the preconditions
+  met, is a target actually in reach, and how reliably does this policy finish
+  that skill?
 
 ## Memory
 
@@ -515,9 +518,83 @@ combined score = utility * feasibility * failure penalty
 Utility can be supplied by the scripted objective or by a frozen open-weight
 VLM. The first VLM backend uses `Qwen/Qwen3-VL-2B-Instruct` through
 Transformers. It emits one structured score for every candidate skill in a
-single generation. Feasibility remains an explicit symbolic precondition and
-will later be replaced or augmented by a calibrated executor success
-estimate. The executor and chain loop are unchanged.
+single generation. The executor and chain loop are unchanged.
+
+Feasibility is composed from two sources that answer different questions:
+
+```text
+feasibility = precondition * P(success | skill, reachable, steps to target)
+```
+
+Symbolic preconditions alone cannot ground the ranking. A resource
+precondition asks whether a block exists anywhere on the 64x64 map, which is
+true in essentially every state, so the Can term carried no information and
+the planner ranked unreachable skills above reachable ones. Reachability
+replaces that existence test with a bounded breadth-first search over walkable
+tiles inside the observation window.
+
+Reachability grades rather than vetoes. A target that is not in view is
+unknown, not impossible: both the executor and the scripted oracle can walk
+out of the observation window to find one. Hard-gating on view-limited
+reachability dropped the four-episode scripted chain from 1.0 to 0.5 success
+with the lost episodes terminating in `no_viable_skill`. Unreached targets are
+therefore scored at `unknown_feasibility = 0.25`, which demotes an unreachable
+favourite without refusing it when nothing nearer makes progress.
+
+How reliably *this* policy finishes what is in reach is measured rather than
+inferred. The first attempt tried to read it from the executor's own critic:
+the skill environment pays one sparse reward on success and terminates there,
+so
+
+```text
+V(s, skill) = E[gamma ** k | success] * P(success)
+```
+
+looks monotone in success probability with only its scale wrong, and isotonic
+regression against observed outcomes should recover a probability. **That did
+not work, and the measurement is reported here rather than buried.** Across 432
+labelled probes the critic separates success at AUC 0.43 - below chance - with
+per-skill AUCs near 0.5. The cause is the training distribution:
+`local_navigation` always spawns a reachable target, so the critic never saw a
+state where its skill was impossible and encodes *which* skill was requested
+instead of whether the state admits it. Because the cross-skill relation
+between value and success is decreasing while an isotonic fit must be
+non-decreasing, the fit collapses onto the base rate and the Can term becomes a
+multiplier varying by 1.15x - which cannot reorder candidates whose rank
+utilities differ by 4x.
+
+The same probes show where the signal is. Reachability splits success 0.70
+against 0.03, and per-skill success runs from 0.17 (`place_table`) to 0.63
+(`collect_wood`). `planner/competence.py` therefore tabulates success by
+`(skill, reachable, distance band)` and shrinks each cell toward its parent by
+pseudo-counts - distance toward the skill's reachable rate, the skill toward
+the reachability rate, that toward the base rate - so a thin cell inherits an
+estimate rather than reading 0 or 1. A floor keeps a measured 3% rate
+selectable, for the same reason reachability grades rather than vetoes. The
+critic path is kept as the ablation that produced the refutation, not as a
+recommended Can term.
+
+Both heads are fitted on one seed and scored on another. The in-sample ECE of
+an isotonic fit is identically zero by construction, so a single-seed protocol
+reports a perfect calibration number for a head carrying no information.
+
+Probing is the expensive part of that measurement, so it runs batched on
+device: one `jax.lax.while_loop` over the whole `(episode, skill)` batch per
+boundary, with a fixed batch shape so the compiled probe is reused across
+boundaries. The serial Python version spent 2187s on 432 rollouts, almost all
+of it in per-step device synchronisation.
+
+With the Can term grounded, the planner itself is the binding constraint: it
+ranked an unreachable skill first at 74.5% of boundaries where a reachable one
+existed, and no downstream factor can undo that. Output is schema-constrained,
+so field order is a hard scaffold rather than a request - the default prompt
+style hands the model `available_now` and `blocked_reason` per candidate and
+makes it echo the availability list in a field declared *before*
+`selected_skill`. The prompt that produced 74.5% is preserved byte for byte as
+`PlannerPromptStyle.BASELINE` so the change is measured against it instead of
+assumed to help. The echoed list is also recorded, which separates a perception
+failure (wrong list) from an instruction-following failure (right list, then an
+unavailable choice).
 
 The ordered sequence is private to the scripted baseline. Planner-visible
 context contains only the objective and prior execution outcomes, and chain
@@ -542,8 +619,13 @@ Tasks:
 - Define the planner input and output schemas. **Implemented.**
 - Add a small frozen VLM backend. **Implemented; evaluation pending.**
 - Rank candidate skills using usefulness and predicted feasibility.
+  **Implemented: preconditions, reachability, and a measured per-skill
+  competence prior. The critic-as-affordance variant was measured and
+  retired.**
 - Replan after success, failure, danger, or timeout.
 - Compare scripted, VLM-only, feasibility-only, and combined planners.
+  **Eight-condition ladder implemented in notebook 06, including the retired
+  critic control and the baseline prompt; GPU run pending.**
 
 ### Phase 5: Memory and visual grounding
 
@@ -676,6 +758,18 @@ Implemented:
 - A model-independent VLM backend interface, Outlines-constrained skill
   rankings, strict validation, and one-call whole-catalog utility scoring.
 - Planning-only controlled-prefix evaluation, separate from executor errors.
+- Horizon-bounded reachability feasibility, graded so an out-of-view target is
+  demoted rather than refused.
+- Batched on-device skill probing that labels every candidate at a boundary
+  with whether the executor actually finished it.
+- A measured competence prior over `(skill, reachable, distance band)` with
+  empirical-Bayes shrinkage, fitted on one seed and scored on another.
+- Critic-as-affordance scoring with isotonic recalibration, retained as the
+  ablation that measured its own failure at AUC 0.43.
+- A schema-constrained planner prompt that reports skill availability before
+  the decoder can name a choice, with the baseline prompt preserved for
+  comparison.
+- Static notebook checks for parse errors, stale imports, and undefined names.
 
 Verified locally on October 8, 2026:
 
@@ -812,3 +906,106 @@ Phase 4 implementation started on October 14, 2026:
   skills, alongside objective success, skill failures, steps, and return.
 - All 92 regular automated tests pass locally; the real-model VLM smoke test
   is opt-in. Ruff and Pyright report no issues.
+
+Planner grounding fixed on October 16, 2026:
+
+- Diagnosed the reported ranking failure. `skill_precondition` tests whether a
+  block exists anywhere on the 64x64 map, so the Can term was satisfied at
+  nearly every boundary and could not demote an out-of-range resource.
+- Added horizon-bounded reachability in `goals/reachability.py`: a
+  breadth-first search over walkable tiles, expressed as iterated min-plus
+  relaxation so it stays inside `jax.lax.fori_loop`, confined by default to the
+  7x9 observation window. It reports interaction distances per skill and
+  distinguishes the 8-neighbourhood used for crafting from the faced tile used
+  by `DO` and `PLACE_TABLE`.
+- Made the gate graded rather than vetoing after a hard gate regressed the
+  four-episode scripted chain from 1.0 to 0.5 success. "Not reachable in view"
+  means unknown, not impossible, because the executor can walk out of the
+  window; unreached targets score `unknown_feasibility = 0.25`.
+- Added `planner/affordance.py`, which reads `V(s, skill)` for the whole
+  catalog in one forward pass at option boundaries and multiplies the result by
+  the reachability gate.
+- Added `planner/calibration.py`: isotonic recalibration by pool-adjacent
+  violators in plain numpy, with Brier score, expected calibration error, and
+  rank-based AUC. No scikit-learn dependency is introduced for 60 lines of
+  monotone regression.
+- Added `evaluation/affordance.py`, which collects calibration data by probing
+  every skill at every chain boundary from a copy of the boundary state and
+  discarding the probe rollouts. It reports `unreachable_successes`, the count
+  of skills a hard gate would have refused that the executor completed anyway.
+- Fixed the planner metrics so they can detect this class of failure.
+  `grounded_selection_rate` now means the chosen skill was usable from that
+  exact state; its previous precondition-based definition was satisfied almost
+  everywhere and so measured nothing. Added `ungrounded_top_choice_rate`, which
+  isolates the VLM's grounding error independent of the Can term, and
+  `feasibility_rescue_rate`, which shows how often the Can term recovered an
+  accepted skill. Ground truth is now computed independently of whichever
+  scorer the planner under test uses.
+- Softened the prompt text to match graded semantics: an out-of-range resource
+  is ranked below anything that makes progress now, not declared impossible.
+- Rebuilt `notebooks/06_evaluate_vlm_planner.ipynb` around a six-condition
+  ladder (`scripted_oracle`, `vlm_only`, `feasibility_only`,
+  `vlm_plus_symbolic`, `vlm_plus_reachability`, `vlm_plus_critic_affordance`),
+  a cheap precondition-versus-reachability table that needs no model weights,
+  and a calibration cell that shares one checkpoint load with the closed-loop
+  executor so the calibrated critic belongs to the policy under test.
+- Added static notebook checks in `tests/test_notebooks.py`. The notebooks need
+  a remote GPU, so what is verified here is what wastes a remote session: every
+  cell parses, every `tiny_sima` symbol imported still exists, and no cell reads
+  a name that no earlier cell binds.
+- All 153 regular automated tests pass locally; the real-model VLM smoke test
+  remains opt-in. Ruff and Pyright report no issues.
+
+Critic affordances measured and retired on October 19, 2026:
+
+- Ran the calibration harness on the GPU. The critic-as-affordance hypothesis
+  failed: pooled AUC 0.428 over 432 labelled probes, per-skill AUCs near 0.5,
+  and an isotonic fit that collapses to two values spanning `[0.240, 0.276]`.
+  The cross-skill relation between value and success is *decreasing*, which a
+  pool-adjacent-violators fit cannot represent, so the Can term degenerated to
+  a near-constant multiplier. A factor varying by 1.15x cannot reorder
+  candidates whose reciprocal-square rank utilities differ by 4x.
+- Diagnosed the cause as the training distribution rather than the fit.
+  `local_navigation` always places a reachable target, so `V(s, skill)` encodes
+  which skill was requested, not whether the state admits it.
+- Dropped the critic from the default feasibility composition. The code stays
+  as the ablation that produced the measurement, with the result recorded in
+  its module docstring so the next reader does not repeat it.
+- Added `planner/competence.py`: a `(skill, reachable, distance band)` lookup
+  table over the three features the same probes show carry signal -
+  reachability splits success 0.70 against 0.03, per-skill success runs 0.17 to
+  0.63. Cells are shrunk toward their parents by pseudo-counts, so an
+  unobserved cell inherits its parent's estimate instead of reading 0 or 1, and
+  a floor keeps a measured 3% rate selectable for the same reason reachability
+  grades rather than vetoes. It is a SayCan competence head, just not one read
+  out of a value function that was never trained to answer the question.
+- Fixed the calibration protocol. Both heads are now fitted on one seed and
+  scored on another; the previously reported ECE was in-sample and an isotonic
+  fit's in-sample ECE is identically zero by construction. The returned report
+  carries a `held_out` flag so the distinction cannot be lost again.
+- Batched the probes. `probe_skills_batched` runs the whole `(episode, skill)`
+  batch for a boundary in one `jax.lax.while_loop` with a fixed batch shape, so
+  the compiled probe is reused across boundaries; `collect_affordance_samples`
+  advances all episodes in lockstep over the boundary index to feed it. The
+  serial version spent 2187s on 432 rollouts, nearly all of it in the six
+  per-step device synchronisations inside `LearnedSkillExecutor.execute`.
+- Attacked the remaining error, which is the planner: it ranked an unreachable
+  skill first at 74.5% of boundaries where a reachable one existed. Because
+  generation is schema-constrained left to right, field order is a hard
+  scaffold - the new default prompt style supplies `available_now` and
+  `blocked_reason` per candidate and requires the model to echo the
+  availability list in a field declared before `selected_skill`. The system
+  prompt no longer tells the planner that a separate affordance model handles
+  executability, which was the instruction licensing the failure.
+- Preserved the previous prompt and system prompt byte for byte as
+  `PlannerPromptStyle.BASELINE`, and added a `vlm_baseline_prompt` condition
+  that differs from `vlm_plus_reachability` in the prompt alone, so the change
+  is measured rather than assumed. The echoed availability list is recorded as
+  `claimed_available`, which separates a perception failure from an
+  instruction-following failure.
+- Extended notebook 06 to an eight-condition ladder with the held-out
+  calibration seed, both competence heads scored side by side, the fitted
+  competence table printed cell by cell with its support, and both prompt
+  styles printed before any model weights load.
+- All 177 regular automated tests pass locally; the real-model VLM smoke test
+  remains opt-in. Ruff and Pyright report no issues.

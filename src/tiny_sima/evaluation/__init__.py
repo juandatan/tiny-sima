@@ -1,14 +1,25 @@
 """Policy evaluation helpers."""
 
+from tiny_sima.evaluation.affordance import (
+    AffordanceSample,
+    collect_affordance_samples,
+    evaluate_affordance_calibration,
+    evaluate_competence_prior,
+    fit_affordance_calibration,
+    fit_affordance_competence_prior,
+)
 from tiny_sima.evaluation.chains import (
     WOOD_TO_STONE_CHAIN,
     ChainTermination,
     LearnedSkillExecutor,
     ScriptedSkillExecutor,
+    SkillProbe,
     evaluate_chain_episode,
     evaluate_learned_skill_chain_batched,
     evaluate_skill_chain,
     learned_skill_executor_from_checkpoint,
+    make_learned_skill_executor,
+    probe_skills_batched,
 )
 from tiny_sima.evaluation.goal_conditioned import (
     diagnose_goal_conditioned_checkpoint,
@@ -36,18 +47,23 @@ from tiny_sima.evaluation.skills import (
 from tiny_sima.evaluation.vlm_smoke import VLMSmokeResult, run_vlm_smoke_test
 
 __all__ = [
+    "AffordanceSample",
     "NvidiaSmiMonitor",
     "PlannerBoundaryTrace",
     "VLMSmokeResult",
     "LearnedSkillExecutor",
     "ScriptedSkillExecutor",
+    "SkillProbe",
     "ChainTermination",
     "WOOD_TO_STONE_CHAIN",
+    "collect_affordance_samples",
     "diagnose_goal_conditioned_checkpoint",
     "diagnose_goal_conditioned_policy",
     "diagnose_goal_conditioned_skill",
+    "evaluate_affordance_calibration",
     "evaluate_checkpoint",
     "evaluate_chain_episode",
+    "evaluate_competence_prior",
     "evaluate_learned_skill_chain_batched",
     "evaluate_goal_conditioned_checkpoint",
     "evaluate_goal_conditioned_policy",
@@ -57,9 +73,13 @@ __all__ = [
     "evaluate_skill_policy",
     "evaluate_skill_chain",
     "evaluate_skill_suite",
+    "fit_affordance_calibration",
+    "fit_affordance_competence_prior",
     "jax_allocator_summary",
     "learned_skill_executor_from_checkpoint",
     "load_goal_conditioned_checkpoint",
+    "make_learned_skill_executor",
+    "probe_skills_batched",
     "run_vlm_smoke_test",
     "scripted_skill_action",
 ]

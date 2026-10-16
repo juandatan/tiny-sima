@@ -6,7 +6,7 @@ import argparse
 import json
 import time
 from collections import Counter, deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
@@ -1064,6 +1064,253 @@ def evaluate_learned_skill_chain_batched(
         "final_failed_skill_counts": final_failed_skill_counts,
         "total_seconds_including_compile": total_seconds,
     }
+
+
+class BatchedProbeCarry(NamedTuple):
+    """JAX state for probing one option per batch entry in lockstep."""
+
+    rng: jax.Array
+    state: Any
+    observation: jax.Array
+    hidden: jax.Array
+    steps: jax.Array
+    initial_metric: jax.Array
+    finished: jax.Array
+    outcome: jax.Array
+
+
+class BatchedProbeOutput(NamedTuple):
+    """Per-entry probe results: how it ended and how long it took."""
+
+    outcome: jax.Array
+    steps: jax.Array
+
+
+@dataclass(frozen=True)
+class SkillProbe:
+    """How one skill ended when attempted from a given state.
+
+    The resulting world state is deliberately absent: a probe exists to label
+    a boundary state, and every probe runs on a throwaway copy so that nothing
+    it does can perturb the trajectory being labelled.
+    """
+
+    skill_id: SkillId
+    outcome: SkillOutcome
+    steps: int
+
+    @property
+    def succeeded(self) -> bool:
+        return self.outcome is SkillOutcome.SUCCESS
+
+
+_PROBE_OUTCOMES = tuple(SkillOutcome)
+
+
+def _stack_states(states: Sequence[Any]) -> Any:
+    """Stack per-entry environment states into one batched pytree."""
+
+    if not states:
+        raise ValueError("Cannot stack zero states.")
+    return jax.tree_util.tree_map(
+        lambda *leaves: jnp.stack([jnp.asarray(leaf) for leaf in leaves]),
+        *states,
+    )
+
+
+BatchedProbe = Callable[[Any, Any, jax.Array, jax.Array], BatchedProbeOutput]
+
+
+@lru_cache(maxsize=16)
+def _make_batched_skill_probe(
+    *,
+    batch_size: int,
+    skill_horizon: int,
+    distractor_count: int,
+    hidden_size: int,
+    skill_embedding_size: int,
+    deterministic: bool,
+) -> BatchedProbe:
+    """Build and cache one compiled probe for a static batch shape.
+
+    The unbatched :meth:`LearnedSkillExecutor.execute` reads ``reward``,
+    ``done`` and four info flags back to the host on every primitive step, so
+    a probe sweep spends most of its time on device synchronisation rather
+    than on rollout. Running the whole batch inside one ``jax.lax.while_loop``
+    removes every per-step round trip; only the final outcome codes come back.
+    """
+
+    environment = make_skill_chain_environment(distractor_count=distractor_count)
+    model = make_goal_conditioned_actor_critic(
+        num_actions=environment.bundle.spec.num_actions,
+        num_skills=len(SKILL_IDS),
+        hidden_size=hidden_size,
+        skill_embedding_size=skill_embedding_size,
+    )
+    success_code = _PROBE_OUTCOMES.index(SkillOutcome.SUCCESS)
+    timeout_code = _PROBE_OUTCOMES.index(SkillOutcome.TIMEOUT)
+    precondition_lost_code = _PROBE_OUTCOMES.index(SkillOutcome.PRECONDITION_LOST)
+    terminated_code = _PROBE_OUTCOMES.index(SkillOutcome.ENVIRONMENT_TERMINATED)
+    infeasible_code = _PROBE_OUTCOMES.index(SkillOutcome.INFEASIBLE)
+
+    def probe(
+        params: Any,
+        states: Any,
+        skill_ids: jax.Array,
+        rng: jax.Array,
+    ) -> BatchedProbeOutput:
+        precondition = _batched_skill_precondition(skill_ids, states)
+        initial_carry = BatchedProbeCarry(
+            rng=rng,
+            state=states,
+            observation=jax.vmap(environment.bundle.env.get_obs)(states),
+            hidden=initial_hidden(batch_size, hidden_size),
+            steps=jnp.zeros((batch_size,), dtype=jnp.int32),
+            initial_metric=_batched_skill_metric(skill_ids, states),
+            finished=~precondition,
+            outcome=jnp.where(precondition, timeout_code, infeasible_code),
+        )
+
+        def continue_probing(
+            loop_state: tuple[jax.Array, BatchedProbeCarry],
+        ) -> jax.Array:
+            iteration, carry = loop_state
+            return (iteration < skill_horizon) & ~jnp.all(carry.finished)
+
+        def step(
+            loop_state: tuple[jax.Array, BatchedProbeCarry],
+        ) -> tuple[jax.Array, BatchedProbeCarry]:
+            iteration, carry = loop_state
+            rng, action_rng, environment_rng = jax.random.split(carry.rng, 3)
+            active = ~carry.finished
+
+            model_output = apply_goal_conditioned_actor_critic(
+                model,
+                params,
+                carry.hidden,
+                (
+                    carry.observation[None, ...],
+                    skill_ids[None, ...],
+                    (carry.steps == 0)[None, ...],
+                ),
+            )
+            action = select_action(
+                model_output.logits[0],
+                action_rng,
+                deterministic=deterministic,
+            )
+            action = jnp.where(active, action, Action.NOOP.value)
+            environment_step = step_batch(
+                environment.bundle,
+                environment_rng,
+                carry.state,
+                action,
+            )
+            state = _select_batched_state(
+                active,
+                environment_step.state,
+                carry.state,
+            )
+            observation = jnp.where(
+                active[:, None],
+                environment_step.observation,
+                carry.observation,
+            )
+
+            steps = carry.steps + active.astype(jnp.int32)
+            metric = _batched_skill_metric(skill_ids, state)
+            success = active & (metric - carry.initial_metric >= 1)
+            timeout = active & ~success & (steps >= skill_horizon)
+            terminated = active & ~success & environment_step.done
+            ended = success | timeout | terminated
+            # The skill environment reports a lost precondition only once the
+            # option has ended, so the same ordering is reproduced here.
+            precondition_after = _batched_skill_precondition(skill_ids, state)
+            precondition_lost = ended & ~success & ~precondition_after
+            outcome = jnp.where(
+                timeout,
+                timeout_code,
+                terminated_code,
+            )
+            outcome = jnp.where(precondition_lost, precondition_lost_code, outcome)
+            outcome = jnp.where(success, success_code, outcome)
+
+            next_carry = BatchedProbeCarry(
+                rng=rng,
+                state=state,
+                observation=observation,
+                hidden=model_output.hidden,
+                steps=steps,
+                initial_metric=carry.initial_metric,
+                finished=carry.finished | ended,
+                outcome=jnp.where(ended, outcome, carry.outcome),
+            )
+            return iteration + 1, next_carry
+
+        _, final_carry = jax.lax.while_loop(
+            continue_probing,
+            step,
+            (jnp.asarray(0, dtype=jnp.int32), initial_carry),
+        )
+        return BatchedProbeOutput(
+            outcome=final_carry.outcome,
+            steps=final_carry.steps,
+        )
+
+    return jax.jit(probe)
+
+
+def probe_skills_batched(
+    executor: LearnedSkillExecutor,
+    states: Sequence[Any],
+    skill_ids: Sequence[SkillId],
+    rng: jax.Array,
+    *,
+    skill_horizon: int = 64,
+    distractor_count: int = 3,
+) -> tuple[SkillProbe, ...]:
+    """Run one option per ``(state, skill)`` pair, all in parallel on device.
+
+    ``states[i]`` is paired with ``skill_ids[i]``, so a caller that wants the
+    whole catalog probed at several boundaries flattens those pairs itself.
+    Keeping the batch length fixed across calls reuses the compiled probe;
+    padding with throwaway entries is cheaper than recompiling.
+    """
+
+    if len(states) != len(skill_ids):
+        raise ValueError("States and skill IDs must describe the same pairs.")
+    if not states:
+        return ()
+    if skill_horizon < 1:
+        raise ValueError("skill_horizon must be positive.")
+
+    probe = _make_batched_skill_probe(
+        batch_size=len(states),
+        skill_horizon=skill_horizon,
+        distractor_count=distractor_count,
+        hidden_size=executor.config.hidden_size,
+        skill_embedding_size=executor.config.skill_embedding_size,
+        deterministic=executor.deterministic,
+    )
+    output = probe(
+        executor.params,
+        _stack_states(states),
+        jnp.asarray(
+            [skill_index(skill_id) for skill_id in skill_ids],
+            dtype=jnp.int32,
+        ),
+        rng,
+    )
+    outcomes = np.asarray(output.outcome)
+    steps = np.asarray(output.steps)
+    return tuple(
+        SkillProbe(
+            skill_id=skill_id,
+            outcome=_PROBE_OUTCOMES[int(outcomes[index])],
+            steps=int(steps[index]),
+        )
+        for index, skill_id in enumerate(skill_ids)
+    )
 
 
 def evaluate_chain_episode(

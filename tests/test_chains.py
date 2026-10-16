@@ -2,6 +2,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+from craftax.craftax_classic.constants import BlockType
 
 from tiny_sima.config import SkillPPOConfig
 from tiny_sima.envs.chains import make_skill_chain_environment
@@ -11,9 +12,11 @@ from tiny_sima.evaluation.chains import (
     LearnedSkillExecutor,
     ScriptedSkillExecutor,
     SkillChainSpec,
+    _make_batched_skill_probe,
     _record_skill_failures,
     evaluate_learned_skill_chain_batched,
     evaluate_skill_chain,
+    probe_skills_batched,
 )
 from tiny_sima.executor.model import (
     initialize_goal_conditioned_parameters,
@@ -224,3 +227,125 @@ def test_batched_failure_counts_persist_across_successful_options() -> None:
         jnp.asarray([True]),
     )
     assert int(selected[0]) == 2
+
+
+def _no_nearby_trees(state: Any, radius: int = 12) -> Any:
+    """Clear trees around the player, leaving the precondition satisfied."""
+
+    world_map = jnp.asarray(state.map)
+    position = jnp.asarray(state.player_position)
+    rows = jnp.arange(world_map.shape[0])[:, None]
+    columns = jnp.arange(world_map.shape[1])[None, :]
+    nearby = (jnp.abs(rows - position[0]) <= radius) & (
+        jnp.abs(columns - position[1]) <= radius
+    )
+    cleared = jnp.where(
+        nearby & (world_map == BlockType.TREE.value),
+        BlockType.GRASS.value,
+        world_map,
+    )
+    assert bool(jnp.any(cleared == BlockType.TREE.value))
+    return state.replace(map=cleared)
+
+
+def test_batched_probe_pairs_each_state_with_its_own_skill() -> None:
+    executor = _make_random_learned_executor()
+    environment = make_skill_chain_environment()
+    states = [
+        environment.reset(jax.random.PRNGKey(seed)).state for seed in range(2)
+    ]
+    pairs = [(state, skill_id) for state in states for skill_id in SKILL_IDS]
+
+    probes = probe_skills_batched(
+        executor,
+        [state for state, _ in pairs],
+        [skill_id for _, skill_id in pairs],
+        jax.random.PRNGKey(0),
+        skill_horizon=4,
+    )
+
+    assert len(probes) == len(pairs)
+    assert [probe.skill_id for probe in probes] == [
+        skill_id for _, skill_id in pairs
+    ]
+    for probe in probes:
+        assert 0 <= probe.steps <= 4
+        assert probe.succeeded == (probe.outcome is SkillOutcome.SUCCESS)
+
+
+def test_batched_probe_reports_the_same_infeasibility_as_the_executor() -> None:
+    executor = _make_random_learned_executor()
+    environment = make_skill_chain_environment()
+    state = environment.reset(jax.random.PRNGKey(0)).state
+
+    probes = probe_skills_batched(
+        executor,
+        [state] * len(SKILL_IDS),
+        list(SKILL_IDS),
+        jax.random.PRNGKey(1),
+        skill_horizon=4,
+    )
+    unbatched = [
+        executor.execute(environment, state, skill_id, jax.random.PRNGKey(1), horizon=4)
+        for skill_id in SKILL_IDS
+    ]
+
+    infeasible_batched = {
+        probe.skill_id
+        for probe in probes
+        if probe.outcome is SkillOutcome.INFEASIBLE
+    }
+    infeasible_unbatched = {
+        skill_id
+        for skill_id, result in zip(SKILL_IDS, unbatched, strict=True)
+        if result.outcome is SkillOutcome.INFEASIBLE
+    }
+    # Stone needs a pickaxe and crafting needs a table, neither of which a
+    # fresh world provides, so the precondition fast path must agree exactly.
+    assert infeasible_batched == infeasible_unbatched
+    assert SkillId.COLLECT_STONE in infeasible_batched
+    assert all(
+        probe.steps == 0
+        for probe in probes
+        if probe.outcome is SkillOutcome.INFEASIBLE
+    )
+
+
+def test_batched_probe_times_out_when_no_target_is_in_reach() -> None:
+    executor = _make_random_learned_executor()
+    environment = make_skill_chain_environment()
+    state = _no_nearby_trees(environment.reset(jax.random.PRNGKey(0)).state)
+
+    probe = probe_skills_batched(
+        executor,
+        [state],
+        [SkillId.COLLECT_WOOD],
+        jax.random.PRNGKey(2),
+        skill_horizon=4,
+    )[0]
+
+    # Wood exists somewhere, so the precondition holds and the option runs;
+    # the nearest tree is far outside four steps, so it can only time out.
+    assert probe.outcome is SkillOutcome.TIMEOUT
+    assert probe.steps == 4
+
+
+def test_batched_probe_compiles_once_per_batch_shape() -> None:
+    executor = _make_random_learned_executor()
+    environment = make_skill_chain_environment()
+    state = environment.reset(jax.random.PRNGKey(0)).state
+    other = environment.reset(jax.random.PRNGKey(3)).state
+
+    _make_batched_skill_probe.cache_clear()
+    for probe_state in (state, other):
+        probe_skills_batched(
+            executor,
+            [probe_state] * len(SKILL_IDS),
+            list(SKILL_IDS),
+            jax.random.PRNGKey(0),
+            skill_horizon=2,
+        )
+
+    info = _make_batched_skill_probe.cache_info()
+    assert info.misses == 1
+    assert info.hits == 1

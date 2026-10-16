@@ -26,9 +26,11 @@ from tiny_sima.planner.saycan import (
     constant_feasibility,
 )
 from tiny_sima.planner.vlm import (
+    PlannerPromptStyle,
     TransformersVLMBackend,
     VLMRequest,
     VLMUtilityScorer,
+    _ranking_output_type,
     build_planner_prompt,
     build_planner_system_prompt,
     parse_vlm_response,
@@ -73,13 +75,20 @@ def _response(
 
 
 def test_planner_prompt_requests_state_dependent_next_skill() -> None:
+    """Pin the baseline prompt that measured 74.5% ungrounded top choices.
+
+    The default style has moved on, but this prompt is the measurement's
+    reference point, so its wording must not drift underneath it.
+    """
+
     state = make_skill_chain_environment().reset(jax.random.PRNGKey(0)).state
     context = PlannerContext(
         objective="Craft a wood pickaxe and collect stone.",
     )
+    style = PlannerPromptStyle.BASELINE
 
-    system_prompt = build_planner_system_prompt()
-    user_prompt = build_planner_prompt(state, context, SKILL_IDS)
+    system_prompt = build_planner_system_prompt(style)
+    user_prompt = build_planner_prompt(state, context, SKILL_IDS, style=style)
     state_summary = json.loads(summarize_state(state))
     catalog_line = next(
         line
@@ -95,10 +104,16 @@ def test_planner_prompt_requests_state_dependent_next_skill() -> None:
     assert "progress already made" in user_prompt
     assert "at most 96 characters" in user_prompt
     assert state_summary["world"] == {
-        "crafting_table_present": False,
-        "stone_available": True,
-        "tree_available": True,
-        "water_available": True,
+        "crafting_table_reachable": False,
+        "crafting_table_steps": None,
+        "placement_space_reachable": True,
+        "placement_space_steps": 1,
+        "stone_reachable": True,
+        "stone_steps": 2,
+        "tree_reachable": True,
+        "tree_steps": 3,
+        "water_reachable": True,
+        "water_steps": 2,
     }
     assert next(
         item["current_value"]
@@ -115,8 +130,77 @@ def test_planner_prompt_requests_state_dependent_next_skill() -> None:
     assert {
         requirement["field"]
         for requirement in pickaxe["requires"]
-    } == {"inventory.wood", "world.crafting_table_present"}
+    } == {"inventory.wood", "world.crafting_table_reachable"}
     assert "description" not in catalog[0]
+    assert "available_now" not in catalog[0]
+
+
+def test_available_first_prompt_puts_availability_before_the_choice() -> None:
+    state = make_skill_chain_environment().reset(jax.random.PRNGKey(0)).state
+    context = PlannerContext(
+        objective="Craft a wood pickaxe and collect stone.",
+    )
+
+    system_prompt = build_planner_system_prompt()
+    user_prompt = build_planner_prompt(state, context, SKILL_IDS)
+    catalog_line = next(
+        line
+        for line in user_prompt.splitlines()
+        if line.startswith("Candidate skills: ")
+    )
+    catalog = json.loads(catalog_line.removeprefix("Candidate skills: "))
+    available_line = next(
+        line
+        for line in user_prompt.splitlines()
+        if line.startswith("Skills available now: ")
+    )
+    available = json.loads(
+        available_line.removeprefix("Skills available now: ")
+    )
+
+    # The baseline deferred executability to "a separate affordance model",
+    # which is exactly the instruction that let an unreachable skill rank first.
+    assert "A separate affordance model" in build_planner_system_prompt(
+        PlannerPromptStyle.BASELINE
+    )
+    assert "A separate affordance model" not in system_prompt
+    assert "includes being doable now" in system_prompt
+    assert "copy the available-now list" in user_prompt
+
+    # Availability is computed for the planner rather than asked of it, and the
+    # available candidates lead the list so position agrees with the answer.
+    assert all("available_now" in entry for entry in catalog)
+    assert available == [
+        entry["skill"] for entry in catalog if entry["available_now"]
+    ]
+    assert [entry["available_now"] for entry in catalog] == sorted(
+        (entry["available_now"] for entry in catalog),
+        reverse=True,
+    )
+    blocked = {
+        entry["skill"]: entry["blocked_reason"]
+        for entry in catalog
+        if not entry["available_now"]
+    }
+    # No table has been placed yet, so crafting fails on its requirement
+    # rather than on distance.
+    assert blocked[SkillId.CRAFT_WOOD_PICKAXE.value] == "missing_requirement"
+    assert SkillId.COLLECT_WOOD.value in available
+
+
+def test_available_now_is_declared_before_the_selected_skill() -> None:
+    # Constrained decoding emits fields in declaration order, so the position
+    # of available_now is what forces the readout to precede the choice.
+    fields = list(
+        _ranking_output_type(SKILL_IDS, True).model_fields  # type: ignore[attr-defined]
+    )
+    baseline = list(
+        _ranking_output_type(SKILL_IDS).model_fields  # type: ignore[attr-defined]
+    )
+
+    assert fields.index("available_now") < fields.index("selected_skill")
+    assert fields.index("progress_assessment") < fields.index("available_now")
+    assert "available_now" not in baseline
 
 
 def test_planner_prompt_exposes_updated_skill_progress() -> None:
@@ -162,6 +246,69 @@ def test_parse_vlm_response_derives_utilities_from_complete_ranking() -> None:
     assert parsed.utilities[SkillId.COLLECT_WOOD] == 1.0
     assert parsed.utilities[SkillId.PLACE_TABLE] == 0.25
     assert set(parsed.utilities) == set(SKILL_IDS)
+
+
+def test_parse_vlm_response_records_the_claimed_available_skills() -> None:
+    ranking = _ranking(SkillId.COLLECT_WOOD, SkillId.DRINK_WATER)
+    parsed = parse_vlm_response(
+        json.dumps(
+            {
+                "progress_assessment": "Wood is the unmet prerequisite.",
+                "available_now": [
+                    SkillId.COLLECT_WOOD.value,
+                    SkillId.DRINK_WATER.value,
+                ],
+                "selected_skill": ranking[0],
+                "ranking": ranking,
+            }
+        ),
+        SKILL_IDS,
+    )
+
+    assert parsed.valid
+    # Comparing this against the true reachable set is what separates a
+    # perception failure from an instruction-following failure.
+    assert parsed.claimed_available == (
+        SkillId.COLLECT_WOOD,
+        SkillId.DRINK_WATER,
+    )
+
+
+def test_parse_vlm_response_leaves_claimed_availability_empty_for_baseline() -> None:
+    parsed = parse_vlm_response(_response(SkillId.COLLECT_WOOD), SKILL_IDS)
+
+    assert parsed.valid
+    assert parsed.claimed_available == ()
+
+
+@pytest.mark.parametrize(
+    ("available_now", "error"),
+    [
+        ("collect_wood", "available_now_not_an_array"),
+        (["chop_tree"], "unknown_available_skill"),
+        (["collect_wood", "collect_wood"], "duplicate_available_skill"),
+    ],
+)
+def test_parse_vlm_response_rejects_malformed_availability(
+    available_now: Any,
+    error: str,
+) -> None:
+    ranking = _ranking(SkillId.COLLECT_WOOD)
+    parsed = parse_vlm_response(
+        json.dumps(
+            {
+                "progress_assessment": "Wood is the unmet prerequisite.",
+                "available_now": available_now,
+                "selected_skill": ranking[0],
+                "ranking": ranking,
+            }
+        ),
+        SKILL_IDS,
+    )
+
+    assert not parsed.valid
+    assert parsed.error == error
+    assert parsed.claimed_available == ()
 
 
 def test_rank_utilities_keep_the_top_skill_after_one_failure() -> None:
@@ -273,14 +420,35 @@ def test_empty_candidate_catalog_returns_no_selection_without_generation() -> No
     assert scorer.last_response.selected_skill is None
 
 
+def test_prompt_style_reaches_the_backend_as_a_schema_requirement() -> None:
+    state = make_skill_chain_environment().reset(jax.random.PRNGKey(0)).state
+    context = PlannerContext(objective="Collect wood.")
+    available_first = FakeBackend(response=_response(SkillId.COLLECT_WOOD))
+    baseline = FakeBackend(response=_response(SkillId.COLLECT_WOOD))
+
+    VLMUtilityScorer(available_first).score_all(state, context, SKILL_IDS)
+    VLMUtilityScorer(
+        baseline,
+        prompt_style=PlannerPromptStyle.BASELINE,
+    ).score_all(state, context, SKILL_IDS)
+
+    # The prompt asks for available_now, so the constrained schema has to make
+    # room for it; otherwise the request is rejected as extra output.
+    assert available_first.requests[0].require_available is True
+    assert baseline.requests[0].require_available is False
+
+
 def test_transformers_backend_caches_constrained_generators(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     backend = TransformersVLMBackend(VLMPlannerConfig())
     created: list[tuple[Any, Any]] = []
 
-    def fake_output_type(candidate_skills: tuple[SkillId, ...]) -> object:
-        return ("schema", candidate_skills)
+    def fake_output_type(
+        candidate_skills: tuple[SkillId, ...],
+        require_available: bool = False,
+    ) -> object:
+        return ("schema", candidate_skills, require_available)
 
     def fake_generator_factory(model: Any, output_type: Any) -> object:
         created.append((model, output_type))
@@ -299,9 +467,21 @@ def test_transformers_backend_caches_constrained_generators(
         outlines_model,
         fake_generator_factory,
     )
+    available_first = backend._generator_for(
+        SKILL_IDS,
+        outlines_model,
+        fake_generator_factory,
+        require_available=True,
+    )
 
     assert first is second
-    assert len(created) == 1
+    # The two prompt styles need different schemas, so they must not share one
+    # compiled generator.
+    assert available_first is not first
+    assert [output_type for _, output_type in created] == [
+        ("schema", SKILL_IDS, False),
+        ("schema", SKILL_IDS, True),
+    ]
 
 
 def test_vlm_smoke_test_validates_one_generation_and_grounded_selection() -> None:

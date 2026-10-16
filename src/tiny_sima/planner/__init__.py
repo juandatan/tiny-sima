@@ -1,11 +1,34 @@
 """Skill-ranking interfaces shared by scripted and future VLM planners."""
 
+from tiny_sima.planner.affordance import (
+    CriticAffordanceScorer,
+    critic_affordance_scorer_from_checkpoint,
+    make_critic_affordance_scorer,
+)
+from tiny_sima.planner.calibration import (
+    IsotonicCalibration,
+    calibration_metrics,
+    expected_calibration_error,
+    fit_isotonic_calibration,
+    roc_auc,
+)
+from tiny_sima.planner.competence import (
+    DEFAULT_DISTANCE_EDGES,
+    DEFAULT_FLOOR,
+    DEFAULT_PRIOR_STRENGTH,
+    CompetencePrior,
+    distance_cell,
+    fit_competence_prior,
+    num_distance_cells,
+)
 from tiny_sima.planner.saycan import (
+    BatchedFeasibilityScorer,
     BatchedUtilityScorer,
     PlannerContext,
     PlannerDecision,
     PlannerSelection,
     PlannerSelectionStatus,
+    ReachabilityFeasibilityScorer,
     SayCanPlanner,
     SequentialUtilityScorer,
     SkillAttempt,
@@ -14,11 +37,14 @@ from tiny_sima.planner.saycan import (
     UtilityScoreBatch,
     constant_feasibility,
     constant_utility,
+    reachability_feasibility,
     symbolic_feasibility,
     zero_utility,
 )
 from tiny_sima.planner.vlm import (
+    DEFAULT_PROMPT_STYLE,
     ParsedVLMResponse,
+    PlannerPromptStyle,
     TransformersVLMBackend,
     VisionLanguageBackend,
     VLMRequest,
@@ -30,12 +56,22 @@ from tiny_sima.planner.vlm import (
 )
 
 __all__ = [
+    "DEFAULT_DISTANCE_EDGES",
+    "DEFAULT_FLOOR",
+    "DEFAULT_PRIOR_STRENGTH",
+    "DEFAULT_PROMPT_STYLE",
+    "BatchedFeasibilityScorer",
     "BatchedUtilityScorer",
+    "CompetencePrior",
+    "CriticAffordanceScorer",
+    "IsotonicCalibration",
     "ParsedVLMResponse",
     "PlannerContext",
     "PlannerDecision",
+    "PlannerPromptStyle",
     "PlannerSelection",
     "PlannerSelectionStatus",
+    "ReachabilityFeasibilityScorer",
     "SayCanPlanner",
     "SequentialUtilityScorer",
     "SkillAttempt",
@@ -48,9 +84,19 @@ __all__ = [
     "VisionLanguageBackend",
     "build_planner_prompt",
     "build_planner_system_prompt",
+    "calibration_metrics",
     "constant_feasibility",
     "constant_utility",
+    "critic_affordance_scorer_from_checkpoint",
+    "distance_cell",
+    "expected_calibration_error",
+    "fit_competence_prior",
+    "fit_isotonic_calibration",
+    "make_critic_affordance_scorer",
+    "num_distance_cells",
     "parse_vlm_response",
+    "reachability_feasibility",
+    "roc_auc",
     "summarize_state",
     "symbolic_feasibility",
     "zero_utility",

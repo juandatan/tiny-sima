@@ -9,7 +9,16 @@ from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 
-from tiny_sima.goals import SKILL_IDS, SkillGoal, SkillId, skill_precondition
+from tiny_sima.goals import (
+    DEFAULT_REACHABILITY,
+    SKILL_IDS,
+    ReachabilityConfig,
+    SkillGoal,
+    SkillId,
+    skill_feasibility_score,
+    skill_precondition,
+    travel_distance_map,
+)
 
 
 class SkillOutcome(str, Enum):
@@ -112,6 +121,26 @@ class BatchedUtilityScorer(Protocol):
         ...
 
 
+@runtime_checkable
+class BatchedFeasibilityScorer(Protocol):
+    """Score feasibility for the whole catalog from shared intermediate work.
+
+    Reachability and critic affordances both derive every candidate's score
+    from one expensive computation per state, so scoring the catalog together
+    avoids repeating it once per skill.
+    """
+
+    def score_all_feasibility(
+        self,
+        state: Any,
+        context: PlannerContext,
+        candidate_skills: tuple[SkillId, ...],
+    ) -> dict[SkillId, float]:
+        """Return feasibility in the range zero to one for each candidate."""
+
+        ...
+
+
 def zero_utility(
     _state: Any,
     _context: PlannerContext,
@@ -172,19 +201,106 @@ def symbolic_feasibility(
     _context: PlannerContext,
     skill_id: SkillId,
 ) -> float:
-    """Use explicit Craftax preconditions as an initial affordance model."""
+    """Use explicit Craftax preconditions as an initial affordance model.
+
+    Resource preconditions test whether a block exists anywhere on the map, so
+    this never rejects an unreachable target. It is retained as the Phase 4
+    ablation baseline; prefer :class:`ReachabilityFeasibilityScorer`.
+    """
 
     feasible = skill_precondition(SkillGoal(skill_id), state)
     return float(bool(np.asarray(feasible)))
 
 
 @dataclass(frozen=True)
+class ReachabilityFeasibilityScorer:
+    """Grade skills by preconditions and horizon-bounded reachability.
+
+    This refines the world-wide existence test in :func:`symbolic_feasibility`
+    with a lower bound on the steps needed to stand next to a target and
+    interact with it. Skills usable from here score one and skills whose target
+    is out of reach score ``config.unknown_feasibility``, which demotes them
+    without making them unselectable -- walking toward a distant target is a
+    legitimate plan, so a hard veto here costs real episodes.
+    """
+
+    config: ReachabilityConfig = DEFAULT_REACHABILITY
+
+    def score_all_feasibility(
+        self,
+        state: Any,
+        _context: PlannerContext,
+        candidate_skills: tuple[SkillId, ...],
+    ) -> dict[SkillId, float]:
+        """Score every candidate from one shared breadth-first distance map."""
+
+        if not candidate_skills:
+            return {}
+        distances = travel_distance_map(state, self.config)
+        return {
+            skill_id: float(
+                np.asarray(
+                    skill_feasibility_score(
+                        SkillGoal(skill_id),
+                        state,
+                        self.config,
+                        distances=distances,
+                    )
+                )
+            )
+            for skill_id in candidate_skills
+        }
+
+    def __call__(
+        self,
+        state: Any,
+        context: PlannerContext,
+        skill_id: SkillId,
+    ) -> float:
+        """Score one candidate, recomputing the distance map on demand."""
+
+        return self.score_all_feasibility(state, context, (skill_id,))[skill_id]
+
+
+reachability_feasibility = ReachabilityFeasibilityScorer()
+
+
+@dataclass(frozen=True)
 class SayCanPlanner:
-    """Rank skills by utility times feasibility and re-rank after outcomes."""
+    """Rank skills by utility times feasibility and re-rank after outcomes.
+
+    The default Can term is reachability alone. A calibrated
+    :class:`~tiny_sima.planner.competence.CompetencePrior` replaces its single
+    hand-set constant with measured success rates once one has been fitted;
+    :class:`~tiny_sima.planner.affordance.CriticAffordanceScorer` is retained
+    only as the ablation that showed the critic cannot do this job.
+    """
 
     utility_scorer: UtilityScorer | BatchedUtilityScorer = zero_utility
-    feasibility_scorer: FeasibilityScorer = symbolic_feasibility
+    feasibility_scorer: FeasibilityScorer | BatchedFeasibilityScorer = (
+        reachability_feasibility
+    )
     candidate_skills: tuple[SkillId, ...] = SKILL_IDS
+
+    def _feasibilities(
+        self,
+        state: Any,
+        context: PlannerContext,
+    ) -> dict[SkillId, float]:
+        if isinstance(self.feasibility_scorer, BatchedFeasibilityScorer):
+            scores = self.feasibility_scorer.score_all_feasibility(
+                state,
+                context,
+                self.candidate_skills,
+            )
+            return {
+                skill_id: float(scores.get(skill_id, 0.0))
+                for skill_id in self.candidate_skills
+            }
+        return {
+            skill_id: float(self.feasibility_scorer(state, context, skill_id))
+            for skill_id in self.candidate_skills
+        }
 
     def _score_with_utility_status(
         self,
@@ -207,10 +323,11 @@ class SayCanPlanner:
                 }
             )
 
+        feasibilities = self._feasibilities(state, context)
         scores = []
         for skill_id in self.candidate_skills:
             utility = float(utility_batch.utilities.get(skill_id, 0.0))
-            feasibility = float(self.feasibility_scorer(state, context, skill_id))
+            feasibility = feasibilities[skill_id]
             failures = sum(
                 attempt.skill_id is skill_id and not attempt.succeeded
                 for attempt in context.history
