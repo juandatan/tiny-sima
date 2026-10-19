@@ -53,6 +53,16 @@ class PlannerBoundaryTrace:
     selected_feasible: bool = False
 
 
+@dataclass
+class _PrefixEpisode:
+    """One episode's cursor while every episode advances in lockstep."""
+
+    index: int
+    state: Any
+    context: PlannerContext
+    rollout_key: Any
+
+
 def evaluate_planner_prefixes(
     planner: SayCanPlanner,
     *,
@@ -68,6 +78,11 @@ def evaluate_planner_prefixes(
     The planner sees only the objective, screenshot-derived state, and outcome
     history. The scripted executor follows the private reference sequence
     after each decision so planner errors do not alter later test states.
+
+    Episodes advance in lockstep, one boundary at a time, so a planner backed
+    by a batched utility model decodes every episode's decision at a boundary
+    in one invocation. Each episode keeps its own rollout key, so the states
+    visited are identical to advancing the episodes one after another.
     """
 
     if num_episodes < 1:
@@ -80,17 +95,33 @@ def evaluate_planner_prefixes(
     traces: list[PlannerBoundaryTrace] = []
     oracle_progress_failures = 0
 
+    episodes: list[_PrefixEpisode] = []
     for episode_index, episode_key in enumerate(episode_keys):
         reset_key, rollout_key = jax.random.split(episode_key)
-        state = environment.reset(reset_key).state
-        context = PlannerContext(objective=chain.objective)
-        for boundary, reference_skill in enumerate(chain.reference_skills):
+        episodes.append(
+            _PrefixEpisode(
+                index=episode_index,
+                state=environment.reset(reset_key).state,
+                context=PlannerContext(objective=chain.objective),
+                rollout_key=rollout_key,
+            )
+        )
+
+    for boundary, reference_skill in enumerate(chain.reference_skills):
+        if not episodes:
+            break
+        selections = planner.select_many(
+            [episode.state for episode in episodes],
+            [episode.context for episode in episodes],
+        )
+        advancing: list[_PrefixEpisode] = []
+        for episode, selection in zip(episodes, selections, strict=True):
+            state = episode.state
             accepted_skills = (
                 chain.valid_next_skills(state)
                 if chain.valid_next_skills is not None
                 else (reference_skill,)
             )
-            selection = planner.select_with_diagnostics(state, context)
             decision = selection.decision
             selected_skill = decision.skill_id if decision is not None else None
             selected_feasibility = 0.0
@@ -128,7 +159,7 @@ def evaluate_planner_prefixes(
             utility_top_feasible = utility_top_skill in feasible_skills
             traces.append(
                 PlannerBoundaryTrace(
-                    episode=episode_index,
+                    episode=episode.index,
                     boundary=boundary,
                     reference_skill=reference_skill,
                     accepted_skills=accepted_skills,
@@ -149,7 +180,9 @@ def evaluate_planner_prefixes(
                 )
             )
 
-            rollout_key, execution_key = jax.random.split(rollout_key)
+            episode.rollout_key, execution_key = jax.random.split(
+                episode.rollout_key
+            )
             result = executor.execute(
                 environment,
                 state,
@@ -158,13 +191,15 @@ def evaluate_planner_prefixes(
                 horizon=skill_horizon,
             )
             if result.outcome is not SkillOutcome.SUCCESS:
+                # This episode stops here; the others keep going so one
+                # oracle failure does not shorten the whole batch.
                 oracle_progress_failures += 1
-                break
-            state = result.state
-            context = PlannerContext(
-                objective=context.objective,
+                continue
+            episode.state = result.state
+            episode.context = PlannerContext(
+                objective=episode.context.objective,
                 history=(
-                    *context.history,
+                    *episode.context.history,
                     SkillAttempt(
                         skill_id=reference_skill,
                         outcome=result.outcome,
@@ -173,6 +208,12 @@ def evaluate_planner_prefixes(
                     ),
                 ),
             )
+            advancing.append(episode)
+        episodes = advancing
+
+    # Report in episode order even though the boundaries were visited in
+    # lockstep, so traces read as episode transcripts.
+    traces.sort(key=lambda trace: (trace.episode, trace.boundary))
 
     matches = np.asarray([trace.matched for trace in traces], dtype=np.bool_)
     selections = [trace.selected_skill for trace in traces]

@@ -1,8 +1,10 @@
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 import jax
+import numpy as np
 import pytest
 
 import tiny_sima.planner.vlm as vlm_module
@@ -33,6 +35,7 @@ from tiny_sima.planner.vlm import (
     _ranking_output_type,
     build_planner_prompt,
     build_planner_system_prompt,
+    generate_all,
     parse_vlm_response,
     summarize_state,
 )
@@ -46,6 +49,26 @@ class FakeBackend:
     def generate(self, request: VLMRequest) -> str:
         self.requests.append(request)
         return self.response
+
+
+@dataclass
+class FakeBatchedBackend:
+    """Backend that records how its requests were grouped into batches."""
+
+    response: str
+    batches: list[tuple[VLMRequest, ...]] = field(default_factory=list)
+
+    def generate(self, request: VLMRequest) -> str:
+        self.batches.append((request,))
+        return self.response
+
+    def generate_batch(self, requests: Sequence[VLMRequest]) -> list[str]:
+        self.batches.append(tuple(requests))
+        return [self.response for _ in requests]
+
+    @property
+    def requests(self) -> list[VLMRequest]:
+        return [request for batch in self.batches for request in batch]
 
 
 def _ranking(*leading_skills: SkillId) -> list[str]:
@@ -436,6 +459,135 @@ def test_prompt_style_reaches_the_backend_as_a_schema_requirement() -> None:
     # room for it; otherwise the request is rejected as extra output.
     assert available_first.requests[0].require_available is True
     assert baseline.requests[0].require_available is False
+
+
+def test_generate_all_falls_back_to_one_request_at_a_time() -> None:
+    # Batching is an optimisation, not part of the backend contract, so a
+    # backend that only implements generate must keep working.
+    single = FakeBackend(response="one")
+    batched = FakeBatchedBackend(response="many")
+    requests = tuple(
+        VLMRequest(
+            image=np.zeros((2, 2, 3), dtype=np.uint8),
+            system_prompt="system",
+            user_prompt=f"user {index}",
+            candidate_skills=SKILL_IDS,
+        )
+        for index in range(3)
+    )
+
+    assert generate_all(single, requests) == ["one"] * 3
+    assert len(single.requests) == 3
+    assert generate_all(batched, requests) == ["many"] * 3
+    assert batched.batches == [requests]
+    assert generate_all(batched, ()) == []
+
+
+def test_generate_all_rejects_a_batch_of_the_wrong_length() -> None:
+    @dataclass
+    class ShortBatchBackend:
+        def generate(self, request: VLMRequest) -> str:
+            return "unused"
+
+        def generate_batch(self, requests: Sequence[VLMRequest]) -> list[str]:
+            return ["only one"]
+
+    request = VLMRequest(
+        image=np.zeros((2, 2, 3), dtype=np.uint8),
+        system_prompt="system",
+        user_prompt="user",
+        candidate_skills=SKILL_IDS,
+    )
+
+    with pytest.raises(ValueError, match="1 responses for 2 requests"):
+        generate_all(ShortBatchBackend(), (request, request))
+
+
+def test_batched_scoring_matches_scoring_one_state_at_a_time() -> None:
+    environment = make_skill_chain_environment()
+    states = [
+        environment.reset(jax.random.PRNGKey(seed)).state for seed in (0, 1, 2)
+    ]
+    contexts = [PlannerContext(objective="Collect stone.")] * len(states)
+    batched_backend = FakeBatchedBackend(
+        response=_response(SkillId.COLLECT_WOOD)
+    )
+    sequential_backend = FakeBackend(response=_response(SkillId.COLLECT_WOOD))
+    batched_scorer = VLMUtilityScorer(batched_backend)
+    sequential_scorer = VLMUtilityScorer(sequential_backend)
+
+    batched = batched_scorer.score_all_batched(states, contexts, SKILL_IDS)
+    sequential = [
+        sequential_scorer.score_all(state, context, SKILL_IDS)
+        for state, context in zip(states, contexts, strict=True)
+    ]
+
+    assert batched == sequential
+    # One padded forward pass instead of one generation per state, with the
+    # same prompts in the same order.
+    assert len(batched_backend.batches) == 1
+    assert [request.user_prompt for request in batched_backend.requests] == [
+        request.user_prompt for request in sequential_backend.requests
+    ]
+    assert len(batched_scorer.last_responses) == len(states)
+    assert batched_scorer.last_response is batched_scorer.last_responses[-1]
+
+
+def test_batched_scoring_generates_once_for_repeated_boundaries() -> None:
+    state = make_skill_chain_environment().reset(jax.random.PRNGKey(0)).state
+    context = PlannerContext(objective="Collect stone.")
+    backend = FakeBatchedBackend(response=_response(SkillId.COLLECT_WOOD))
+
+    scores = VLMUtilityScorer(backend).score_all_batched(
+        (state, state, state),
+        (context, context, context),
+        SKILL_IDS,
+    )
+
+    assert len(scores) == 3
+    assert len(backend.requests) == 1
+
+
+def test_select_many_matches_selecting_one_state_at_a_time() -> None:
+    environment = make_skill_chain_environment()
+    states = [
+        environment.reset(jax.random.PRNGKey(seed)).state for seed in (0, 1)
+    ]
+    context = PlannerContext(objective="Collect stone.")
+    planner = SayCanPlanner(
+        utility_scorer=VLMUtilityScorer(
+            FakeBatchedBackend(response=_response(SkillId.COLLECT_WOOD))
+        )
+    )
+
+    assert planner.select_many(states, [context] * len(states)) == [
+        planner.select_with_diagnostics(state, context) for state in states
+    ]
+
+    with pytest.raises(ValueError, match="equal length"):
+        planner.select_many(states, [context])
+
+
+def test_planner_prefixes_decode_one_batch_per_boundary() -> None:
+    backend = FakeBatchedBackend(response=_response(SkillId.COLLECT_WOOD))
+    result = evaluate_planner_prefixes(
+        SayCanPlanner(utility_scorer=VLMUtilityScorer(backend)),
+        num_episodes=3,
+        seed=2,
+        skill_horizon=32,
+    )
+
+    # Episodes advance in lockstep, so a boundary costs one generation call
+    # for all surviving episodes rather than one per episode.
+    assert len(backend.batches) <= len(WOOD_TO_STONE_CHAIN.reference_skills)
+    assert len(backend.batches[0]) == 3
+    assert len(backend.requests) == len(result["traces"])
+    # Traces still read as per-episode transcripts.
+    assert [
+        (trace.episode, trace.boundary) for trace in result["traces"]
+    ] == sorted(
+        (trace.episode, trace.boundary) for trace in result["traces"]
+    )
 
 
 def test_transformers_backend_caches_constrained_generators(

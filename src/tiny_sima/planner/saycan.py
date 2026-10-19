@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
@@ -117,6 +117,27 @@ class BatchedUtilityScorer(Protocol):
         candidate_skills: tuple[SkillId, ...],
     ) -> UtilityScoreBatch:
         """Return utility in the range zero to one for each candidate."""
+
+        ...
+
+
+@runtime_checkable
+class MultiStateUtilityScorer(Protocol):
+    """Score several option boundaries in one planner-model invocation.
+
+    Generation dominates the wall clock of a planner evaluation, and the
+    boundaries reached by independent episodes are independent of each other,
+    so a scorer able to decode them together replaces one call per episode
+    with one call per boundary.
+    """
+
+    def score_all_batched(
+        self,
+        states: Sequence[Any],
+        contexts: Sequence[PlannerContext],
+        candidate_skills: tuple[SkillId, ...],
+    ) -> list[UtilityScoreBatch]:
+        """Return one whole-catalog utility batch per state, in order."""
 
         ...
 
@@ -265,6 +286,38 @@ class ReachabilityFeasibilityScorer:
 reachability_feasibility = ReachabilityFeasibilityScorer()
 
 
+def _planner_selection(
+    scores: tuple[SkillScore, ...],
+    utility_batch: UtilityScoreBatch,
+) -> PlannerSelection:
+    """Turn one boundary's ranking into a decision plus its diagnostics."""
+
+    if not utility_batch.valid:
+        return PlannerSelection(
+            decision=None,
+            status=PlannerSelectionStatus.INVALID_UTILITY,
+            utility_error=utility_batch.error,
+            utility_ranking=utility_batch.ranking,
+            utility_raw_response=utility_batch.raw_response,
+        )
+    if not scores or scores[0].combined <= 0.0:
+        return PlannerSelection(
+            decision=None,
+            status=PlannerSelectionStatus.NO_VIABLE_SKILL,
+            utility_ranking=utility_batch.ranking,
+            utility_raw_response=utility_batch.raw_response,
+        )
+    return PlannerSelection(
+        decision=PlannerDecision(
+            skill_id=scores[0].skill_id,
+            scores=scores,
+        ),
+        status=PlannerSelectionStatus.SELECTED,
+        utility_ranking=utility_batch.ranking,
+        utility_raw_response=utility_batch.raw_response,
+    )
+
+
 @dataclass(frozen=True)
 class SayCanPlanner:
     """Rank skills by utility times feasibility and re-rank after outcomes.
@@ -302,27 +355,54 @@ class SayCanPlanner:
             for skill_id in self.candidate_skills
         }
 
-    def _score_with_utility_status(
+    def _utility_batch(
         self,
         state: Any,
         context: PlannerContext,
-    ) -> tuple[tuple[SkillScore, ...], UtilityScoreBatch]:
+    ) -> UtilityScoreBatch:
         if isinstance(self.utility_scorer, BatchedUtilityScorer):
-            utility_batch = self.utility_scorer.score_all(
+            return self.utility_scorer.score_all(
                 state,
                 context,
                 self.candidate_skills,
             )
-        else:
-            utility_batch = UtilityScoreBatch(
-                utilities={
-                    skill_id: float(
-                        self.utility_scorer(state, context, skill_id)
-                    )
-                    for skill_id in self.candidate_skills
-                }
-            )
+        return UtilityScoreBatch(
+            utilities={
+                skill_id: float(self.utility_scorer(state, context, skill_id))
+                for skill_id in self.candidate_skills
+            }
+        )
 
+    def _utility_batches(
+        self,
+        states: Sequence[Any],
+        contexts: Sequence[PlannerContext],
+    ) -> list[UtilityScoreBatch]:
+        if isinstance(self.utility_scorer, MultiStateUtilityScorer):
+            batches = list(
+                self.utility_scorer.score_all_batched(
+                    states,
+                    contexts,
+                    self.candidate_skills,
+                )
+            )
+            if len(batches) != len(states):
+                raise ValueError(
+                    f"score_all_batched returned {len(batches)} batches for "
+                    f"{len(states)} states."
+                )
+            return batches
+        return [
+            self._utility_batch(state, context)
+            for state, context in zip(states, contexts, strict=True)
+        ]
+
+    def _scores(
+        self,
+        state: Any,
+        context: PlannerContext,
+        utility_batch: UtilityScoreBatch,
+    ) -> tuple[SkillScore, ...]:
         feasibilities = self._feasibilities(state, context)
         scores = []
         for skill_id in self.candidate_skills:
@@ -342,14 +422,13 @@ class SayCanPlanner:
                     combined=utility * feasibility * failure_penalty,
                 )
             )
-        ranking = tuple(
+        return tuple(
             sorted(
                 scores,
                 key=lambda score: score.combined,
                 reverse=True,
             )
         )
-        return ranking, utility_batch
 
     def score(
         self,
@@ -358,8 +437,8 @@ class SayCanPlanner:
     ) -> tuple[SkillScore, ...]:
         """Return a descending candidate ranking with inspectable factors."""
 
-        scores, _ = self._score_with_utility_status(state, context)
-        return scores
+        utility_batch = self._utility_batch(state, context)
+        return self._scores(state, context, utility_batch)
 
     def select_with_diagnostics(
         self,
@@ -368,31 +447,39 @@ class SayCanPlanner:
     ) -> PlannerSelection:
         """Select a skill while preserving utility-model failure details."""
 
-        scores, utility_batch = self._score_with_utility_status(state, context)
-        if not utility_batch.valid:
-            return PlannerSelection(
-                decision=None,
-                status=PlannerSelectionStatus.INVALID_UTILITY,
-                utility_error=utility_batch.error,
-                utility_ranking=utility_batch.ranking,
-                utility_raw_response=utility_batch.raw_response,
-            )
-        if not scores or scores[0].combined <= 0.0:
-            return PlannerSelection(
-                decision=None,
-                status=PlannerSelectionStatus.NO_VIABLE_SKILL,
-                utility_ranking=utility_batch.ranking,
-                utility_raw_response=utility_batch.raw_response,
-            )
-        return PlannerSelection(
-            decision=PlannerDecision(
-                skill_id=scores[0].skill_id,
-                scores=scores,
-            ),
-            status=PlannerSelectionStatus.SELECTED,
-            utility_ranking=utility_batch.ranking,
-            utility_raw_response=utility_batch.raw_response,
+        utility_batch = self._utility_batch(state, context)
+        return _planner_selection(
+            self._scores(state, context, utility_batch),
+            utility_batch,
         )
+
+    def select_many(
+        self,
+        states: Sequence[Any],
+        contexts: Sequence[PlannerContext],
+    ) -> list[PlannerSelection]:
+        """Select at several boundaries with one utility-model invocation.
+
+        Feasibility is still computed per state: a breadth-first distance map
+        costs nothing next to a generation, and batching it would tie the
+        planner to a fixed batch shape.
+        """
+
+        if len(states) != len(contexts):
+            raise ValueError("states and contexts must have equal length.")
+        utility_batches = self._utility_batches(states, contexts)
+        return [
+            _planner_selection(
+                self._scores(state, context, utility_batch),
+                utility_batch,
+            )
+            for state, context, utility_batch in zip(
+                states,
+                contexts,
+                utility_batches,
+                strict=True,
+            )
+        ]
 
     def select(
         self,

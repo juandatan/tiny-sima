@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
 from hashlib import sha256
-from typing import Any, NamedTuple, Protocol
+from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 import numpy as np
 from craftax.craftax_classic.constants import BlockType
@@ -79,6 +80,40 @@ class VisionLanguageBackend(Protocol):
         """Generate one planner response."""
 
         ...
+
+
+@runtime_checkable
+class BatchedVisionLanguageBackend(Protocol):
+    """Optional backend extension that decodes several requests together."""
+
+    def generate_batch(self, requests: Sequence[VLMRequest]) -> list[str]:
+        """Generate one response per request, in the order given."""
+
+        ...
+
+
+def generate_all(
+    backend: VisionLanguageBackend,
+    requests: Sequence[VLMRequest],
+) -> list[str]:
+    """Generate every response, batching when the backend supports it.
+
+    Batching is an optimisation rather than part of the backend contract, so
+    a backend written against :class:`VisionLanguageBackend` alone still
+    works -- one request at a time.
+    """
+
+    if not requests:
+        return []
+    if isinstance(backend, BatchedVisionLanguageBackend):
+        responses = list(backend.generate_batch(requests))
+        if len(responses) != len(requests):
+            raise ValueError(
+                f"generate_batch returned {len(responses)} responses for "
+                f"{len(requests)} requests."
+            )
+        return responses
+    return [backend.generate(request) for request in requests]
 
 
 @dataclass(frozen=True)
@@ -567,6 +602,23 @@ def build_planner_prompt(
     )
 
 
+class _PreparedRequest(NamedTuple):
+    """One rendered boundary and the cache key that identifies it."""
+
+    cache_key: str
+    request: VLMRequest
+
+
+_EMPTY_CATALOG_RESPONSE = ParsedVLMResponse(
+    utilities={},
+    ranking=(),
+    selected_skill=None,
+    progress_assessment="No candidate skills were supplied.",
+    raw_response="",
+    valid=True,
+)
+
+
 @dataclass
 class VLMUtilityScorer:
     """Use one VLM call to score all candidate skills at a boundary."""
@@ -576,31 +628,22 @@ class VLMUtilityScorer:
     reachability: ReachabilityConfig = DEFAULT_REACHABILITY
     prompt_style: PlannerPromptStyle = DEFAULT_PROMPT_STYLE
     last_response: ParsedVLMResponse | None = None
+    # Every response from the most recent call, in request order, so a batched
+    # evaluation can still attribute a parse failure to its own boundary.
+    last_responses: tuple[ParsedVLMResponse, ...] = ()
     _cache: dict[str, ParsedVLMResponse] = field(
         default_factory=dict,
         init=False,
         repr=False,
     )
 
-    def score_all(
+    def _prepare(
         self,
         state: Any,
         context: PlannerContext,
         candidate_skills: tuple[SkillId, ...],
-    ) -> UtilityScoreBatch:
-        """Render the state, invoke the VLM once, and return safe utilities."""
-
-        if not candidate_skills:
-            parsed = ParsedVLMResponse(
-                utilities={},
-                ranking=(),
-                selected_skill=None,
-                progress_assessment="No candidate skills were supplied.",
-                raw_response="",
-                valid=True,
-            )
-            self.last_response = parsed
-            return UtilityScoreBatch(utilities={})
+    ) -> _PreparedRequest:
+        """Render one boundary into a request and its response cache key."""
 
         image = render_state(
             state,
@@ -615,34 +658,91 @@ class VLMUtilityScorer:
             self.reachability,
             self.prompt_style,
         )
-        require_available = self.prompt_style is PlannerPromptStyle.AVAILABLE_FIRST
         cache_key = sha256(
             system_prompt.encode("utf-8")
             + user_prompt.encode("utf-8")
             + image.tobytes()
         ).hexdigest()
-        parsed = self._cache.get(cache_key)
-        if parsed is None:
-            request = VLMRequest(
+        return _PreparedRequest(
+            cache_key=cache_key,
+            request=VLMRequest(
                 image=image,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 candidate_skills=candidate_skills,
-                require_available=require_available,
-            )
-            parsed = parse_vlm_response(
-                self.backend.generate(request),
-                candidate_skills,
-            )
-            self._cache[cache_key] = parsed
-        self.last_response = parsed
-        return UtilityScoreBatch(
-            utilities=parsed.utilities,
-            valid=parsed.valid,
-            error=parsed.error,
-            ranking=parsed.ranking,
-            raw_response=parsed.raw_response,
+                require_available=(
+                    self.prompt_style is PlannerPromptStyle.AVAILABLE_FIRST
+                ),
+            ),
         )
+
+    def score_all(
+        self,
+        state: Any,
+        context: PlannerContext,
+        candidate_skills: tuple[SkillId, ...],
+    ) -> UtilityScoreBatch:
+        """Render the state, invoke the VLM once, and return safe utilities."""
+
+        return self.score_all_batched((state,), (context,), candidate_skills)[0]
+
+    def score_all_batched(
+        self,
+        states: Sequence[Any],
+        contexts: Sequence[PlannerContext],
+        candidate_skills: tuple[SkillId, ...],
+    ) -> list[UtilityScoreBatch]:
+        """Score several boundaries with one batched backend invocation.
+
+        Decoding dominates the wall clock of a planner evaluation and the
+        boundaries of independent episodes are independent, so scoring them
+        together turns one generation per episode into one padded forward
+        pass. Returned batches stay aligned with ``states``.
+        """
+
+        if len(states) != len(contexts):
+            raise ValueError("states and contexts must have equal length.")
+        if not candidate_skills:
+            self.last_responses = tuple(
+                _EMPTY_CATALOG_RESPONSE for _ in states
+            )
+            self.last_response = _EMPTY_CATALOG_RESPONSE
+            return [UtilityScoreBatch(utilities={}) for _ in states]
+
+        prepared = [
+            self._prepare(state, context, candidate_skills)
+            for state, context in zip(states, contexts, strict=True)
+        ]
+        # Identical boundaries within one batch share a single generation, the
+        # same way repeated boundaries across ablations share the cache.
+        pending: dict[str, VLMRequest] = {
+            cache_key: request
+            for cache_key, request in prepared
+            if cache_key not in self._cache
+        }
+        if pending:
+            responses = generate_all(self.backend, tuple(pending.values()))
+            for cache_key, response in zip(pending, responses, strict=True):
+                self._cache[cache_key] = parse_vlm_response(
+                    response,
+                    candidate_skills,
+                )
+        parsed_responses = [
+            self._cache[cache_key] for cache_key, _ in prepared
+        ]
+        self.last_responses = tuple(parsed_responses)
+        if parsed_responses:
+            self.last_response = parsed_responses[-1]
+        return [
+            UtilityScoreBatch(
+                utilities=parsed.utilities,
+                valid=parsed.valid,
+                error=parsed.error,
+                ranking=parsed.ranking,
+                raw_response=parsed.raw_response,
+            )
+            for parsed in parsed_responses
+        ]
 
     def clear_cache(self) -> None:
         """Discard responses cached for matched planner ablations."""
@@ -711,6 +811,49 @@ def _ranking_output_type(
         __config__=ConfigDict(extra="forbid"),
         **fields,
     )
+
+
+def _planner_chat(request: VLMRequest) -> Any:
+    """Build the one-turn multimodal chat for a planner request."""
+
+    try:
+        from outlines.inputs import (  # pyright: ignore[reportMissingImports]
+            Chat,
+        )
+        from outlines.inputs import (  # pyright: ignore[reportMissingImports]
+            Image as OutlinesImage,
+        )
+        from PIL import Image
+    except ImportError as error:
+        raise ImportError(
+            'Install the VLM dependencies with pip install -e ".[vlm]".'
+        ) from error
+
+    image = Image.fromarray(request.image)
+    image.format = "PNG"
+    return Chat(
+        [
+            {
+                "role": "system",
+                "content": request.system_prompt,
+            },
+            {
+                "role": "user",
+                "content": [
+                    request.user_prompt,
+                    OutlinesImage(image),
+                ],
+            },
+        ]
+    )
+
+
+def _response_text(output: Any) -> str:
+    """Normalise an Outlines result to the JSON text the parser expects."""
+
+    if hasattr(output, "model_dump_json"):
+        return str(output.model_dump_json())
+    return str(output)
 
 
 class TransformersVLMBackend:
@@ -810,37 +953,7 @@ class TransformersVLMBackend:
     def generate(self, request: VLMRequest) -> str:
         """Generate one schema-constrained ranking at an option boundary."""
 
-        try:
-            from outlines.inputs import (  # pyright: ignore[reportMissingImports]
-                Chat,
-            )
-            from outlines.inputs import (  # pyright: ignore[reportMissingImports]
-                Image as OutlinesImage,
-            )
-            from PIL import Image
-        except ImportError as error:
-            raise ImportError(
-                'Install the VLM dependencies with pip install -e ".[vlm]".'
-            ) from error
-
         _, outlines_model, generator_factory = self._load()
-        image = Image.fromarray(request.image)
-        image.format = "PNG"
-        chat = Chat(
-            [
-                {
-                    "role": "system",
-                    "content": request.system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        request.user_prompt,
-                        OutlinesImage(image),
-                    ],
-                },
-            ]
-        )
         generator = self._generator_for(
             request.candidate_skills,
             outlines_model,
@@ -848,9 +961,43 @@ class TransformersVLMBackend:
             require_available=request.require_available,
         )
         output = generator(
-            chat,
+            _planner_chat(request),
             max_new_tokens=self.config.max_new_tokens,
         )
-        if hasattr(output, "model_dump_json"):
-            return str(output.model_dump_json())
-        return str(output)
+        return _response_text(output)
+
+    def generate_batch(self, requests: Sequence[VLMRequest]) -> list[str]:
+        """Generate one ranking per request with batched constrained decoding.
+
+        A constrained generator owns one logits processor, which allocates a
+        guide per sequence once the batch arrives, so requests are grouped by
+        catalog and schema and each group decodes in chunks of
+        ``config.max_batch_size``. Responses keep the request order.
+        """
+
+        if not requests:
+            return []
+        _, outlines_model, generator_factory = self._load()
+        groups: dict[tuple[tuple[SkillId, ...], bool], list[int]] = {}
+        for index, request in enumerate(requests):
+            key = (request.candidate_skills, request.require_available)
+            groups.setdefault(key, []).append(index)
+
+        # The groups partition the request indices, so every slot is written.
+        responses = [""] * len(requests)
+        for (candidate_skills, require_available), indices in groups.items():
+            generator = self._generator_for(
+                candidate_skills,
+                outlines_model,
+                generator_factory,
+                require_available=require_available,
+            )
+            for start in range(0, len(indices), self.config.max_batch_size):
+                chunk = indices[start : start + self.config.max_batch_size]
+                outputs = generator.batch(
+                    [_planner_chat(requests[index]) for index in chunk],
+                    max_new_tokens=self.config.max_new_tokens,
+                )
+                for index, output in zip(chunk, outputs, strict=True):
+                    responses[index] = _response_text(output)
+        return responses

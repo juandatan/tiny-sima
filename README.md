@@ -596,6 +596,19 @@ assumed to help. The echoed list is also recorded, which separates a perception
 failure (wrong list) from an instruction-following failure (right list, then an
 unavailable choice).
 
+Measuring a prompt change is only useful if the loop is short, and generation
+dominates it. The controlled-prefix evaluation therefore advances every episode
+in lockstep, one boundary at a time, and decodes all of their decisions in one
+constrained batch: `SayCanPlanner.select_many` collects the states, the scorer
+renders and caches them per boundary, and `TransformersVLMBackend.generate_batch`
+groups the requests by catalog and schema - a constrained generator owns one
+logits processor, which allocates a guide per sequence - and decodes in chunks
+of `max_batch_size`. Each episode keeps its own rollout key, so lockstep visits
+exactly the states that sequential advancing would. Batching is optional at the
+backend boundary: `generate_all` falls back to one call at a time for any
+backend implementing only `generate`. The closed loop cannot batch this way,
+because each decision depends on where the previous skill left that episode.
+
 The ordered sequence is private to the scripted baseline. Planner-visible
 context contains only the objective and prior execution outcomes, and chain
 success is determined from the resulting Craftax state. This allows a future
@@ -769,6 +782,8 @@ Implemented:
 - A schema-constrained planner prompt that reports skill availability before
   the decoder can name a choice, with the baseline prompt preserved for
   comparison.
+- Batched constrained generation across episodes at a shared boundary, with a
+  sequential fallback for backends that do not support it.
 - Static notebook checks for parse errors, stale imports, and undefined names.
 
 Verified locally on October 8, 2026:
@@ -1007,5 +1022,23 @@ Critic affordances measured and retired on October 19, 2026:
   calibration seed, both competence heads scored side by side, the fitted
   competence table printed cell by cell with its support, and both prompt
   styles printed before any model weights load.
-- All 177 regular automated tests pass locally; the real-model VLM smoke test
+- Batched planner generation, so measuring a prompt costs a batch per boundary
+  instead of a generation per episode per boundary.
+  `TransformersVLMBackend.generate_batch` groups requests by catalog and schema
+  and decodes in chunks of the new `max_batch_size`; `generate_all` falls back
+  to sequential calls for a backend without it; `VLMUtilityScorer`
+  `score_all_batched` renders and caches per item and batches only the misses;
+  `SayCanPlanner.select_many` keeps feasibility per state, which is free next
+  to generation. `evaluate_planner_prefixes` advances every episode in lockstep
+  over the boundary index, each with its own rollout key, so the states visited
+  are unchanged and one oracle failure no longer shortens the batch.
+- Replaced notebook 06's single `QUICK_EVAL` switch with `smoke`, `prompt`, and
+  `full` presets over independent probing, prefix, and closed-loop knobs, and
+  enabled `autoreload`. The `prompt` preset runs eight full prefix episodes,
+  loads both fits from disk, and skips the closed loop, so a prompt edit costs
+  one cell run rather than a kernel restart - which here means reinstalling the
+  package and reloading the VLM. 48 prefix boundaries give a standard error of
+  about 0.063 on an `ungrounded_top` near 0.745, which is enough to see a real
+  prompt effect without the ladder's confirmation conditions.
+- All 183 regular automated tests pass locally; the real-model VLM smoke test
   remains opt-in. Ruff and Pyright report no issues.

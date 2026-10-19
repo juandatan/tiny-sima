@@ -24,6 +24,7 @@ from tiny_sima.planner.competence import (
 from tiny_sima.planner.saycan import (
     BatchedFeasibilityScorer,
     BatchedUtilityScorer,
+    MultiStateUtilityScorer,
     PlannerContext,
     PlannerDecision,
     PlannerSelection,
@@ -43,6 +44,7 @@ from tiny_sima.planner.saycan import (
 )
 from tiny_sima.planner.vlm import (
     DEFAULT_PROMPT_STYLE,
+    BatchedVisionLanguageBackend,
     ParsedVLMResponse,
     PlannerPromptStyle,
     TransformersVLMBackend,
@@ -51,6 +53,7 @@ from tiny_sima.planner.vlm import (
     VLMUtilityScorer,
     build_planner_prompt,
     build_planner_system_prompt,
+    generate_all,
     parse_vlm_response,
     summarize_state,
 )
@@ -62,9 +65,11 @@ __all__ = [
     "DEFAULT_PROMPT_STYLE",
     "BatchedFeasibilityScorer",
     "BatchedUtilityScorer",
+    "BatchedVisionLanguageBackend",
     "CompetencePrior",
     "CriticAffordanceScorer",
     "IsotonicCalibration",
+    "MultiStateUtilityScorer",
     "ParsedVLMResponse",
     "PlannerContext",
     "PlannerDecision",
@@ -92,6 +97,7 @@ __all__ = [
     "expected_calibration_error",
     "fit_competence_prior",
     "fit_isotonic_calibration",
+    "generate_all",
     "make_critic_affordance_scorer",
     "num_distance_cells",
     "parse_vlm_response",

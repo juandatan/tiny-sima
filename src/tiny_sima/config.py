@@ -146,6 +146,10 @@ class VLMPlannerConfig:
     dtype: str = "bfloat16"
     device_map: str = "auto"
     block_pixel_size: int = 16
+    # Boundaries from independent episodes decode together, so this caps how
+    # many padded sequences share one forward pass before memory becomes the
+    # binding constraint rather than latency.
+    max_batch_size: int = 8
 
     def validate(self) -> Self:
         """Raise a helpful error for unsupported inference settings."""
@@ -154,6 +158,8 @@ class VLMPlannerConfig:
             raise ValueError("model_id cannot be empty.")
         if self.max_new_tokens < 1:
             raise ValueError("max_new_tokens must be positive.")
+        if self.max_batch_size < 1:
+            raise ValueError("max_batch_size must be positive.")
         if self.dtype not in {"auto", "bfloat16", "float16", "float32"}:
             raise ValueError(
                 "dtype must be auto, bfloat16, float16, or float32."

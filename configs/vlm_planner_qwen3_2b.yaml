@@ -4,3 +4,7 @@ max_new_tokens: 256
 dtype: bfloat16
 device_map: auto
 block_pixel_size: 16
+# Boundaries from independent episodes decode in one padded forward pass. Eight
+# 16-pixel-block frames fit alongside a 2B model; lower it if decoding runs out
+# of memory, raise it if the prefix ladder is latency bound.
+max_batch_size: 8
