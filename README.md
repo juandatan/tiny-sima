@@ -596,6 +596,22 @@ assumed to help. The echoed list is also recorded, which separates a perception
 failure (wrong list) from an instruction-following failure (right list, then an
 unavailable choice).
 
+Measured on 48 prefix boundaries, the change took the ungrounded top choice
+from 0.750 to 0.026, and with it the Can terms' rescue rate to zero - every
+condition sharing the new prompt now scores the same. It also exposed two new
+errors. The schema fixes the ranking's length but cannot make its entries
+distinct, and the model filled the slots by cycling the skills it had just
+reported as available: 10 of 48 responses failed as
+`ranking_not_a_permutation`, every one with a correct `selected_skill`. Those
+rankings are now repaired at parse time - each skill keeps its first position,
+omitted skills follow in catalog order - and flagged, so the prefix evaluation
+reports the strict-parse accuracy from the same generations. The other error
+is at the last boundary, where the model picked `collect_wood` over an
+available, claimed `collect_stone` in six of eight episodes. Catalog order
+always lists `collect_wood` first, so a `vlm_shuffled_available` condition
+lists the available skills in a seeded order and is otherwise identical; the
+per-boundary table shows whether the error follows the position.
+
 Measuring a prompt change is only useful if the loop is short, and generation
 dominates it. The controlled-prefix evaluation therefore advances every episode
 in lockstep, one boundary at a time, and decodes all of their decisions in one
@@ -608,6 +624,11 @@ exactly the states that sequential advancing would. Batching is optional at the
 backend boundary: `generate_all` falls back to one call at a time for any
 backend implementing only `generate`. The closed loop cannot batch this way,
 because each decision depends on where the previous skill left that episode.
+The oracle ignores the planner, so its rollout is collected once as a
+`PrefixTrajectory` and every condition is scored on it, and the frame renderer
+and the reachability search are compiled once rather than dispatched op by op
+or recompiled per call - together roughly a second per boundary that every
+condition paid, including those the response cache answered.
 
 The ordered sequence is private to the scripted baseline. Planner-visible
 context contains only the objective and prior execution outcomes, and chain
@@ -637,8 +658,9 @@ Tasks:
   retired.**
 - Replan after success, failure, danger, or timeout.
 - Compare scripted, VLM-only, feasibility-only, and combined planners.
-  **Eight-condition ladder implemented in notebook 06, including the retired
-  critic control and the baseline prompt; GPU run pending.**
+  **Nine-condition ladder implemented in notebook 06, including the retired
+  critic control, the baseline prompt, and a position-bias control; first GPU
+  prefix run recorded, closed loop pending.**
 
 ### Phase 5: Memory and visual grounding
 
@@ -784,6 +806,9 @@ Implemented:
   comparison.
 - Batched constrained generation across episodes at a shared boundary, with a
   sequential fallback for backends that do not support it.
+- Parse-time repair of rankings that repeat a skill, flagged per response so
+  strict-parse accuracy is reported from the same generations.
+- One oracle trajectory shared by every prefix-ablation condition.
 - Static notebook checks for parse errors, stale imports, and undefined names.
 
 Verified locally on October 8, 2026:
@@ -1040,5 +1065,34 @@ Critic affordances measured and retired on October 19, 2026:
   package and reloading the VLM. 48 prefix boundaries give a standard error of
   about 0.063 on an `ungrounded_top` near 0.745, which is enough to see a real
   prompt effect without the ladder's confirmation conditions.
-- All 183 regular automated tests pass locally; the real-model VLM smoke test
+- Read the first `full` run. The available-first prompt took the ungrounded
+  top choice from 0.750 to 0.026, and the competence prior separated held-out
+  success at AUC 0.738 against the critic's 0.369. Accepted accuracy fell from
+  0.938 to 0.646 even so, for two new reasons, both addressed below.
+- Repaired rankings that repeat a skill. 10 of 48 available-first responses
+  cycled the available skills to fill the ranking, every one with the right
+  `selected_skill`; repairing them would have lifted accepted accuracy to about
+  0.854. `VLMUtilityScorer.repair_ranking` defaults on, each repaired response
+  is flagged, and `evaluate_planner_prefixes` reports
+  `strict_accepted_next_skill_accuracy` and `repaired_utility_response_rate`
+  beside it. The scorer cache now holds raw text, so the parse mode can change
+  without regenerating.
+- Added `vlm_shuffled_available`, the position-bias control for the last
+  boundary, where `collect_wood` - always listed first - was chosen over an
+  available `collect_stone` in six of eight episodes. `available_shuffle_seed`
+  orders the available list per boundary as a pure function of the seed and
+  the prompt, so the cache still hits.
+- Raised the available-first assessment limit from 96 to 160 characters and
+  asked for English, since assessments were cut off mid-sentence and drifted
+  into Chinese near the cutoff; the baseline keeps 96. `max_new_tokens` rose
+  from 256 to 320 so a longer assessment cannot truncate the JSON.
+- Fixed notebook 06's per-skill table, which read the prior's predictions on
+  precondition-passing probes against the critic's success rate over all
+  probes, so `place_table` showed 0.98 predicted against 0.17 observed.
+- Removed about a second per boundary from every prefix condition. The frame
+  renderer is compiled once per texture size (253 ms to 0.6 ms a frame on CPU),
+  `travel_distance_map` is compiled once per config instead of retracing its
+  loop on every call, and `collect_prefix_trajectory` runs the scripted oracle
+  once for the whole ladder rather than once per condition.
+- All 191 regular automated tests pass locally; the real-model VLM smoke test
   remains opt-in. Ruff and Pyright report no issues.

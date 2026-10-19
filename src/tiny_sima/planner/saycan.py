@@ -89,6 +89,7 @@ class PlannerSelection:
     utility_error: str | None = None
     utility_ranking: tuple[SkillId, ...] = ()
     utility_raw_response: str | None = None
+    utility_repaired: bool = False
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,9 @@ class UtilityScoreBatch:
     error: str | None = None
     ranking: tuple[SkillId, ...] = ()
     raw_response: str | None = None
+    # True when the ranking was accepted only after a parse-time repair, so the
+    # strict-parse result stays recoverable from the same generations.
+    repaired: bool = False
 
 
 UtilityScorer = Callable[[Any, PlannerContext, SkillId], float]
@@ -306,6 +310,7 @@ def _planner_selection(
             status=PlannerSelectionStatus.NO_VIABLE_SKILL,
             utility_ranking=utility_batch.ranking,
             utility_raw_response=utility_batch.raw_response,
+            utility_repaired=utility_batch.repaired,
         )
     return PlannerSelection(
         decision=PlannerDecision(
@@ -315,6 +320,7 @@ def _planner_selection(
         status=PlannerSelectionStatus.SELECTED,
         utility_ranking=utility_batch.ranking,
         utility_raw_response=utility_batch.raw_response,
+        utility_repaired=utility_batch.repaired,
     )
 
 

@@ -1,6 +1,10 @@
 model_id: Qwen/Qwen3-VL-2B-Instruct
 environment_name: Craftax-Classic-Symbolic-v1
-max_new_tokens: 256
+# The available-first response is about 150 tokens with a 160-character
+# assessment in English, but the model can drift into Chinese, close to a token
+# per character. A cap that cuts the JSON short is a parse failure, and decoding
+# stops at the closing brace anyway, so the slack costs nothing.
+max_new_tokens: 320
 dtype: bfloat16
 device_map: auto
 block_pixel_size: 16

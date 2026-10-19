@@ -36,6 +36,9 @@ from tiny_sima.evaluation.gpu_monitor import (
 )
 from tiny_sima.evaluation.planner import (
     PlannerBoundaryTrace,
+    PrefixBoundary,
+    PrefixTrajectory,
+    collect_prefix_trajectory,
     evaluate_planner_prefixes,
 )
 from tiny_sima.evaluation.policy import evaluate_checkpoint, evaluate_policy
@@ -50,6 +53,8 @@ __all__ = [
     "AffordanceSample",
     "NvidiaSmiMonitor",
     "PlannerBoundaryTrace",
+    "PrefixBoundary",
+    "PrefixTrajectory",
     "VLMSmokeResult",
     "LearnedSkillExecutor",
     "ScriptedSkillExecutor",
@@ -57,6 +62,7 @@ __all__ = [
     "ChainTermination",
     "WOOD_TO_STONE_CHAIN",
     "collect_affordance_samples",
+    "collect_prefix_trajectory",
     "diagnose_goal_conditioned_checkpoint",
     "diagnose_goal_conditioned_policy",
     "diagnose_goal_conditioned_skill",

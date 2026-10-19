@@ -6,6 +6,7 @@ import argparse
 import json
 import time
 from dataclasses import dataclass
+from functools import cache
 from typing import Any, NamedTuple
 
 import jax
@@ -294,6 +295,24 @@ def make_vectorized_environment(
     return VectorizedCraftax(bundle=bundle, num_envs=num_envs)
 
 
+@cache
+def _pixel_renderer(classic: bool, block_pixel_size: int) -> Any:
+    """Build and compile one renderer per game variant and texture size.
+
+    Craftax builds its renderer uncompiled, so calling it dispatches every
+    array operation separately: a quarter of a second per frame on CPU, paid at
+    every planner boundary including those the response cache answers.
+    Compiled once, a frame costs under a millisecond.
+    """
+
+    if classic:
+        from craftax.craftax_classic.renderer import make_craftax_pixel_renderer
+    else:
+        from craftax.craftax.renderer import make_craftax_pixel_renderer
+
+    return jax.jit(make_craftax_pixel_renderer(block_pixel_size))
+
+
 def render_state(
     state: Any,
     env_name: str,
@@ -309,12 +328,7 @@ def render_state(
             f"received {block_pixel_size}."
         )
 
-    if "Classic" in env_name:
-        from craftax.craftax_classic.renderer import make_craftax_pixel_renderer
-    else:
-        from craftax.craftax.renderer import make_craftax_pixel_renderer
-
-    renderer = make_craftax_pixel_renderer(block_pixel_size)
+    renderer = _pixel_renderer("Classic" in env_name, block_pixel_size)
     pixels = np.asarray(renderer(state))
     if np.issubdtype(pixels.dtype, np.floating) and pixels.max(initial=0) <= 1.0:
         pixels = pixels * 255.0

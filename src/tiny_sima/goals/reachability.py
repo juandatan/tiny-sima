@@ -28,7 +28,8 @@ by the calibrated affordance model in :mod:`tiny_sima.planner.affordance`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from functools import partial
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -164,6 +165,30 @@ def travel_distance_map(
     always zero even when it is not itself walkable.
     """
 
+    return _travel_distance_map(
+        _MapView(
+            map=jnp.asarray(state.map),
+            player_position=jnp.asarray(state.player_position),
+        ),
+        config,
+    )
+
+
+class _MapView(NamedTuple):
+    """The two state fields the search reads, as a pytree ``jit`` can take."""
+
+    map: jax.Array
+    player_position: jax.Array
+
+
+# Compiled once per config. Run eagerly, the loop body is a fresh closure on
+# every call, so JAX recompiled it at every planner boundary and the search
+# dominated an evaluation that never touched the VLM.
+@partial(jax.jit, static_argnames=("config",))
+def _travel_distance_map(
+    state: _MapView,
+    config: ReachabilityConfig,
+) -> jax.Array:
     unreachable = config.unreachable
     passable = walkable_mask(state) & view_mask(state, config.view_radius)
     start = _player_mask(state)

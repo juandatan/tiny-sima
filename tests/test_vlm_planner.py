@@ -16,7 +16,10 @@ from tiny_sima.evaluation.chains import (
     ScriptedSkillExecutor,
     evaluate_skill_chain,
 )
-from tiny_sima.evaluation.planner import evaluate_planner_prefixes
+from tiny_sima.evaluation.planner import (
+    collect_prefix_trajectory,
+    evaluate_planner_prefixes,
+)
 from tiny_sima.evaluation.vlm_smoke import run_vlm_smoke_test
 from tiny_sima.goals import SKILL_IDS, SkillId
 from tiny_sima.planner.saycan import (
@@ -37,6 +40,7 @@ from tiny_sima.planner.vlm import (
     build_planner_system_prompt,
     generate_all,
     parse_vlm_response,
+    progress_assessment_limit,
     summarize_state,
 )
 
@@ -599,6 +603,7 @@ def test_transformers_backend_caches_constrained_generators(
     def fake_output_type(
         candidate_skills: tuple[SkillId, ...],
         require_available: bool = False,
+        assessment_max_length: int = 96,
     ) -> object:
         return ("schema", candidate_skills, require_available)
 
@@ -753,3 +758,229 @@ def test_invalid_vlm_output_has_distinct_chain_termination() -> None:
     ] == 1
     assert result["planner_error_counts"] == {"malformed_json": 1}
     assert result["episodes"][0].planner_raw_response == "not json"
+
+
+def _cycling_response(*available: SkillId) -> str:
+    """Fill every ranking slot by cycling the available skills, as Qwen did."""
+
+    ranking = [available[index % len(available)].value for index in range(6)]
+    return json.dumps(
+        {
+            "progress_assessment": "A pickaxe is ready, so collect stone.",
+            "available_now": [skill_id.value for skill_id in available],
+            "selected_skill": ranking[0],
+            "ranking": ranking,
+        }
+    )
+
+
+def test_ranking_repair_keeps_the_expressed_order_and_flags_the_response() -> None:
+    response = _cycling_response(SkillId.COLLECT_STONE, SkillId.COLLECT_WOOD)
+
+    strict = parse_vlm_response(response, SKILL_IDS)
+    repaired = parse_vlm_response(response, SKILL_IDS, repair_ranking=True)
+
+    assert not strict.valid
+    assert strict.error == "ranking_not_a_permutation"
+    assert repaired.valid
+    assert repaired.repaired
+    assert repaired.selected_skill is SkillId.COLLECT_STONE
+    # First occurrences keep their positions; the skills the model never named
+    # follow in catalog order.
+    assert repaired.ranking == (
+        SkillId.COLLECT_STONE,
+        SkillId.COLLECT_WOOD,
+        *(
+            skill_id
+            for skill_id in SKILL_IDS
+            if skill_id not in (SkillId.COLLECT_STONE, SkillId.COLLECT_WOOD)
+        ),
+    )
+    assert repaired.utilities[SkillId.COLLECT_STONE] == 1.0
+    assert not parse_vlm_response(
+        _response(SkillId.COLLECT_WOOD),
+        SKILL_IDS,
+        repair_ranking=True,
+    ).repaired
+
+
+def test_ranking_repair_does_not_rescue_other_failures() -> None:
+    def parse(ranking: list[str], selected: str = "collect_wood") -> Any:
+        return parse_vlm_response(
+            json.dumps(
+                {
+                    "progress_assessment": "Wood is still required.",
+                    "selected_skill": selected,
+                    "ranking": ranking,
+                }
+            ),
+            SKILL_IDS,
+            repair_ranking=True,
+        )
+
+    # Nothing to repair from, an unknown name, and a choice the ranking
+    # contradicts all still fail closed.
+    assert parse([]).error == "ranking_wrong_length"
+    assert parse(["collect_wood", "chop_tree"]).error == (
+        "unknown_ranking_skills:chop_tree"
+    )
+    assert parse(
+        ["place_table", "collect_wood", "place_table"]
+    ).error == "selected_skill_ranking_mismatch"
+
+
+def test_scorer_repairs_by_default_and_shares_generations_across_parse_modes() -> (
+    None
+):
+    state = make_skill_chain_environment().reset(jax.random.PRNGKey(0)).state
+    context = PlannerContext(objective="Collect stone.")
+    backend = FakeBackend(
+        response=_cycling_response(SkillId.COLLECT_STONE, SkillId.COLLECT_WOOD)
+    )
+    scorer = VLMUtilityScorer(backend)
+
+    repaired = scorer.score_all(state, context, SKILL_IDS)
+    scorer.repair_ranking = False
+    strict = scorer.score_all(state, context, SKILL_IDS)
+
+    assert repaired.valid and repaired.repaired
+    assert not strict.valid
+    assert strict.error == "ranking_not_a_permutation"
+    # The cache holds raw text, so changing how it is parsed regenerates nothing.
+    assert len(backend.requests) == 1
+
+
+def test_planner_prefixes_report_strict_accuracy_alongside_repair() -> None:
+    backend = FakeBatchedBackend(
+        response=_cycling_response(SkillId.COLLECT_WOOD, SkillId.DRINK_WATER)
+    )
+    result = evaluate_planner_prefixes(
+        SayCanPlanner(utility_scorer=VLMUtilityScorer(backend)),
+        num_episodes=1,
+        seed=2,
+        skill_horizon=32,
+    )
+
+    assert result["repaired_utility_response_rate"] == 1.0
+    assert result["valid_utility_response_rate"] == 1.0
+    assert result["accepted_next_skill_accuracy"] > 0.0
+    # Strict parsing would have rejected every one of these responses.
+    assert result["strict_accepted_next_skill_accuracy"] == 0.0
+    assert all(trace.utility_repaired for trace in result["traces"])
+
+
+def _available_list(prompt: str) -> list[str]:
+    line = next(
+        line
+        for line in prompt.splitlines()
+        if line.startswith("Skills available now: ")
+    )
+    return json.loads(line.removeprefix("Skills available now: "))
+
+
+def test_available_shuffle_reorders_only_the_available_list() -> None:
+    environment = make_skill_chain_environment()
+    context = PlannerContext(objective="Collect stone.")
+    states = [
+        environment.reset(jax.random.PRNGKey(seed)).state for seed in range(8)
+    ]
+
+    orders = []
+    for state in states:
+        plain = build_planner_prompt(state, context, SKILL_IDS)
+        shuffled = build_planner_prompt(
+            state,
+            context,
+            SKILL_IDS,
+            available_shuffle_seed=3,
+        )
+        catalog_line = next(
+            line
+            for line in shuffled.splitlines()
+            if line.startswith("Candidate skills: ")
+        )
+        catalog = json.loads(catalog_line.removeprefix("Candidate skills: "))
+
+        assert sorted(_available_list(shuffled)) == sorted(_available_list(plain))
+        # The catalog lists the available skills in the same shuffled order.
+        assert [
+            entry["skill"] for entry in catalog if entry["available_now"]
+        ] == _available_list(shuffled)
+        # A pure function of seed and boundary, so the cache still hits.
+        assert shuffled == build_planner_prompt(
+            state,
+            context,
+            SKILL_IDS,
+            available_shuffle_seed=3,
+        )
+        orders.append(
+            _available_list(shuffled) != _available_list(plain)
+        )
+
+    assert any(orders)
+
+    with pytest.raises(ValueError, match="available_first"):
+        build_planner_prompt(
+            states[0],
+            context,
+            SKILL_IDS,
+            style=PlannerPromptStyle.BASELINE,
+            available_shuffle_seed=3,
+        )
+
+
+def test_assessment_limit_follows_the_prompt_style() -> None:
+    state = make_skill_chain_environment().reset(jax.random.PRNGKey(0)).state
+    context = PlannerContext(objective="Collect wood.")
+    available_first = FakeBackend(response=_response(SkillId.COLLECT_WOOD))
+    baseline = FakeBackend(response=_response(SkillId.COLLECT_WOOD))
+
+    VLMUtilityScorer(available_first).score_all(state, context, SKILL_IDS)
+    VLMUtilityScorer(
+        baseline,
+        prompt_style=PlannerPromptStyle.BASELINE,
+    ).score_all(state, context, SKILL_IDS)
+
+    limit = progress_assessment_limit()
+    assert limit > progress_assessment_limit(PlannerPromptStyle.BASELINE) == 96
+    assert available_first.requests[0].assessment_max_length == limit
+    assert baseline.requests[0].assessment_max_length == 96
+    assert f"in English of at most {limit} characters" in (
+        available_first.requests[0].user_prompt
+    )
+    schema = _ranking_output_type(SKILL_IDS, True, limit).model_json_schema()  # type: ignore[attr-defined]
+    assert schema["properties"]["progress_assessment"]["maxLength"] == limit
+
+
+def test_planner_prefixes_reuse_one_oracle_trajectory() -> None:
+    planner = SayCanPlanner(
+        utility_scorer=VLMUtilityScorer(
+            FakeBatchedBackend(response=_response(SkillId.COLLECT_WOOD))
+        )
+    )
+    trajectory = collect_prefix_trajectory(num_episodes=2, seed=2, skill_horizon=32)
+
+    fresh = evaluate_planner_prefixes(
+        planner,
+        num_episodes=2,
+        seed=2,
+        skill_horizon=32,
+    )
+    reused = evaluate_planner_prefixes(
+        planner,
+        num_episodes=2,
+        seed=2,
+        skill_horizon=32,
+        trajectory=trajectory,
+    )
+
+    assert reused == fresh
+
+    with pytest.raises(ValueError, match="different settings"):
+        evaluate_planner_prefixes(
+            planner,
+            trajectory=trajectory,
+            num_episodes=2,
+            seed=3,
+            skill_horizon=32,
+        )

@@ -56,6 +56,22 @@ class PlannerPromptStyle(str, Enum):
 
 DEFAULT_PROMPT_STYLE = PlannerPromptStyle.AVAILABLE_FIRST
 
+# The baseline keeps the limit it was measured with. At 96 characters the
+# available-first assessments were cut off mid-sentence and drifted out of
+# English near the cutoff, so that style gets more room.
+_PROGRESS_ASSESSMENT_LIMITS = {
+    PlannerPromptStyle.BASELINE: 96,
+    PlannerPromptStyle.AVAILABLE_FIRST: 160,
+}
+
+
+def progress_assessment_limit(
+    style: PlannerPromptStyle = DEFAULT_PROMPT_STYLE,
+) -> int:
+    """Return the character limit the prompt and schema place on the assessment."""
+
+    return _PROGRESS_ASSESSMENT_LIMITS[style]
+
 
 class VLMRequest(NamedTuple):
     """One image-text generation request at an option boundary."""
@@ -65,6 +81,7 @@ class VLMRequest(NamedTuple):
     user_prompt: str
     candidate_skills: tuple[SkillId, ...]
     require_available: bool = False
+    assessment_max_length: int = 96
 
     @property
     def prompt(self) -> str:
@@ -131,6 +148,9 @@ class ParsedVLMResponse:
     # against the true reachable set separates a perception failure from an
     # instruction-following one, which point at different fixes.
     claimed_available: tuple[SkillId, ...] = ()
+    # True when the ranking only became a permutation after repair; see
+    # :func:`parse_vlm_response`.
+    repaired: bool = False
 
 
 def _rank_utility(index: int) -> float:
@@ -179,8 +199,21 @@ def _invalid_vlm_response(
 def parse_vlm_response(
     response: str,
     candidate_skills: tuple[SkillId, ...],
+    *,
+    repair_ranking: bool = False,
 ) -> ParsedVLMResponse:
-    """Parse a strict planner response without trusting unknown skill names."""
+    """Parse a planner response without trusting unknown skill names.
+
+    ``repair_ranking`` accepts a ranking that names only known skills but
+    repeats some and so omits others. The constrained schema fixes the
+    ranking's length but cannot make its entries distinct, and under the
+    available-first prompt the model fills the slots by cycling through the
+    skills it just reported as available: 10 of 48 prefix boundaries, every
+    one with a correct ``selected_skill``. Repair keeps each skill's first
+    position and appends the omitted skills in catalog order, which leaves
+    the choice and the order the model did express untouched. The response is
+    flagged ``repaired`` so the strict result is still recoverable.
+    """
 
     payload = _json_object(response)
     if payload is None:
@@ -265,13 +298,23 @@ def parse_vlm_response(
             f"unknown_ranking_skills:{names}",
         )
 
-    if len(ranking) != len(candidate_skills):
+    is_permutation = (
+        len(ranking) == len(candidate_skills) and set(ranking) == candidate_set
+    )
+    repaired = False
+    if not is_permutation and repair_ranking and ranking:
+        kept = list(dict.fromkeys(ranking))
+        ranking = [
+            *kept,
+            *(skill_id for skill_id in candidate_skills if skill_id not in kept),
+        ]
+        repaired = True
+    elif len(ranking) != len(candidate_skills):
         return _invalid_vlm_response(
             response,
             "ranking_wrong_length",
         )
-
-    if len(set(ranking)) != len(ranking) or set(ranking) != candidate_set:
+    elif not is_permutation:
         return _invalid_vlm_response(
             response,
             "ranking_not_a_permutation",
@@ -295,6 +338,7 @@ def parse_vlm_response(
         raw_response=response,
         valid=True,
         claimed_available=claimed_available,
+        repaired=repaired,
     )
 
 
@@ -524,8 +568,24 @@ def build_planner_prompt(
     candidate_skills: tuple[SkillId, ...],
     reachability: ReachabilityConfig = DEFAULT_REACHABILITY,
     style: PlannerPromptStyle = DEFAULT_PROMPT_STYLE,
+    *,
+    available_shuffle_seed: int | None = None,
 ) -> str:
-    """Build a reference-plan-free prompt for one skill boundary."""
+    """Build a reference-plan-free prompt for one skill boundary.
+
+    ``available_shuffle_seed`` lists the available skills in a seeded order
+    instead of catalog order. It is the control for position bias: with the
+    catalog order collect_wood is always listed first, and the model picked it
+    over an available, claimed collect_stone at six of eight final boundaries.
+    The order is a pure function of the seed and the boundary, so the response
+    cache still hits on a repeated boundary.
+    """
+
+    if (
+        available_shuffle_seed is not None
+        and style is not PlannerPromptStyle.AVAILABLE_FIRST
+    ):
+        raise ValueError("available_shuffle_seed needs the available_first style.")
 
     history = [
         {
@@ -573,10 +633,22 @@ def build_planner_prompt(
 
     # Available candidates are listed first so that position agrees with the
     # answer being asked for; the ranking is still over the whole catalog.
-    ordered = sorted(catalog, key=lambda entry: not entry["available_now"])
-    available = [
-        entry["skill"] for entry in ordered if entry["available_now"]
+    available_entries = [entry for entry in catalog if entry["available_now"]]
+    if available_shuffle_seed is not None:
+        boundary_key = sha256("\n".join(header).encode("utf-8")).digest()
+        rng = np.random.default_rng(
+            (available_shuffle_seed, int.from_bytes(boundary_key[:8], "big"))
+        )
+        available_entries = [
+            available_entries[index]
+            for index in rng.permutation(len(available_entries))
+        ]
+    ordered = [
+        *available_entries,
+        *(entry for entry in catalog if not entry["available_now"]),
     ]
+    available = [entry["skill"] for entry in available_entries]
+    assessment_limit = progress_assessment_limit(style)
     return "\n".join(
         (
             *header,
@@ -588,8 +660,9 @@ def build_planner_prompt(
             "no_target_in_view means requesting it would just walk off to "
             "search.",
             "Skills available now: " + (json.dumps(available) or "[]"),
-            "Answer in this order. First a progress assessment of at most 96 "
-            "characters. Second, copy the available-now list into the "
+            "Answer in this order. First a progress assessment in English of "
+            f"at most {assessment_limit} characters. Second, copy the "
+            "available-now list into the "
             "available_now field. Third, choose selected_skill from that list; "
             "if the list is empty, choose the candidate with the smallest "
             "steps_to_target. Fourth, rank every candidate exactly once, "
@@ -627,11 +700,19 @@ class VLMUtilityScorer:
     config: VLMPlannerConfig = VLMPlannerConfig()
     reachability: ReachabilityConfig = DEFAULT_REACHABILITY
     prompt_style: PlannerPromptStyle = DEFAULT_PROMPT_STYLE
+    # Accept rankings that repeat skills; see :func:`parse_vlm_response`.
+    # False is the strict-parse ablation.
+    repair_ranking: bool = True
+    # Seeded order for the available-skill list, the position-bias control;
+    # see :func:`build_planner_prompt`.
+    available_shuffle_seed: int | None = None
     last_response: ParsedVLMResponse | None = None
     # Every response from the most recent call, in request order, so a batched
     # evaluation can still attribute a parse failure to its own boundary.
     last_responses: tuple[ParsedVLMResponse, ...] = ()
-    _cache: dict[str, ParsedVLMResponse] = field(
+    # Raw response text rather than parsed results, so the parse settings can
+    # change without invalidating generations.
+    _cache: dict[str, str] = field(
         default_factory=dict,
         init=False,
         repr=False,
@@ -657,6 +738,7 @@ class VLMUtilityScorer:
             candidate_skills,
             self.reachability,
             self.prompt_style,
+            available_shuffle_seed=self.available_shuffle_seed,
         )
         cache_key = sha256(
             system_prompt.encode("utf-8")
@@ -672,6 +754,9 @@ class VLMUtilityScorer:
                 candidate_skills=candidate_skills,
                 require_available=(
                     self.prompt_style is PlannerPromptStyle.AVAILABLE_FIRST
+                ),
+                assessment_max_length=progress_assessment_limit(
+                    self.prompt_style
                 ),
             ),
         )
@@ -722,13 +807,14 @@ class VLMUtilityScorer:
         }
         if pending:
             responses = generate_all(self.backend, tuple(pending.values()))
-            for cache_key, response in zip(pending, responses, strict=True):
-                self._cache[cache_key] = parse_vlm_response(
-                    response,
-                    candidate_skills,
-                )
+            self._cache.update(zip(pending, responses, strict=True))
         parsed_responses = [
-            self._cache[cache_key] for cache_key, _ in prepared
+            parse_vlm_response(
+                self._cache[cache_key],
+                candidate_skills,
+                repair_ranking=self.repair_ranking,
+            )
+            for cache_key, _ in prepared
         ]
         self.last_responses = tuple(parsed_responses)
         if parsed_responses:
@@ -740,6 +826,7 @@ class VLMUtilityScorer:
                 error=parsed.error,
                 ranking=parsed.ranking,
                 raw_response=parsed.raw_response,
+                repaired=parsed.repaired,
             )
             for parsed in parsed_responses
         ]
@@ -754,6 +841,7 @@ class VLMUtilityScorer:
 def _ranking_output_type(
     candidate_skills: tuple[SkillId, ...],
     require_available: bool = False,
+    assessment_max_length: int = 96,
 ) -> Any:
     """Create the constrained Pydantic type consumed by Outlines.
 
@@ -788,7 +876,7 @@ def _ranking_output_type(
     )
     ranking_type = list[candidate_enum]  # pyright: ignore[reportInvalidTypeForm]
     fields: dict[str, Any] = {
-        "progress_assessment": (str, Field(max_length=96)),
+        "progress_assessment": (str, Field(max_length=assessment_max_length)),
     }
     if require_available:
         fields["available_now"] = (
@@ -865,7 +953,7 @@ class TransformersVLMBackend:
         self._processor: Any | None = None
         self._outlines_model: Any | None = None
         self._generator_factory: Any | None = None
-        self._generators: dict[tuple[tuple[SkillId, ...], bool], Any] = {}
+        self._generators: dict[tuple[tuple[SkillId, ...], bool, int], Any] = {}
 
     def _load(self) -> tuple[Any, Any, Any]:
         if (
@@ -937,15 +1025,16 @@ class TransformersVLMBackend:
         generator_factory: Any,
         *,
         require_available: bool = False,
+        assessment_max_length: int = 96,
     ) -> Any:
         """Return one cached constrained generator per catalog and schema."""
 
-        key = (candidate_skills, require_available)
+        key = (candidate_skills, require_available, assessment_max_length)
         generator = self._generators.get(key)
         if generator is None:
             generator = generator_factory(
                 outlines_model,
-                _ranking_output_type(candidate_skills, require_available),
+                _ranking_output_type(*key),
             )
             self._generators[key] = generator
         return generator
@@ -959,6 +1048,7 @@ class TransformersVLMBackend:
             outlines_model,
             generator_factory,
             require_available=request.require_available,
+            assessment_max_length=request.assessment_max_length,
         )
         output = generator(
             _planner_chat(request),
@@ -978,19 +1068,25 @@ class TransformersVLMBackend:
         if not requests:
             return []
         _, outlines_model, generator_factory = self._load()
-        groups: dict[tuple[tuple[SkillId, ...], bool], list[int]] = {}
+        groups: dict[tuple[tuple[SkillId, ...], bool, int], list[int]] = {}
         for index, request in enumerate(requests):
-            key = (request.candidate_skills, request.require_available)
+            key = (
+                request.candidate_skills,
+                request.require_available,
+                request.assessment_max_length,
+            )
             groups.setdefault(key, []).append(index)
 
         # The groups partition the request indices, so every slot is written.
         responses = [""] * len(requests)
-        for (candidate_skills, require_available), indices in groups.items():
+        for key, indices in groups.items():
+            candidate_skills, require_available, assessment_max_length = key
             generator = self._generator_for(
                 candidate_skills,
                 outlines_model,
                 generator_factory,
                 require_available=require_available,
+                assessment_max_length=assessment_max_length,
             )
             for start in range(0, len(indices), self.config.max_batch_size):
                 chunk = indices[start : start + self.config.max_batch_size]
