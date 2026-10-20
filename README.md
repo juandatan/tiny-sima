@@ -625,6 +625,22 @@ first, and flags the response like a cycled ranking. Three of the 48
 boundaries have an oracle skill that is out of reach, so a grounded planner
 can accept at most 45.
 
+Greedy decoding made one thing exact: under the available-first prompt,
+preconditions, reachability, the critic, and the competence prior produced
+byte-identical 64-episode closed loops. The prompt already carries what the Can
+term knows - `available_now`, `blocked_reason`, and `steps_to_target` are
+computed from the same reachability search - so the model's top choice is
+reachable at 96% of boundaries and no Can term has anything left to rescue.
+Grounding can live in the prompt or in the Can term, and which Can term is
+better is only measurable under the prompt that leaves grounding to it. The
+ladder is laid out on those two axes: the available-first prompt with and
+without reachability, plus catalog order as the position-bias ablation, and
+the baseline prompt with no Can term, reachability, or the competence prior.
+Seeded order is now the available-first default. The closed loop adds the
+collect-first scripted plan as the stronger fixed reference, and reports
+paired comparisons, since every condition starts episode `i` from the same
+world.
+
 Measuring a prompt change is only useful if the loop is short, and generation
 dominates it. The controlled-prefix evaluation therefore advances every episode
 in lockstep, one boundary at a time, and decodes all of their decisions in one
@@ -677,10 +693,11 @@ Tasks:
   retired.**
 - Replan after success, failure, danger, or timeout.
 - Compare scripted, VLM-only, feasibility-only, and combined planners.
-  **Nine-condition ladder implemented in notebook 06, including the retired
-  critic control, the baseline prompt, and a position-bias control; first GPU
-  prefix and closed-loop runs recorded. The closed loop predates the ranking
-  repair and is dominated by invalid output, so it needs a rerun.**
+  **Ladder implemented in notebook 06 on two axes, prompt grounding against
+  Can-term grounding, with a position-bias control, a collect-first scripted
+  plan, and paired closed-loop comparisons; three 64-episode closed loops
+  recorded, the last with greedy decoding and both repairs. A run of the
+  restructured ladder is pending.**
 
 ### Phase 5: Memory and visual grounding
 
@@ -1147,8 +1164,70 @@ Critic affordances measured and retired on October 19, 2026:
   each time the first entry of the model's own `available_now`. Shuffled
   order missed there twice in eight, once where stone was out of reach; the
   greedy rerun has to confirm the difference.
+- Read the first 64-episode closed loop, run with sampled decoding and before
+  the mismatch repair. Nine conditions took 31 minutes, against 70 for 16
+  episodes before lockstep. Success ranged from 0.172 (`feasibility_only`) to
+  0.328 (`vlm_baseline_prompt`), with the scripted plan at 0.250; no pair
+  differs significantly (baseline against oracle Fisher p = 0.44, against
+  `vlm_only` p = 0.16). The executor sets the ceiling: all 48 of the oracle's
+  failures were timeouts, 41 of them in `collect_wood`, and `collect_wood` was
+  the final failed skill in 29 to 34 episodes of every other condition. The
+  mismatch ended 5 to 7 episodes in every available-first condition. Those
+  conditions also hit the 12-decision limit in 14 or 15 episodes while
+  completing 6.8 skills on average against the oracle's 3.9, and shuffled order
+  hit it in 9. Held out, the critic's AUC was 0.369 and the competence prior's
+  0.738.
 - Repaired a `selected_skill` the ranking does not put first, which was the one
   invalid response left after the cycling repair and would have ended about
   one closed-loop episode in six. Strict parsing still rejects it.
 - All 197 regular automated tests pass locally; the real-model VLM smoke test
+  remains opt-in. Ruff and Pyright report no issues.
+
+Planner ladder restructured on October 20, 2026:
+
+- Read the first full run with greedy decoding and both repairs. No response
+  was invalid in any condition, prefix or closed loop. On the prefix ladder the
+  shuffled order accepted 45 of 48 - every achievable boundary - against 43
+  for the fixed order with any Can term and 41 for `vlm_only`; both avoidable
+  fixed-order misses were `collect_wood` over an available `collect_stone` at
+  the last boundary, once with the assessment saying stone came next. The
+  baseline prompt's 46 is above the achievable 45 because it was credited for
+  choosing unreachable reference skills, with a 0.729 ungrounded top choice
+  that reachability rescued at 0.646 of boundaries. Closed-loop success out of
+  64: shuffled 19, baseline prompt 17, scripted plan 16, `vlm_only` 15, the
+  four fixed-order Can terms 14 each with byte-identical episodes, and
+  `feasibility_only` 11. No pair is significant (shuffled against fixed order
+  Fisher p = 0.42, against the scripted plan p = 0.69), and detecting a 0.10
+  difference at these rates takes about 300 episodes an arm unpaired. The
+  scripted plan's 48 failures were all timeouts, 41 in `collect_wood`; the
+  held-out competence table puts `collect_wood` at 0.94 success with a target
+  two steps away or closer and 0.58 at three to six. Held out, the critic's AUC
+  was 0.369 and the competence prior's 0.738; the critic condition took 294 s
+  of closed loop against 106 s for reachability.
+- Restructured notebook 06's ladder around where grounding lives. Under the
+  available-first prompt: `vlm_plus_reachability` (seeded order, formerly
+  `vlm_shuffled_available`), `vlm_fixed_order` (formerly
+  `vlm_plus_reachability`), and `vlm_only`. Under the baseline prompt:
+  `baseline_prompt_only`, `baseline_plus_reachability` (formerly
+  `vlm_baseline_prompt`), and `baseline_plus_competence_prior`. The three
+  baseline conditions share one scorer, so the prompt is generated once.
+- Retired from runs, with code and numbers kept: `vlm_plus_symbolic`, which
+  matched reachability exactly; `vlm_plus_critic_affordance`, AUC 0.369 and an
+  identical closed loop at 2.8 times the cost; and the competence prior under
+  the available-first prompt, identical to reachability, which moved to the
+  baseline prompt. The critic is still fitted and scored whenever probing
+  runs, so its AUC stays reproduced.
+- Made seeded order notebook 06's available-first default, since it scored at
+  or above catalog order in every run that measured both and catalog order's
+  last-boundary error recurred in each. The library's `VLMUtilityScorer` still
+  defaults to catalog order.
+- Added `scripted_collect_first` to the closed loop, the October 14 plan that
+  collects all three wood before placing the table (0.578 against 0.344 for
+  the default order with this executor), as the stronger fixed plan for the
+  VLM to be measured against.
+- Added `compare_paired_successes`, an exact McNemar test over two
+  `evaluate_skill_chain` results on the same seed and episode count; it
+  refuses results that do not pair. Notebook 06 prints a paired table for the
+  comparisons each pair of conditions isolates.
+- All 201 regular automated tests pass locally; the real-model VLM smoke test
   remains opt-in. Ruff and Pyright report no issues.

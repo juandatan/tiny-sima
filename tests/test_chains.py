@@ -1,5 +1,6 @@
 import dataclasses
 from collections.abc import Sequence
+from types import SimpleNamespace
 from typing import Any
 
 import jax
@@ -22,6 +23,7 @@ from tiny_sima.evaluation.chains import (
     _outcome_from_step,
     _record_skill_failures,
     _start_skill,
+    compare_paired_successes,
     evaluate_chain_episode,
     evaluate_chain_episodes,
     evaluate_learned_skill_chain_batched,
@@ -667,3 +669,62 @@ def test_lockstep_plans_every_running_episode_in_one_call() -> None:
     assert len(scorer.batch_sizes) == max(decisions)
     assert scorer.batch_sizes == sorted(scorer.batch_sizes, reverse=True)
     assert sum(scorer.batch_sizes) == sum(decisions)
+
+
+def _paired_result(outcomes: Sequence[bool], seed: int = 0) -> dict[str, Any]:
+    return {
+        "seed": seed,
+        "num_episodes": len(outcomes),
+        "episodes": [SimpleNamespace(succeeded=outcome) for outcome in outcomes],
+    }
+
+
+def test_paired_comparison_reads_only_discordant_episodes() -> None:
+    reference = _paired_result([True, True, False, False, False, False, False, False])
+    candidate = _paired_result([True, False, True, True, True, True, True, False])
+
+    comparison = compare_paired_successes(reference, candidate)
+
+    assert comparison["both"] == 1
+    assert comparison["neither"] == 1
+    assert comparison["reference_only"] == 1
+    assert comparison["candidate_only"] == 5
+    assert comparison["difference"] == pytest.approx(4 / 8)
+    # Two-sided exact binomial on six discordant pairs, one against five.
+    assert comparison["p_value"] == pytest.approx(2 * (1 + 6) / 2**6)
+    # Swapping the arms flips the sign and keeps the test.
+    swapped = compare_paired_successes(candidate, reference)
+    assert swapped["difference"] == pytest.approx(-4 / 8)
+    assert swapped["p_value"] == comparison["p_value"]
+
+
+def test_paired_comparison_without_discordant_pairs_is_uninformative() -> None:
+    result = _paired_result([True, False, True])
+
+    comparison = compare_paired_successes(result, result)
+
+    assert comparison["p_value"] == 1.0
+    assert comparison["difference"] == 0.0
+
+
+def test_paired_comparison_rejects_results_from_different_worlds() -> None:
+    with pytest.raises(ValueError, match="seed"):
+        compare_paired_successes(
+            _paired_result([True, False], seed=0),
+            _paired_result([True, False], seed=1),
+        )
+    with pytest.raises(ValueError, match="num_episodes"):
+        compare_paired_successes(
+            _paired_result([True, False]),
+            _paired_result([True, False, True]),
+        )
+
+
+def test_conditions_on_one_seed_pair_episode_by_episode() -> None:
+    first = evaluate_skill_chain(ScriptedSkillExecutor(), num_episodes=3, seed=5)
+    second = evaluate_skill_chain(ScriptedSkillExecutor(), num_episodes=3, seed=5)
+
+    comparison = compare_paired_successes(first, second)
+
+    assert comparison["num_pairs"] == 3
+    assert comparison["reference_only"] == comparison["candidate_only"] == 0

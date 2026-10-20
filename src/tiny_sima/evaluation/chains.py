@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from collections import Counter, deque
 from collections.abc import Callable, Sequence
@@ -1837,6 +1838,53 @@ def evaluate_skill_chain(
         "final_failed_skill_counts": final_failed_skill_counts,
         "final_failure_outcome_counts": final_failure_outcome_counts,
         "episodes": episodes,
+    }
+
+
+def compare_paired_successes(
+    reference: dict[str, Any],
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    """Compare two :func:`evaluate_skill_chain` results episode by episode.
+
+    Results evaluated with the same seed and episode count reset episode ``i``
+    into the same world, so their outcomes pair up. The exact McNemar test
+    reads only the discordant pairs, which removes the variance between worlds
+    that an unpaired test on two success rates has to carry: at 64 episodes
+    and success near 0.25, Fisher's test cannot separate 0.30 from 0.22.
+    """
+
+    for key in ("seed", "num_episodes"):
+        if reference[key] != candidate[key]:
+            raise ValueError(
+                f"Paired results need the same {key}: "
+                f"{reference[key]} and {candidate[key]}."
+            )
+    pairs = [
+        (first.succeeded, second.succeeded)
+        for first, second in zip(
+            reference["episodes"],
+            candidate["episodes"],
+            strict=True,
+        )
+    ]
+    reference_only = sum(first and not second for first, second in pairs)
+    candidate_only = sum(second and not first for first, second in pairs)
+    discordant = reference_only + candidate_only
+    # Two-sided exact test: under the null each discordant pair is a fair coin.
+    tail = sum(
+        math.comb(discordant, count)
+        for count in range(min(reference_only, candidate_only) + 1)
+    )
+    p_value = min(1.0, 2.0 * tail / 2**discordant) if discordant else 1.0
+    return {
+        "num_pairs": len(pairs),
+        "both": sum(first and second for first, second in pairs),
+        "neither": sum(not first and not second for first, second in pairs),
+        "reference_only": reference_only,
+        "candidate_only": candidate_only,
+        "difference": (candidate_only - reference_only) / len(pairs),
+        "p_value": p_value,
     }
 
 
