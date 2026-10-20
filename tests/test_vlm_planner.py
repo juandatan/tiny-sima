@@ -818,15 +818,102 @@ def test_ranking_repair_does_not_rescue_other_failures() -> None:
             repair_ranking=True,
         )
 
-    # Nothing to repair from, an unknown name, and a choice the ranking
-    # contradicts all still fail closed.
+    # Nothing to repair from and an unknown name still fail closed.
     assert parse([]).error == "ranking_wrong_length"
     assert parse(["collect_wood", "chop_tree"]).error == (
         "unknown_ranking_skills:chop_tree"
     )
-    assert parse(
-        ["place_table", "collect_wood", "place_table"]
-    ).error == "selected_skill_ranking_mismatch"
+    assert parse(["place_table"], selected="chop_tree").error == (
+        "unknown_selected_skill"
+    )
+
+
+def test_ranking_repair_moves_the_selection_to_the_top() -> None:
+    ranking = [
+        SkillId.COLLECT_WOOD,
+        SkillId.DRINK_WATER,
+        SkillId.PLACE_TABLE,
+        *(
+            skill_id
+            for skill_id in SKILL_IDS
+            if skill_id
+            not in (SkillId.COLLECT_WOOD, SkillId.DRINK_WATER, SkillId.PLACE_TABLE)
+        ),
+    ]
+    response = json.dumps(
+        {
+            "progress_assessment": "Two wood, so the table can be placed.",
+            "selected_skill": SkillId.PLACE_TABLE.value,
+            "ranking": [skill_id.value for skill_id in ranking],
+        }
+    )
+
+    strict = parse_vlm_response(response, SKILL_IDS)
+    repaired = parse_vlm_response(response, SKILL_IDS, repair_ranking=True)
+
+    assert strict.error == "selected_skill_ranking_mismatch"
+    assert repaired.valid and repaired.repaired
+    assert repaired.selected_skill is SkillId.PLACE_TABLE
+    # The rest of the expressed order is kept below the selection.
+    assert repaired.ranking == (
+        SkillId.PLACE_TABLE,
+        *(skill_id for skill_id in ranking if skill_id is not SkillId.PLACE_TABLE),
+    )
+    assert repaired.utilities[SkillId.PLACE_TABLE] == 1.0
+
+    # Duplicates and a mismatch in one response are repaired together.
+    cycled = parse_vlm_response(
+        json.dumps(
+            {
+                "progress_assessment": "Wood is still required.",
+                "selected_skill": "place_table",
+                "ranking": ["collect_wood", "place_table", "collect_wood"],
+            }
+        ),
+        SKILL_IDS,
+        repair_ranking=True,
+    )
+    assert cycled.ranking[:2] == (SkillId.PLACE_TABLE, SkillId.COLLECT_WOOD)
+    assert sorted(cycled.ranking) == sorted(SKILL_IDS)
+
+
+def test_transformers_backend_decodes_greedily_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    response = _response(SkillId.COLLECT_WOOD)
+
+    class RecordingGenerator:
+        def __call__(self, prompt: Any, **kwargs: Any) -> str:
+            calls.append(kwargs)
+            return response
+
+        def batch(self, prompts: list[Any], **kwargs: Any) -> list[str]:
+            calls.append(kwargs)
+            return [response] * len(prompts)
+
+    def make_backend(config: VLMPlannerConfig) -> TransformersVLMBackend:
+        backend = TransformersVLMBackend(config)
+        monkeypatch.setattr(
+            backend, "_load", lambda: (None, object(), lambda *_: object())
+        )
+        monkeypatch.setattr(
+            backend, "_generator_for", lambda *_, **__: RecordingGenerator()
+        )
+        monkeypatch.setattr(vlm_module, "_planner_chat", lambda request: request)
+        return backend
+
+    request = VLMRequest(
+        image=np.zeros((4, 4, 3), dtype=np.uint8),
+        system_prompt="Plan.",
+        user_prompt="Choose a skill.",
+        candidate_skills=SKILL_IDS,
+    )
+    make_backend(VLMPlannerConfig()).generate(request)
+    make_backend(VLMPlannerConfig()).generate_batch([request, request])
+    make_backend(VLMPlannerConfig(do_sample=True)).generate(request)
+
+    assert [call["do_sample"] for call in calls] == [False, False, True]
 
 
 def test_scorer_repairs_by_default_and_shares_generations_across_parse_modes() -> (

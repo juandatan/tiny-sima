@@ -150,6 +150,12 @@ class VLMPlannerConfig:
     # many padded sequences share one forward pass before memory becomes the
     # binding constraint rather than latency.
     max_batch_size: int = 8
+    # Without an explicit choice, generate() falls back to the checkpoint's
+    # generation_config, and Qwen instruct checkpoints ship sampling defaults.
+    # Two runs of identical code on identical prefix states accepted 43 and 38
+    # of 48 boundaries, a swing as large as the gaps between conditions, so
+    # decoding is greedy unless sampling is asked for.
+    do_sample: bool = False
 
     def validate(self) -> Self:
         """Raise a helpful error for unsupported inference settings."""

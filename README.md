@@ -612,6 +612,19 @@ always lists `collect_wood` first, so a `vlm_shuffled_available` condition
 lists the available skills in a seeded order and is otherwise identical; the
 per-boundary table shows whether the error follows the position.
 
+A second prefix run on identical code and identical oracle states moved
+`vlm_only` from 43 to 38 accepted of 48. Decoding had never been set
+explicitly, so `generate` fell back to the checkpoint's sampling defaults, and
+a swing that size is as large as the gaps between conditions: shuffled order's
+44 against fixed order's 38 in that run says nothing while fixed order alone
+spans 38 to 43. Decoding is now greedy (`do_sample: false`). The same run had
+one response that selected `place_table` but ranked `collect_wood` first; both
+were acceptable, but a mismatch ended the closed-loop episode. Repair now
+moves the selection to the top of the ranking, since the schema decodes it
+first, and flags the response like a cycled ranking. Three of the 48
+boundaries have an oracle skill that is out of reach, so a grounded planner
+can accept at most 45.
+
 Measuring a prompt change is only useful if the loop is short, and generation
 dominates it. The controlled-prefix evaluation therefore advances every episode
 in lockstep, one boundary at a time, and decodes all of their decisions in one
@@ -813,8 +826,10 @@ Implemented:
   comparison.
 - Batched constrained generation across episodes at a shared boundary, with a
   sequential fallback for backends that do not support it.
-- Parse-time repair of rankings that repeat a skill, flagged per response so
-  strict-parse accuracy is reported from the same generations.
+- Parse-time repair of rankings that repeat a skill or that disagree with the
+  selected skill, flagged per response so strict-parse accuracy is reported
+  from the same generations.
+- Greedy decoding by default, so responses are a function of the prompt.
 - One oracle trajectory shared by every prefix-ablation condition.
 - Static notebook checks for parse errors, stale imports, and undefined names.
 
@@ -1124,5 +1139,16 @@ Critic affordances measured and retired on October 19, 2026:
   notebook 06's `full` preset now runs 64 closed-loop episodes, a standard
   error near 0.05 instead of 0.11. The closed-loop cell prints
   `planner_error_counts`, which says which validation ended an episode.
-- All 195 regular automated tests pass locally; the real-model VLM smoke test
+- Read the second prefix run. On identical states `vlm_only` accepted 38 of
+  48 boundaries against 43 in the first, because decoding fell back to the
+  checkpoint's sampling defaults. `VLMPlannerConfig.do_sample` now defaults to
+  false and is passed to every generation. Every avoidable fixed-order miss
+  in that run was `collect_wood` over `collect_stone` at the last boundary,
+  each time the first entry of the model's own `available_now`. Shuffled
+  order missed there twice in eight, once where stone was out of reach; the
+  greedy rerun has to confirm the difference.
+- Repaired a `selected_skill` the ranking does not put first, which was the one
+  invalid response left after the cycling repair and would have ended about
+  one closed-loop episode in six. Strict parsing still rejects it.
+- All 197 regular automated tests pass locally; the real-model VLM smoke test
   remains opt-in. Ruff and Pyright report no issues.

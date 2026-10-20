@@ -12,3 +12,6 @@ block_pixel_size: 16
 # 16-pixel-block frames fit alongside a 2B model; lower it if decoding runs out
 # of memory, raise it if the prefix ladder is latency bound.
 max_batch_size: 8
+# Greedy, so a boundary's response is a function of its prompt and conditions
+# differ by what they change rather than by sampling noise.
+do_sample: false

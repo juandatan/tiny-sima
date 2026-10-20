@@ -211,8 +211,14 @@ def parse_vlm_response(
     skills it just reported as available: 10 of 48 prefix boundaries, every
     one with a correct ``selected_skill``. Repair keeps each skill's first
     position and appends the omitted skills in catalog order, which leaves
-    the choice and the order the model did express untouched. The response is
-    flagged ``repaired`` so the strict result is still recoverable.
+    the choice and the order the model did express untouched.
+
+    Repair also resolves a ``selected_skill`` that the ranking does not put
+    first, by moving the selection to the top. The schema decodes the
+    selection before the ranking, so it is the earlier commitment, and in the
+    closed loop an invalid response ends the episode: one such response in 48
+    boundaries would end roughly one 12-decision episode in six. Either repair
+    flags the response ``repaired`` so the strict result is still recoverable.
     """
 
     payload = _json_object(response)
@@ -320,12 +326,20 @@ def parse_vlm_response(
             "ranking_not_a_permutation",
         )
 
+    if ranking and selected_skill is not None and selected_skill != ranking[0]:
+        if not repair_ranking:
+            return _invalid_vlm_response(
+                response,
+                "selected_skill_ranking_mismatch",
+            )
+        # Both fields are validated against the candidates by now, so the
+        # selection is in the ranking.
+        ranking = [
+            selected_skill,
+            *(skill_id for skill_id in ranking if skill_id != selected_skill),
+        ]
+        repaired = True
     ranking_tuple = tuple(ranking)
-    if ranking_tuple and selected_skill != ranking_tuple[0]:
-        return _invalid_vlm_response(
-            response,
-            "selected_skill_ranking_mismatch",
-        )
     utilities = {
         skill_id: _rank_utility(index)
         for index, skill_id in enumerate(ranking_tuple)
@@ -1053,6 +1067,7 @@ class TransformersVLMBackend:
         output = generator(
             _planner_chat(request),
             max_new_tokens=self.config.max_new_tokens,
+            do_sample=self.config.do_sample,
         )
         return _response_text(output)
 
@@ -1093,6 +1108,7 @@ class TransformersVLMBackend:
                 outputs = generator.batch(
                     [_planner_chat(requests[index]) for index in chunk],
                     max_new_tokens=self.config.max_new_tokens,
+                    do_sample=self.config.do_sample,
                 )
                 for index, output in zip(chunk, outputs, strict=True):
                     responses[index] = _response_text(output)
