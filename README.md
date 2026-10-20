@@ -622,8 +622,10 @@ logits processor, which allocates a guide per sequence - and decodes in chunks
 of `max_batch_size`. Each episode keeps its own rollout key, so lockstep visits
 exactly the states that sequential advancing would. Batching is optional at the
 backend boundary: `generate_all` falls back to one call at a time for any
-backend implementing only `generate`. The closed loop cannot batch this way,
-because each decision depends on where the previous skill left that episode.
+backend implementing only `generate`. The closed loop batches the same way:
+a decision depends only on its own episode's state and history, so
+`evaluate_chain_episodes` plans every running episode in one `select_many` call
+per decision index and runs the chosen skills together in one compiled loop.
 The oracle ignores the planner, so its rollout is collected once as a
 `PrefixTrajectory` and every condition is scored on it, and the frame renderer
 and the reachability search are compiled once rather than dispatched op by op
@@ -645,8 +647,12 @@ attributing executor failures to the planner.
 Fixed-plan learned-executor evaluations batch persistent worlds into one
 compiled JAX state machine. Completed environments are masked while each
 world tracks its current option, horizon, retries, and termination reason. The
-generic Python evaluator remains available for arbitrary planners and detailed
-per-decision traces.
+generic evaluator accepts arbitrary Python planners and keeps detailed
+per-decision traces. It advances episodes in lockstep between decisions, and
+`LearnedSkillExecutor.execute_many` runs each decision's options as one
+compiled loop, padded to the episode count so one compilation serves every
+decision. Each option splits its own key exactly as a lone option would, so
+lockstep results equal running the episodes one by one.
 
 Tasks:
 
@@ -660,7 +666,8 @@ Tasks:
 - Compare scripted, VLM-only, feasibility-only, and combined planners.
   **Nine-condition ladder implemented in notebook 06, including the retired
   critic control, the baseline prompt, and a position-bias control; first GPU
-  prefix run recorded, closed loop pending.**
+  prefix and closed-loop runs recorded. The closed loop predates the ranking
+  repair and is dominated by invalid output, so it needs a rerun.**
 
 ### Phase 5: Memory and visual grounding
 
@@ -1094,5 +1101,28 @@ Critic affordances measured and retired on October 19, 2026:
   `travel_distance_map` is compiled once per config instead of retracing its
   loop on every call, and `collect_prefix_trajectory` runs the scripted oracle
   once for the whole ladder rather than once per condition.
-- All 191 regular automated tests pass locally; the real-model VLM smoke test
+- Read the first closed loop, 16 episodes and run before the ranking repair.
+  Invalid planner output ended 13 of 16 episodes in every condition sharing the
+  available-first prompt, so those five conditions scored identically at 0.062
+  success after 20.8 environment steps. The scripted plan reached only 0.188,
+  and 12 of its 13 failure-limit endings were repeated `collect_wood`
+  timeouts, so the executor caps closed-loop success once the planner is
+  fixed. The baseline prompt's 0.375 is not distinguishable from the oracle at
+  this size (Fisher p = 0.43). The run took about 70 minutes, 45 seconds an
+  episode even for the oracle, which never calls the VLM.
+- Compiled the learned executor. `LearnedSkillExecutor.execute` stepped the
+  environment from Python, dispatching each Craftax operation separately and
+  reading four flags back per step; one 64-step option took 8.9 s on CPU and
+  now takes 13 ms after a 2.3 s compile. The compiled loop matches the
+  stepwise reference on outcome, step count, and final world state, and is
+  cached on the environment's class rather than its instance, so a fresh but
+  identical environment does not recompile.
+- Ran closed-loop episodes in lockstep. `evaluate_chain_episodes` plans every
+  running episode in one batched generation per decision index and executes
+  their skills together, with results equal to running them one by one. A
+  16-episode scripted closed loop takes 5.5 s on CPU and 64 episodes 10 s, so
+  notebook 06's `full` preset now runs 64 closed-loop episodes, a standard
+  error near 0.05 instead of 0.11. The closed-loop cell prints
+  `planner_error_counts`, which says which validation ended an episode.
+- All 195 regular automated tests pass locally; the real-model VLM smoke test
   remains opt-in. Ruff and Pyright report no issues.

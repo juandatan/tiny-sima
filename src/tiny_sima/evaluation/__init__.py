@@ -10,11 +10,13 @@ from tiny_sima.evaluation.affordance import (
 )
 from tiny_sima.evaluation.chains import (
     WOOD_TO_STONE_CHAIN,
+    BatchedSkillExecutor,
     ChainTermination,
     LearnedSkillExecutor,
     ScriptedSkillExecutor,
     SkillProbe,
     evaluate_chain_episode,
+    evaluate_chain_episodes,
     evaluate_learned_skill_chain_batched,
     evaluate_skill_chain,
     learned_skill_executor_from_checkpoint,
@@ -51,6 +53,7 @@ from tiny_sima.evaluation.vlm_smoke import VLMSmokeResult, run_vlm_smoke_test
 
 __all__ = [
     "AffordanceSample",
+    "BatchedSkillExecutor",
     "NvidiaSmiMonitor",
     "PlannerBoundaryTrace",
     "PrefixBoundary",
@@ -69,6 +72,7 @@ __all__ = [
     "evaluate_affordance_calibration",
     "evaluate_checkpoint",
     "evaluate_chain_episode",
+    "evaluate_chain_episodes",
     "evaluate_competence_prior",
     "evaluate_learned_skill_chain_batched",
     "evaluate_goal_conditioned_checkpoint",

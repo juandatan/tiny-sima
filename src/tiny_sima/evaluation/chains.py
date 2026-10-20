@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, NamedTuple, Protocol
+from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -56,6 +56,8 @@ from tiny_sima.goals import (
 )
 from tiny_sima.planner.saycan import (
     PlannerContext,
+    PlannerDecision,
+    PlannerSelection,
     PlannerSelectionStatus,
     SayCanPlanner,
     SequentialUtilityScorer,
@@ -443,48 +445,66 @@ class ScriptedSkillExecutor:
         )
 
 
-PolicyStep = Callable[
-    [jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
-    tuple[jax.Array, jax.Array],
-]
+@runtime_checkable
+class BatchedSkillExecutor(Protocol):
+    """An executor that runs several independent skill attempts at once."""
+
+    def execute_many(
+        self,
+        environment: SkillChainEnvironment,
+        states: Sequence[Any],
+        skill_ids: Sequence[SkillId],
+        rngs: Sequence[jax.Array],
+        *,
+        horizon: int,
+        batch_size: int | None = None,
+    ) -> list[SkillExecutionResult]:
+        """Attempt ``skill_ids[i]`` from ``states[i]`` with ``rngs[i]``."""
+
+        ...
+
+
+def _execute_many(
+    executor: SkillExecutor,
+    environment: SkillChainEnvironment,
+    states: Sequence[Any],
+    skill_ids: Sequence[SkillId],
+    rngs: Sequence[jax.Array],
+    *,
+    horizon: int,
+    batch_size: int | None = None,
+) -> list[SkillExecutionResult]:
+    """Run attempts together when the executor can, one by one otherwise."""
+
+    if isinstance(executor, BatchedSkillExecutor):
+        return executor.execute_many(
+            environment,
+            states,
+            skill_ids,
+            rngs,
+            horizon=horizon,
+            batch_size=batch_size,
+        )
+    return [
+        executor.execute(environment, state, skill_id, rng, horizon=horizon)
+        for state, skill_id, rng in zip(states, skill_ids, rngs, strict=True)
+    ]
 
 
 @dataclass(frozen=True)
 class LearnedSkillExecutor:
-    """Checkpoint-backed low-level policy used in persistent worlds."""
+    """Checkpoint-backed low-level policy used in persistent worlds.
+
+    Every attempt runs inside one compiled loop, so nothing returns to the
+    host until the option ends. Stepping the environment from Python instead
+    dispatched each Craftax operation separately and read four flags back per
+    step, which made a 64-step option cost seconds rather than milliseconds.
+    """
 
     params: Any
     config: SkillPPOConfig
     model: GoalConditionedActorCriticRNN
     deterministic: bool = True
-    _policy_step: PolicyStep | None = None
-
-    def __post_init__(self) -> None:
-        def policy_step(
-            hidden: jax.Array,
-            observation: jax.Array,
-            categorical_skill_id: jax.Array,
-            reset: jax.Array,
-            rng: jax.Array,
-        ) -> tuple[jax.Array, jax.Array]:
-            output = apply_goal_conditioned_actor_critic(
-                self.model,
-                self.params,
-                hidden,
-                (
-                    observation[None, None, ...],
-                    categorical_skill_id[None, None],
-                    reset[None, None],
-                ),
-            )
-            action = select_action(
-                output.logits[0],
-                rng,
-                deterministic=self.deterministic,
-            )
-            return output.hidden, action[0]
-
-        object.__setattr__(self, "_policy_step", jax.jit(policy_step))
 
     def execute(
         self,
@@ -495,62 +515,84 @@ class LearnedSkillExecutor:
         *,
         horizon: int,
     ) -> SkillExecutionResult:
-        skill_environment, episode_state = _start_skill(
+        return self.execute_many(
             environment,
-            state,
-            skill_id,
-            horizon,
-        )
-        if not bool(np.asarray(skill_precondition(skill_environment.goal, state))):
-            return SkillExecutionResult(
-                state=state,
-                outcome=SkillOutcome.INFEASIBLE,
-                steps=0,
-                skill_return=0.0,
-                native_return=0.0,
-            )
+            [state],
+            [skill_id],
+            [rng],
+            horizon=horizon,
+        )[0]
 
-        if self._policy_step is None:
-            raise RuntimeError("Learned executor policy step was not initialized.")
-        hidden = initial_hidden(1, self.config.hidden_size)
-        categorical_skill_id = jnp.asarray(skill_index(skill_id), dtype=jnp.int32)
-        skill_return = 0.0
-        native_return = 0.0
-        current = episode_state
-        step_keys = jax.random.split(rng, horizon * 2)
-        for step_index in range(horizon):
-            observation = environment.bundle.env.get_obs(current.env_state)
-            hidden, action = self._policy_step(
-                hidden,
-                observation,
-                categorical_skill_id,
-                jnp.asarray(step_index == 0),
-                step_keys[2 * step_index],
-            )
-            result = skill_environment.step(
-                step_keys[2 * step_index + 1],
-                current,
-                action,
-            )
-            current = result.state
-            skill_return += float(np.asarray(result.reward))
-            native_return += float(np.asarray(result.info["native_reward"]))
-            outcome = _outcome_from_step(result)
-            if outcome is not None:
-                return SkillExecutionResult(
-                    state=current.env_state,
-                    outcome=outcome,
-                    steps=step_index + 1,
-                    skill_return=skill_return,
-                    native_return=native_return,
-                )
-        return SkillExecutionResult(
-            state=current.env_state,
-            outcome=SkillOutcome.TIMEOUT,
-            steps=horizon,
-            skill_return=skill_return,
-            native_return=native_return,
+    def execute_many(
+        self,
+        environment: SkillChainEnvironment,
+        states: Sequence[Any],
+        skill_ids: Sequence[SkillId],
+        rngs: Sequence[jax.Array],
+        *,
+        horizon: int,
+        batch_size: int | None = None,
+    ) -> list[SkillExecutionResult]:
+        """Run independent attempts in parallel on device.
+
+        Each attempt draws from its own key exactly as a lone attempt would,
+        so batching changes how long the call takes, not what happens.
+        ``batch_size`` pads the call to a fixed shape: a caller whose batch
+        shrinks as episodes finish reuses one compiled loop instead of
+        compiling one per size.
+        """
+
+        count = len(states)
+        if len(skill_ids) != count or len(rngs) != count:
+            raise ValueError("states, skill_ids and rngs must have equal length.")
+        if count == 0:
+            return []
+        size = count if batch_size is None else batch_size
+        if size < count:
+            raise ValueError(f"batch_size {size} is smaller than {count} attempts.")
+        if horizon < 1:
+            raise ValueError("horizon must be positive.")
+
+        padding = size - count
+        run = _batched_skill_execution(
+            environment.bundle.env,
+            batch_size=size,
+            skill_horizon=horizon,
+            num_actions=environment.bundle.spec.num_actions,
+            hidden_size=self.config.hidden_size,
+            skill_embedding_size=self.config.skill_embedding_size,
+            deterministic=self.deterministic,
         )
+        output = run(
+            self.params,
+            environment.bundle.params,
+            _stack_host_states([*states, *[states[0]] * padding]),
+            jnp.asarray(
+                [skill_index(skill_id) for skill_id in skill_ids] + [0] * padding,
+                dtype=jnp.int32,
+            ),
+            jnp.asarray([True] * count + [False] * padding),
+            jnp.stack([*rngs, *[rngs[0]] * padding]),
+        )
+        # One transfer for the whole batch. The planner reads these states
+        # field by field, which costs nothing on host arrays.
+        output = jax.device_get(output)
+        return [
+            SkillExecutionResult(
+                state=jax.tree_util.tree_map(
+                    lambda leaf, index=index: leaf[index],
+                    output.state,
+                ),
+                outcome=_PROBE_OUTCOMES[int(output.outcome[index])],
+                steps=int(output.steps[index]),
+                skill_return=float(
+                    _PROBE_OUTCOMES[int(output.outcome[index])]
+                    is SkillOutcome.SUCCESS
+                ),
+                native_return=float(output.native_return[index]),
+            )
+            for index in range(count)
+        ]
 
 
 def make_learned_skill_executor(
@@ -1313,6 +1355,369 @@ def probe_skills_batched(
     )
 
 
+class BatchedExecutionCarry(NamedTuple):
+    """JAX state for executing one option per batch entry in lockstep."""
+
+    state: Any
+    observation: jax.Array
+    hidden: jax.Array
+    steps: jax.Array
+    finished: jax.Array
+    outcome: jax.Array
+    native_return: jax.Array
+
+
+class BatchedExecutionOutput(NamedTuple):
+    """Per-entry world state and diagnostics after one option."""
+
+    state: Any
+    outcome: jax.Array
+    steps: jax.Array
+    native_return: jax.Array
+
+
+BatchedExecution = Callable[
+    [Any, Any, Any, jax.Array, jax.Array, jax.Array],
+    BatchedExecutionOutput,
+]
+
+_BATCHED_EXECUTIONS: dict[tuple[Any, ...], BatchedExecution] = {}
+
+
+def _stack_host_states(states: Sequence[Any]) -> Any:
+    """Stack states on the host so every call sees the same leaf dtypes.
+
+    A freshly reset state carries weakly typed leaves and a state returned by
+    a previous call does not; passing both straight to ``jit`` would compile
+    the loop twice for one shape.
+    """
+
+    return jax.tree_util.tree_map(
+        lambda *leaves: np.stack([np.asarray(leaf) for leaf in leaves]),
+        *states,
+    )
+
+
+def _batched_skill_execution(
+    env: Any,
+    *,
+    batch_size: int,
+    skill_horizon: int,
+    num_actions: int,
+    hidden_size: int,
+    skill_embedding_size: int,
+    deterministic: bool,
+) -> BatchedExecution:
+    """Build and cache one compiled executor for a static batch shape.
+
+    The cache is keyed on the environment's class and static parameters
+    rather than on the instance, because evaluations build a fresh but
+    identical environment per call and each would otherwise recompile. Its
+    dynamic parameters are an argument, so a caller's settings are honoured.
+
+    Unlike :func:`_make_batched_skill_probe`, which shares one key across the
+    batch, entry ``i`` splits ``rngs[i]`` into a policy key and an
+    environment key per step, the schedule a lone attempt has always used.
+    """
+
+    key = (
+        type(env),
+        getattr(env, "static_env_params", None),
+        batch_size,
+        skill_horizon,
+        num_actions,
+        hidden_size,
+        skill_embedding_size,
+        deterministic,
+    )
+    cached = _BATCHED_EXECUTIONS.get(key)
+    if cached is not None:
+        return cached
+
+    model = make_goal_conditioned_actor_critic(
+        num_actions=num_actions,
+        num_skills=len(SKILL_IDS),
+        hidden_size=hidden_size,
+        skill_embedding_size=skill_embedding_size,
+    )
+    success_code = _PROBE_OUTCOMES.index(SkillOutcome.SUCCESS)
+    timeout_code = _PROBE_OUTCOMES.index(SkillOutcome.TIMEOUT)
+    precondition_lost_code = _PROBE_OUTCOMES.index(SkillOutcome.PRECONDITION_LOST)
+    terminated_code = _PROBE_OUTCOMES.index(SkillOutcome.ENVIRONMENT_TERMINATED)
+    infeasible_code = _PROBE_OUTCOMES.index(SkillOutcome.INFEASIBLE)
+
+    def sample_action(logits: jax.Array, rng: jax.Array) -> jax.Array:
+        return select_action(logits[None], rng, deterministic=deterministic)[0]
+
+    def execute(
+        params: Any,
+        env_params: Any,
+        states: Any,
+        skill_ids: jax.Array,
+        active: jax.Array,
+        rngs: jax.Array,
+    ) -> BatchedExecutionOutput:
+        step_keys = jax.vmap(
+            lambda rng: jax.random.split(rng, 2 * skill_horizon)
+        )(rngs)
+        runnable = active & _batched_skill_precondition(skill_ids, states)
+        initial_metric = _batched_skill_metric(skill_ids, states)
+        initial_carry = BatchedExecutionCarry(
+            state=states,
+            observation=jax.vmap(env.get_obs)(states),
+            hidden=initial_hidden(batch_size, hidden_size),
+            steps=jnp.zeros((batch_size,), dtype=jnp.int32),
+            finished=~runnable,
+            outcome=jnp.where(runnable, timeout_code, infeasible_code),
+            native_return=jnp.zeros((batch_size,), dtype=jnp.float32),
+        )
+
+        def continue_executing(
+            loop_state: tuple[jax.Array, BatchedExecutionCarry],
+        ) -> jax.Array:
+            iteration, carry = loop_state
+            return (iteration < skill_horizon) & ~jnp.all(carry.finished)
+
+        def step(
+            loop_state: tuple[jax.Array, BatchedExecutionCarry],
+        ) -> tuple[jax.Array, BatchedExecutionCarry]:
+            iteration, carry = loop_state
+            running = ~carry.finished
+            model_output = apply_goal_conditioned_actor_critic(
+                model,
+                params,
+                carry.hidden,
+                (
+                    carry.observation[None, ...],
+                    skill_ids[None, ...],
+                    (carry.steps == 0)[None, ...],
+                ),
+            )
+            action = jax.vmap(sample_action)(
+                model_output.logits[0],
+                step_keys[:, 2 * iteration],
+            )
+            action = jnp.where(running, action, Action.NOOP.value)
+            observation, stepped_state, native_reward, done, _ = jax.vmap(
+                env.step,
+                in_axes=(0, 0, 0, None),
+            )(step_keys[:, 2 * iteration + 1], carry.state, action, env_params)
+            state = _select_batched_state(running, stepped_state, carry.state)
+            observation = jnp.where(
+                running[:, None],
+                observation,
+                carry.observation,
+            )
+
+            steps = carry.steps + running.astype(jnp.int32)
+            metric = _batched_skill_metric(skill_ids, state)
+            success = running & (metric - initial_metric >= 1)
+            timeout = running & ~success & (steps >= skill_horizon)
+            terminated = running & ~success & done
+            ended = success | timeout | terminated
+            # Same ordering as the skill environment: a lost precondition is
+            # only reported once the option has ended for another reason.
+            precondition_lost = ended & ~success & ~_batched_skill_precondition(
+                skill_ids,
+                state,
+            )
+            outcome = jnp.where(timeout, timeout_code, terminated_code)
+            outcome = jnp.where(precondition_lost, precondition_lost_code, outcome)
+            outcome = jnp.where(success, success_code, outcome)
+
+            next_carry = BatchedExecutionCarry(
+                state=state,
+                observation=observation,
+                hidden=model_output.hidden,
+                steps=steps,
+                finished=carry.finished | ended,
+                outcome=jnp.where(ended, outcome, carry.outcome),
+                native_return=carry.native_return
+                + jnp.where(running, native_reward, 0.0),
+            )
+            return iteration + 1, next_carry
+
+        _, final_carry = jax.lax.while_loop(
+            continue_executing,
+            step,
+            (jnp.asarray(0, dtype=jnp.int32), initial_carry),
+        )
+        return BatchedExecutionOutput(
+            state=final_carry.state,
+            outcome=final_carry.outcome,
+            steps=final_carry.steps,
+            native_return=final_carry.native_return,
+        )
+
+    compiled = jax.jit(execute)
+    _BATCHED_EXECUTIONS[key] = compiled
+    return compiled
+
+
+@dataclass
+class _ChainCursor:
+    """One episode's progress while every episode advances in lockstep."""
+
+    state: Any
+    context: PlannerContext
+    rng: jax.Array
+    trace: list[ChainStepTrace]
+    environment_steps: int = 0
+    native_return: float = 0.0
+    termination: ChainTermination = ChainTermination.DECISION_LIMIT
+    planner_error: str | None = None
+    planner_raw_response: str | None = None
+    finished: bool = False
+
+
+def evaluate_chain_episodes(
+    planner: SayCanPlanner,
+    executor: SkillExecutor,
+    environment: SkillChainEnvironment,
+    rngs: Sequence[jax.Array],
+    *,
+    chain: SkillChainSpec = WOOD_TO_STONE_CHAIN,
+    skill_horizon: int = 64,
+    max_decisions: int = 12,
+    max_failures_per_skill: int = 2,
+) -> list[ChainEpisodeResult]:
+    """Run independent planner/executor episodes in lockstep by decision.
+
+    A decision depends only on its own episode's state and history, so at
+    each decision index every unfinished episode is planned in one
+    :meth:`SayCanPlanner.select_many` call, which a batched utility model
+    decodes together, and its skills run in one
+    :meth:`LearnedSkillExecutor.execute_many` call. Each episode keeps its
+    own key, so the results are those of running the episodes one by one.
+    """
+
+    cursors: list[_ChainCursor] = []
+    for rng in rngs:
+        reset_rng, episode_rng = jax.random.split(rng)
+        cursors.append(
+            _ChainCursor(
+                state=environment.reset(reset_rng).state,
+                context=PlannerContext(objective=chain.objective),
+                rng=episode_rng,
+                trace=[],
+            )
+        )
+
+    for decision_index in range(max_decisions):
+        for cursor in cursors:
+            if not cursor.finished and chain.is_complete(cursor.state):
+                cursor.termination = ChainTermination.SUCCESS
+                cursor.finished = True
+        deciding = [cursor for cursor in cursors if not cursor.finished]
+        if not deciding:
+            break
+        selections = planner.select_many(
+            [cursor.state for cursor in deciding],
+            [cursor.context for cursor in deciding],
+        )
+
+        executing: list[
+            tuple[_ChainCursor, PlannerSelection, PlannerDecision, jax.Array]
+        ] = []
+        for cursor, selection in zip(deciding, selections, strict=True):
+            decision = selection.decision
+            if decision is None:
+                cursor.planner_error = selection.utility_error
+                cursor.planner_raw_response = selection.utility_raw_response
+                cursor.termination = (
+                    ChainTermination.INVALID_PLANNER_OUTPUT
+                    if selection.status is PlannerSelectionStatus.INVALID_UTILITY
+                    else ChainTermination.NO_VIABLE_SKILL
+                )
+                cursor.finished = True
+                continue
+            cursor.rng, execution_rng = jax.random.split(cursor.rng)
+            executing.append((cursor, selection, decision, execution_rng))
+        if not executing:
+            continue
+
+        results = _execute_many(
+            executor,
+            environment,
+            [cursor.state for cursor, _, _, _ in executing],
+            [decision.skill_id for _, _, decision, _ in executing],
+            [execution_rng for _, _, _, execution_rng in executing],
+            horizon=skill_horizon,
+            # Padded to the episode count so one compiled loop serves every
+            # decision, however many episodes are still running.
+            batch_size=len(cursors),
+        )
+        for (cursor, selection, decision, _), result in zip(
+            executing,
+            results,
+            strict=True,
+        ):
+            selected_score = next(
+                score
+                for score in decision.scores
+                if score.skill_id is decision.skill_id
+            )
+            cursor.trace.append(
+                ChainStepTrace(
+                    decision_index=decision_index,
+                    requested_skill=decision.skill_id,
+                    outcome=result.outcome,
+                    steps=result.steps,
+                    native_return=result.native_return,
+                    utility=selected_score.utility,
+                    feasibility=selected_score.feasibility,
+                    combined_score=selected_score.combined,
+                    candidate_scores=decision.scores,
+                    planner_ranking=selection.utility_ranking,
+                    planner_raw_response=selection.utility_raw_response,
+                )
+            )
+            cursor.state = result.state
+            cursor.environment_steps += result.steps
+            cursor.native_return += result.native_return
+            cursor.context = PlannerContext(
+                objective=cursor.context.objective,
+                history=(
+                    *cursor.context.history,
+                    SkillAttempt(
+                        skill_id=decision.skill_id,
+                        outcome=result.outcome,
+                        steps=result.steps,
+                        native_return=result.native_return,
+                    ),
+                ),
+            )
+            failures = sum(
+                item.skill_id is decision.skill_id and not item.succeeded
+                for item in cursor.context.history
+            )
+            if failures >= max_failures_per_skill:
+                cursor.termination = ChainTermination.FAILURE_LIMIT
+                cursor.finished = True
+
+    episodes: list[ChainEpisodeResult] = []
+    for cursor in cursors:
+        succeeded = chain.is_complete(cursor.state)
+        episodes.append(
+            ChainEpisodeResult(
+                succeeded=succeeded,
+                completed_skills=sum(
+                    attempt.succeeded for attempt in cursor.context.history
+                ),
+                decisions=len(cursor.trace),
+                environment_steps=cursor.environment_steps,
+                native_return=cursor.native_return,
+                termination=(
+                    ChainTermination.SUCCESS if succeeded else cursor.termination
+                ),
+                planner_error=cursor.planner_error,
+                planner_raw_response=cursor.planner_raw_response,
+                trace=tuple(cursor.trace),
+            )
+        )
+    return episodes
+
+
 def evaluate_chain_episode(
     planner: SayCanPlanner,
     executor: SkillExecutor,
@@ -1326,95 +1731,16 @@ def evaluate_chain_episode(
 ) -> ChainEpisodeResult:
     """Run one event-driven planner/executor episode without state resets."""
 
-    reset_rng, episode_rng = jax.random.split(rng)
-    reset = environment.reset(reset_rng)
-    state = reset.state
-    context = PlannerContext(objective=chain.objective)
-    trace: list[ChainStepTrace] = []
-    environment_steps = 0
-    native_return = 0.0
-    termination = ChainTermination.DECISION_LIMIT
-    planner_error: str | None = None
-    planner_raw_response: str | None = None
-
-    for decision_index in range(max_decisions):
-        if chain.is_complete(state):
-            termination = ChainTermination.SUCCESS
-            break
-        selection = planner.select_with_diagnostics(state, context)
-        decision = selection.decision
-        if decision is None:
-            planner_error = selection.utility_error
-            planner_raw_response = selection.utility_raw_response
-            termination = (
-                ChainTermination.INVALID_PLANNER_OUTPUT
-                if selection.status is PlannerSelectionStatus.INVALID_UTILITY
-                else ChainTermination.NO_VIABLE_SKILL
-            )
-            break
-        episode_rng, execution_rng = jax.random.split(episode_rng)
-        result = executor.execute(
-            environment,
-            state,
-            decision.skill_id,
-            execution_rng,
-            horizon=skill_horizon,
-        )
-        selected_score = next(
-            score
-            for score in decision.scores
-            if score.skill_id is decision.skill_id
-        )
-        trace.append(
-            ChainStepTrace(
-                decision_index=decision_index,
-                requested_skill=decision.skill_id,
-                outcome=result.outcome,
-                steps=result.steps,
-                native_return=result.native_return,
-                utility=selected_score.utility,
-                feasibility=selected_score.feasibility,
-                combined_score=selected_score.combined,
-                candidate_scores=decision.scores,
-                planner_ranking=selection.utility_ranking,
-                planner_raw_response=selection.utility_raw_response,
-            )
-        )
-        state = result.state
-        environment_steps += result.steps
-        native_return += result.native_return
-        attempt = SkillAttempt(
-            skill_id=decision.skill_id,
-            outcome=result.outcome,
-            steps=result.steps,
-            native_return=result.native_return,
-        )
-        context = PlannerContext(
-            objective=context.objective,
-            history=(*context.history, attempt),
-        )
-        failures = sum(
-            item.skill_id is decision.skill_id and not item.succeeded
-            for item in context.history
-        )
-        if failures >= max_failures_per_skill:
-            termination = ChainTermination.FAILURE_LIMIT
-            break
-
-    succeeded = chain.is_complete(state)
-    if succeeded:
-        termination = ChainTermination.SUCCESS
-    return ChainEpisodeResult(
-        succeeded=succeeded,
-        completed_skills=sum(attempt.succeeded for attempt in context.history),
-        decisions=len(trace),
-        environment_steps=environment_steps,
-        native_return=native_return,
-        termination=termination,
-        planner_error=planner_error,
-        planner_raw_response=planner_raw_response,
-        trace=tuple(trace),
-    )
+    return evaluate_chain_episodes(
+        planner,
+        executor,
+        environment,
+        [rng],
+        chain=chain,
+        skill_horizon=skill_horizon,
+        max_decisions=max_decisions,
+        max_failures_per_skill=max_failures_per_skill,
+    )[0]
 
 
 def evaluate_skill_chain(
@@ -1440,19 +1766,16 @@ def evaluate_skill_chain(
         distractor_count=distractor_count,
     )
     episode_keys = jax.random.split(jax.random.PRNGKey(seed), num_episodes)
-    episodes = [
-        evaluate_chain_episode(
-            active_planner,
-            executor,
-            environment,
-            episode_key,
-            chain=chain,
-            skill_horizon=skill_horizon,
-            max_decisions=max_decisions,
-            max_failures_per_skill=max_failures_per_skill,
-        )
-        for episode_key in episode_keys
-    ]
+    episodes = evaluate_chain_episodes(
+        active_planner,
+        executor,
+        environment,
+        list(episode_keys),
+        chain=chain,
+        skill_horizon=skill_horizon,
+        max_decisions=max_decisions,
+        max_failures_per_skill=max_failures_per_skill,
+    )
     successes = np.asarray([episode.succeeded for episode in episodes])
     termination_counts = {
         termination.value: sum(

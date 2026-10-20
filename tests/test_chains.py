@@ -1,33 +1,47 @@
+import dataclasses
+from collections.abc import Sequence
 from typing import Any
 
 import jax
 import jax.numpy as jnp
-from craftax.craftax_classic.constants import BlockType
+import numpy as np
+import pytest
+from craftax.craftax_classic.constants import Action, BlockType
 
 from tiny_sima.config import SkillPPOConfig
-from tiny_sima.envs.chains import make_skill_chain_environment
+from tiny_sima.envs.chains import SkillChainEnvironment, make_skill_chain_environment
 from tiny_sima.evaluation.chains import (
+    _BATCHED_EXECUTIONS,
     WOOD_TO_STONE_CHAIN,
     ChainTermination,
     LearnedSkillExecutor,
     ScriptedSkillExecutor,
     SkillChainSpec,
+    SkillExecutionResult,
     _make_batched_skill_probe,
+    _outcome_from_step,
     _record_skill_failures,
+    _start_skill,
+    evaluate_chain_episode,
+    evaluate_chain_episodes,
     evaluate_learned_skill_chain_batched,
     evaluate_skill_chain,
     probe_skills_batched,
 )
 from tiny_sima.executor.model import (
+    apply_goal_conditioned_actor_critic,
+    initial_hidden,
     initialize_goal_conditioned_parameters,
     make_goal_conditioned_actor_critic,
+    select_action,
 )
-from tiny_sima.goals import SKILL_IDS, SkillId
+from tiny_sima.goals import SKILL_IDS, SkillId, skill_index, skill_precondition
 from tiny_sima.planner.saycan import (
     PlannerContext,
     SayCanPlanner,
     SequentialUtilityScorer,
     SkillOutcome,
+    UtilityScoreBatch,
 )
 
 
@@ -59,6 +73,124 @@ def _make_random_learned_executor() -> LearnedSkillExecutor:
         config=config,
         model=model,
     )
+
+
+def _execute_stepwise(
+    executor: LearnedSkillExecutor,
+    environment: SkillChainEnvironment,
+    state: Any,
+    skill_id: SkillId,
+    rng: jax.Array,
+    *,
+    horizon: int,
+) -> SkillExecutionResult:
+    """The executor as it was before compilation, kept as the reference.
+
+    It steps the skill environment from Python and reads every outcome flag
+    back to the host, which is slow but leaves no doubt about the semantics.
+    """
+
+    skill_environment, current = _start_skill(environment, state, skill_id, horizon)
+    if not bool(np.asarray(skill_precondition(skill_environment.goal, state))):
+        return SkillExecutionResult(
+            state=state,
+            outcome=SkillOutcome.INFEASIBLE,
+            steps=0,
+            skill_return=0.0,
+            native_return=0.0,
+        )
+    hidden = initial_hidden(1, executor.config.hidden_size)
+    categorical_skill_id = jnp.asarray(skill_index(skill_id), dtype=jnp.int32)
+    skill_return = 0.0
+    native_return = 0.0
+    step_keys = jax.random.split(rng, horizon * 2)
+    for step_index in range(horizon):
+        output = apply_goal_conditioned_actor_critic(
+            executor.model,
+            executor.params,
+            hidden,
+            (
+                environment.bundle.env.get_obs(current.env_state)[None, None],
+                categorical_skill_id[None, None],
+                jnp.asarray(step_index == 0)[None, None],
+            ),
+        )
+        hidden = output.hidden
+        action = select_action(
+            output.logits[0],
+            step_keys[2 * step_index],
+            deterministic=executor.deterministic,
+        )[0]
+        result = skill_environment.step(
+            step_keys[2 * step_index + 1],
+            current,
+            action,
+        )
+        current = result.state
+        skill_return += float(np.asarray(result.reward))
+        native_return += float(np.asarray(result.info["native_reward"]))
+        outcome = _outcome_from_step(result)
+        if outcome is not None:
+            return SkillExecutionResult(
+                state=current.env_state,
+                outcome=outcome,
+                steps=step_index + 1,
+                skill_return=skill_return,
+                native_return=native_return,
+            )
+    return SkillExecutionResult(
+        state=current.env_state,
+        outcome=SkillOutcome.TIMEOUT,
+        steps=horizon,
+        skill_return=skill_return,
+        native_return=native_return,
+    )
+
+
+def _assert_same_execution(
+    actual: SkillExecutionResult,
+    expected: SkillExecutionResult,
+) -> None:
+    assert actual.outcome is expected.outcome
+    assert actual.steps == expected.steps
+    assert actual.skill_return == expected.skill_return
+    assert actual.native_return == pytest.approx(expected.native_return, abs=1e-5)
+    actual_leaves = jax.tree_util.tree_leaves(actual.state)
+    expected_leaves = jax.tree_util.tree_leaves(expected.state)
+    assert len(actual_leaves) == len(expected_leaves)
+    for actual_leaf, expected_leaf in zip(
+        actual_leaves,
+        expected_leaves,
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            np.asarray(actual_leaf),
+            np.asarray(expected_leaf),
+            rtol=0,
+            atol=1e-6,
+        )
+
+
+def _beside_a_table(environment: SkillChainEnvironment, seed: int) -> Any:
+    """Return a fresh world with a table beside the player and one wood."""
+
+    state = environment.reset(jax.random.PRNGKey(seed)).state
+    row, column = (int(value) for value in np.asarray(state.player_position))
+    return state.replace(
+        map=jnp.asarray(state.map)
+        .at[row, column + 1]
+        .set(BlockType.CRAFTING_TABLE.value),
+        inventory=state.inventory.replace(wood=1),
+    )
+
+
+def _craft_biased(executor: LearnedSkillExecutor) -> LearnedSkillExecutor:
+    """Tilt a random policy toward crafting so a success is near certain."""
+
+    params = jax.tree_util.tree_map(lambda leaf: leaf, executor.params)
+    logits = params["params"]["actor_logits"]
+    logits["bias"] = logits["bias"].at[Action.MAKE_WOOD_PICKAXE.value].add(4.0)
+    return dataclasses.replace(executor, params=params, deterministic=False)
 
 
 def _always_complete(_state: Any) -> bool:
@@ -349,3 +481,189 @@ def test_batched_probe_compiles_once_per_batch_shape() -> None:
     info = _make_batched_skill_probe.cache_info()
     assert info.misses == 1
     assert info.hits == 1
+
+
+def test_compiled_executor_matches_the_stepwise_executor() -> None:
+    executor = _craft_biased(_make_random_learned_executor())
+    environment = make_skill_chain_environment()
+    # A fresh world makes stone and crafting infeasible. Beside a table,
+    # the tilted policy crafts within a few steps, which covers success.
+    states = [
+        environment.reset(jax.random.PRNGKey(0)).state,
+        _beside_a_table(environment, seed=1),
+    ]
+    pairs = [(state, skill_id) for state in states for skill_id in SKILL_IDS]
+    keys = list(jax.random.split(jax.random.PRNGKey(5), len(pairs)))
+
+    expected = [
+        _execute_stepwise(executor, environment, state, skill_id, key, horizon=24)
+        for (state, skill_id), key in zip(pairs, keys, strict=True)
+    ]
+    single = [
+        executor.execute(environment, state, skill_id, key, horizon=24)
+        for (state, skill_id), key in zip(pairs, keys, strict=True)
+    ]
+    # Padding past the number of attempts must not leak into real entries.
+    batched = executor.execute_many(
+        environment,
+        [state for state, _ in pairs],
+        [skill_id for _, skill_id in pairs],
+        keys,
+        horizon=24,
+        batch_size=len(pairs) + 3,
+    )
+
+    for actual_single, actual_batched, reference in zip(
+        single,
+        batched,
+        expected,
+        strict=True,
+    ):
+        _assert_same_execution(actual_single, reference)
+        _assert_same_execution(actual_batched, reference)
+    outcomes = {result.outcome for result in expected}
+    assert {
+        SkillOutcome.SUCCESS,
+        SkillOutcome.TIMEOUT,
+        SkillOutcome.INFEASIBLE,
+    } <= outcomes
+
+
+def test_compiled_executor_compiles_once_across_environments() -> None:
+    executor = _make_random_learned_executor()
+    first = make_skill_chain_environment()
+    second = make_skill_chain_environment()
+    fresh = [first.reset(jax.random.PRNGKey(seed)).state for seed in range(3)]
+
+    _BATCHED_EXECUTIONS.clear()
+    results = executor.execute_many(
+        first,
+        fresh,
+        [SkillId.COLLECT_WOOD] * 3,
+        list(jax.random.split(jax.random.PRNGKey(0), 3)),
+        horizon=2,
+        batch_size=4,
+    )
+    # A new but identical environment, fewer attempts, and states that came
+    # back from the device all reuse the loop compiled for the first call.
+    executor.execute_many(
+        second,
+        [result.state for result in results[:2]],
+        [SkillId.DRINK_WATER] * 2,
+        list(jax.random.split(jax.random.PRNGKey(1), 2)),
+        horizon=2,
+        batch_size=4,
+    )
+
+    assert len(_BATCHED_EXECUTIONS) == 1
+    (compiled,) = _BATCHED_EXECUTIONS.values()
+    assert compiled._cache_size() == 1  # type: ignore[attr-defined]
+
+
+@dataclasses.dataclass
+class _RecordingSequentialScorer:
+    """The scripted reference plan, answered in batches it records."""
+
+    reference_skills: tuple[SkillId, ...]
+    batch_sizes: list[int] = dataclasses.field(default_factory=list)
+
+    def __call__(
+        self,
+        state: Any,
+        context: PlannerContext,
+        skill_id: SkillId,
+    ) -> float:
+        return SequentialUtilityScorer(self.reference_skills)(
+            state,
+            context,
+            skill_id,
+        )
+
+    def score_all_batched(
+        self,
+        states: Sequence[Any],
+        contexts: Sequence[PlannerContext],
+        candidate_skills: tuple[SkillId, ...],
+    ) -> list[UtilityScoreBatch]:
+        self.batch_sizes.append(len(states))
+        return [
+            UtilityScoreBatch(
+                utilities={
+                    skill_id: self(state, context, skill_id)
+                    for skill_id in candidate_skills
+                }
+            )
+            for state, context in zip(states, contexts, strict=True)
+        ]
+
+
+def _facing_left(state: Any) -> bool:
+    return int(np.asarray(state.player_direction)) == Action.LEFT.value
+
+
+def test_lockstep_episodes_match_running_them_one_by_one() -> None:
+    executor = _craft_biased(_make_random_learned_executor())
+    environment = make_skill_chain_environment()
+    # Worlds that start facing left count as complete at once, so episodes
+    # finish at different decisions and the lockstep loop must skip them.
+    chain = WOOD_TO_STONE_CHAIN._replace(is_complete=_facing_left)
+    keys = list(jax.random.split(jax.random.PRNGKey(4), 6))
+    settings = {
+        "chain": chain,
+        "skill_horizon": 6,
+        "max_decisions": 3,
+        "max_failures_per_skill": 2,
+    }
+
+    def planner() -> SayCanPlanner:
+        return SayCanPlanner(
+            utility_scorer=_RecordingSequentialScorer(chain.reference_skills)
+        )
+
+    lockstep = evaluate_chain_episodes(
+        planner(),
+        executor,
+        environment,
+        keys,
+        **settings,
+    )
+    one_by_one = [
+        evaluate_chain_episode(planner(), executor, environment, key, **settings)
+        for key in keys
+    ]
+
+    for actual, expected in zip(lockstep, one_by_one, strict=True):
+        assert actual.succeeded == expected.succeeded
+        assert actual.termination is expected.termination
+        assert actual.decisions == expected.decisions
+        assert actual.environment_steps == expected.environment_steps
+        assert actual.native_return == pytest.approx(expected.native_return)
+        assert [
+            (trace.requested_skill, trace.outcome, trace.steps)
+            for trace in actual.trace
+        ] == [
+            (trace.requested_skill, trace.outcome, trace.steps)
+            for trace in expected.trace
+        ]
+    decisions = {episode.decisions for episode in lockstep}
+    assert min(decisions) == 0
+    assert max(decisions) > 0
+
+
+def test_lockstep_plans_every_running_episode_in_one_call() -> None:
+    scorer = _RecordingSequentialScorer(WOOD_TO_STONE_CHAIN.reference_skills)
+    result = evaluate_skill_chain(
+        _make_random_learned_executor(),
+        planner=SayCanPlanner(utility_scorer=scorer),
+        num_episodes=4,
+        seed=0,
+        skill_horizon=2,
+        max_decisions=3,
+    )
+
+    # One planner call per decision index, never one per episode.
+    decisions = [episode.decisions for episode in result["episodes"]]
+    assert scorer.batch_sizes[0] == 4
+    assert len(scorer.batch_sizes) == max(decisions)
+    assert scorer.batch_sizes == sorted(scorer.batch_sizes, reverse=True)
+    assert sum(scorer.batch_sizes) == sum(decisions)
