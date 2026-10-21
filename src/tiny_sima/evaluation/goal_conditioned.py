@@ -14,6 +14,7 @@ from craftax.craftax_classic.constants import Action
 
 from tiny_sima.config import SkillPPOConfig, load_skill_config
 from tiny_sima.envs.skills import (
+    ScenarioRandomization,
     SkillEpisodeState,
     SkillScenario,
     make_skill_environment,
@@ -328,6 +329,7 @@ def evaluate_goal_conditioned_skill(
     min_distance: int = 2,
     max_distance: int = 4,
     distractor_count: int = 6,
+    randomization: ScenarioRandomization | None = None,
 ) -> dict[str, Any]:
     """Evaluate one requested skill over independently generated scenarios."""
 
@@ -343,6 +345,7 @@ def evaluate_goal_conditioned_skill(
         min_distance=min_distance,
         max_distance=max_distance,
         distractor_count=distractor_count,
+        randomization=randomization,
     )
     model = make_goal_conditioned_actor_critic(
         num_actions=environment.bundle.spec.num_actions,
@@ -432,6 +435,11 @@ def evaluate_goal_conditioned_skill(
         "min_distance": environment.scenario.min_distance,
         "max_distance": environment.scenario.max_distance,
         "distractor_count": environment.scenario.distractor_count,
+        "randomization": (
+            None
+            if environment.scenario.randomization is None
+            else environment.scenario.randomization.to_dict()
+        ),
         "seed": seed,
         "deterministic": deterministic,
         "success_rate": float(succeeded.mean()),
@@ -455,6 +463,7 @@ def evaluate_goal_conditioned_policy(
     min_distance: int = 2,
     max_distance: int = 4,
     distractor_count: int = 6,
+    randomization: ScenarioRandomization | None = None,
 ) -> list[dict[str, Any]]:
     """Evaluate every requested skill independently."""
 
@@ -472,6 +481,7 @@ def evaluate_goal_conditioned_policy(
             min_distance=min_distance,
             max_distance=max_distance,
             distractor_count=distractor_count,
+            randomization=randomization,
         )
         for index, skill_id in enumerate(scenario_skills)
     ]
@@ -488,6 +498,7 @@ def evaluate_goal_conditioned_checkpoint(
     min_distance: int = 2,
     max_distance: int = 4,
     distractor_count: int = 6,
+    randomization: ScenarioRandomization | None = None,
 ) -> list[dict[str, Any]]:
     """Load and evaluate a saved goal-conditioned executor."""
 
@@ -503,6 +514,7 @@ def evaluate_goal_conditioned_checkpoint(
         min_distance=min_distance,
         max_distance=max_distance,
         distractor_count=distractor_count,
+        randomization=randomization,
     )
 
 

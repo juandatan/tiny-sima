@@ -54,9 +54,11 @@ def scripted_skill_action(
     """Return a shortest-path action for a controlled skill scenario."""
 
     skill_id = environment.goal.skill_id
-    if (
-        environment.scenario.kind is SkillScenario.LOCAL_NAVIGATION
-    ):
+    if environment.scenario.kind is SkillScenario.RANDOMIZED:
+        # Obstacles may block the straight route this policy walks; the
+        # breadth-first policy in tiny_sima.evaluation.chains handles them.
+        raise ValueError("The scripted skill policy does not support randomized.")
+    if environment.scenario.kind is SkillScenario.LOCAL_NAVIGATION:
         player_position = state.env_state.player_position
         row_delta = state.approach_position[..., 0] - player_position[..., 0]
         column_delta = state.approach_position[..., 1] - player_position[..., 1]

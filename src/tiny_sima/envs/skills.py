@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -14,12 +14,18 @@ from craftax.craftax_classic.constants import (
     Action,
     BlockType,
 )
-from craftax.craftax_classic.envs.craftax_state import Inventory
+from craftax.craftax_classic.envs.craftax_state import EnvParams, Inventory
+from craftax.craftax_classic.game_logic import calculate_light_level
 
 from tiny_sima.envs.craftax import (
     CraftaxBundle,
     EnvironmentSpec,
     make_environment,
+)
+from tiny_sima.goals.reachability import (
+    DEFAULT_REACHABILITY,
+    interaction_distance,
+    walkable_mask,
 )
 from tiny_sima.goals.skills import (
     SKILL_IDS,
@@ -31,6 +37,9 @@ from tiny_sima.goals.skills import (
     skill_progress_from_metric,
     skill_success_from_metric,
 )
+
+if TYPE_CHECKING:
+    from tiny_sima.config import SkillPPOConfig
 
 
 class SkillEpisodeState(NamedTuple):
@@ -94,16 +103,73 @@ class SkillScenario(str, Enum):
 
     NEARBY = "nearby"
     LOCAL_NAVIGATION = "local_navigation"
+    RANDOMIZED = "randomized"
+
+
+@dataclass(frozen=True)
+class ScenarioRandomization:
+    """Knobs that widen local navigation toward the worlds a chain hands over.
+
+    ``local_navigation`` starts every episode at the map centre in a cleared
+    window, with one target, a reserved straight route, the minimal inventory
+    and the clock at dawn. A chain boundary differs in each of those ways, and
+    each knob below undoes one of them, so any one can be switched off as an
+    ablation. The defaults are the full randomized distribution. Every world
+    stays solvable: a target the in-view search cannot reach inside the horizon
+    gets its L-route cleared, and ``place_table`` always keeps a free neighbour.
+    """
+
+    # Obstacles may land on the shortest route, so reaching a target can need
+    # a detour, as it does once a chain has filled the window.
+    reserve_route: bool = False
+    # Further copies of a collect or drink target, as the chain's three trees.
+    extra_target_count: int = 2
+    # Chance of a crafting table in view for skills that do not use one, as
+    # after place_table.
+    table_probability: float = 0.5
+    # The player stands up to this many tiles from the map centre on each
+    # axis, so the view can include terrain the window clearing missed.
+    max_player_offset: int = 3
+    # Chance of clearing the window around the map centre at all; otherwise
+    # the target sits in natural terrain.
+    clear_probability: float = 0.5
+    # Wood, saplings, stone and wood tools beyond the skill's minimum.
+    random_inventory: bool = True
+    # Health, food, drink and energy anywhere from three to nine.
+    random_vitals: bool = True
+    # The clock starts anywhere up to this step, so light_level, which the
+    # symbolic observation carries, covers dusk and night as well as dawn.
+    max_start_timestep: int = 300
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.extra_target_count <= 8:
+            raise ValueError("extra_target_count must be between 0 and 8.")
+        if not 0.0 <= self.table_probability <= 1.0:
+            raise ValueError("table_probability must lie in [0, 1].")
+        if not 0 <= self.max_player_offset <= 8:
+            raise ValueError("max_player_offset must be between 0 and 8.")
+        if not 0.0 <= self.clear_probability <= 1.0:
+            raise ValueError("clear_probability must lie in [0, 1].")
+        if self.max_start_timestep < 0:
+            raise ValueError("max_start_timestep cannot be negative.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True, init=False)
 class SkillScenarioConfig:
-    """Static controls for reproducible skill-scenario generation."""
+    """Static controls for reproducible skill-scenario generation.
+
+    ``randomization`` applies only to the randomized kind, which defaults to
+    the full :class:`ScenarioRandomization`.
+    """
 
     kind: SkillScenario
     min_distance: int
     max_distance: int
     distractor_count: int
+    randomization: ScenarioRandomization | None
 
     def __init__(
         self,
@@ -112,8 +178,13 @@ class SkillScenarioConfig:
         min_distance: int = 2,
         max_distance: int = 4,
         distractor_count: int = 6,
+        randomization: ScenarioRandomization | None = None,
     ) -> None:
         normalized_kind = SkillScenario(kind)
+        if normalized_kind is SkillScenario.RANDOMIZED:
+            randomization = randomization or ScenarioRandomization()
+        elif randomization is not None:
+            raise ValueError("randomization applies only to the randomized kind.")
         if min_distance < 1:
             raise ValueError("min_distance must be positive.")
         if max_distance < min_distance:
@@ -131,6 +202,13 @@ class SkillScenarioConfig:
         object.__setattr__(self, "min_distance", min_distance)
         object.__setattr__(self, "max_distance", max_distance)
         object.__setattr__(self, "distractor_count", distractor_count)
+        object.__setattr__(self, "randomization", randomization)
+
+    @property
+    def max_start_timestep(self) -> int:
+        if self.randomization is None:
+            return 0
+        return self.randomization.max_start_timestep
 
 
 @dataclass(frozen=True)
@@ -470,6 +548,274 @@ def _prepare_local_navigation_scenario(
     )
 
 
+_RESOURCE_SKILLS = frozenset(
+    {SkillId.COLLECT_WOOD, SkillId.COLLECT_STONE, SkillId.DRINK_WATER}
+)
+_TABLE_SKILLS = frozenset({SkillId.CRAFT_WOOD_PICKAXE, SkillId.CRAFT_WOOD_SWORD})
+_DEFAULT_PARAMS = EnvParams()
+
+
+def _randomized_distractor_blocks(target: BlockType | None) -> jax.Array:
+    candidates = (
+        BlockType.TREE,
+        BlockType.STONE,
+        BlockType.WATER,
+        BlockType.COAL,
+        BlockType.SAND,
+        BlockType.FURNACE,
+        BlockType.PLANT,
+    )
+    return jnp.asarray(
+        [block.value for block in candidates if block is not target],
+        dtype=jnp.int32,
+    )
+
+
+def _view_offsets() -> jax.Array:
+    row_radius = OBS_DIM[0] // 2
+    column_radius = OBS_DIM[1] // 2
+    return jnp.asarray(
+        [
+            (row, column)
+            for row in range(-row_radius, row_radius + 1)
+            for column in range(-column_radius, column_radius + 1)
+            if row != 0 or column != 0
+        ],
+        dtype=jnp.int32,
+    )
+
+
+def _route_mask(
+    shape: tuple[int, ...],
+    start: jax.Array,
+    stop: jax.Array,
+) -> jax.Array:
+    """Return the L-route from ``start`` down or up to ``stop``'s row, then across."""
+
+    rows = jnp.arange(shape[0])[:, None]
+    columns = jnp.arange(shape[1])[None, :]
+    vertical = (columns == start[1]) & _between(rows, start[0], stop[0])
+    horizontal = (rows == stop[0]) & _between(columns, start[1], stop[1])
+    return vertical | horizontal
+
+
+def _random_inventory(skill_id: SkillId, rng: jax.Array) -> Inventory:
+    """Add chain-like holdings on top of what the skill needs."""
+
+    base = _scenario_inventory(skill_id)
+    wood, sapling, stone, pickaxe, sword = jax.random.randint(
+        rng,
+        (5,),
+        jnp.asarray([0, 0, 0, 0, 0]),
+        jnp.asarray([4, 2, 3, 2, 2]),
+    )
+    return replace(
+        base,
+        wood=base.wood + wood,
+        sapling=sapling,
+        stone=stone,
+        wood_pickaxe=jnp.maximum(base.wood_pickaxe, pickaxe),
+        wood_sword=sword,
+    )
+
+
+def _prepare_randomized_scenario(
+    state: Any,
+    goal: SkillGoal,
+    rng: jax.Array,
+    config: SkillScenarioConfig,
+) -> PreparedSkillScenario:
+    randomization = config.randomization
+    assert randomization is not None
+    (
+        offset_rng,
+        clear_rng,
+        target_rng,
+        direction_rng,
+        placement_rng,
+        table_rng,
+        block_rng,
+        neighbour_rng,
+        inventory_rng,
+    ) = jax.random.split(rng, 9)
+    centre = jnp.array(
+        [state.map.shape[0] // 2, state.map.shape[1] // 2],
+        dtype=jnp.int32,
+    )
+    player_position = centre + jax.random.randint(
+        offset_rng,
+        (2,),
+        -randomization.max_player_offset,
+        randomization.max_player_offset + 1,
+        dtype=jnp.int32,
+    )
+
+    # The chain world clears the same window around the map centre, so an
+    # offset player sees cleared ground on one side and terrain on the other.
+    row_radius = OBS_DIM[0] // 2
+    column_radius = OBS_DIM[1] // 2
+    centre_row = state.map.shape[0] // 2
+    centre_column = state.map.shape[1] // 2
+    cleared = state.map.at[
+        centre_row - row_radius : centre_row + row_radius + 1,
+        centre_column - column_radius : centre_column + column_radius + 1,
+    ].set(BlockType.GRASS.value)
+    world_map = jnp.where(
+        jax.random.bernoulli(clear_rng, randomization.clear_probability),
+        cleared,
+        state.map,
+    )
+    world_map = world_map.at[player_position[0], player_position[1]].set(
+        BlockType.GRASS.value
+    )
+
+    offsets = _local_offsets(config)
+    target_offset = offsets[jax.random.randint(target_rng, (), 0, offsets.shape[0])]
+    target_direction = _direction_to_target(target_offset)
+    target_position = player_position + target_offset
+    approach_position = target_position - DIRECTIONS[target_direction]
+    route = _route_mask(world_map.shape, player_position, approach_position)
+
+    view_offsets = _view_offsets()
+    candidates = player_position + view_offsets
+    scores = jax.random.uniform(placement_rng, (candidates.shape[0],))
+    reserved = jnp.all(candidates == target_position, axis=-1)
+    if randomization.reserve_route:
+        reserved = reserved | route[candidates[:, 0], candidates[:, 1]]
+    used = reserved
+
+    def place(
+        world_map: jax.Array,
+        used: jax.Array,
+        block: Any,
+        *,
+        eligible: Any = True,
+        keep: Any = True,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Put ``block`` on the lowest-scoring eligible tile not yet used."""
+
+        allowed = eligible & ~used
+        index = jnp.argmin(jnp.where(allowed, scores, jnp.inf))
+        keep = keep & allowed[index]
+        position = candidates[index]
+        return (
+            world_map.at[position[0], position[1]].set(
+                jnp.where(keep, block, world_map[position[0], position[1]])
+            ),
+            used.at[index].set(used[index] | keep),
+        )
+
+    target = _target_block(goal.skill_id)
+    if target is not None and goal.skill_id in _RESOURCE_SKILLS:
+        # Copies no closer than the sampled target, so the distance band
+        # still names the nearest target rather than a lucky extra one.
+        far = jnp.sum(jnp.abs(view_offsets), axis=-1) >= jnp.sum(
+            jnp.abs(target_offset)
+        )
+        for _ in range(randomization.extra_target_count):
+            world_map, used = place(world_map, used, target.value, eligible=far)
+    if goal.skill_id not in _TABLE_SKILLS and randomization.table_probability > 0:
+        world_map, used = place(
+            world_map,
+            used,
+            BlockType.CRAFTING_TABLE.value,
+            keep=jax.random.bernoulli(table_rng, randomization.table_probability),
+        )
+    blocks = jax.random.choice(
+        block_rng,
+        _randomized_distractor_blocks(target),
+        (config.distractor_count,),
+    )
+    for index in range(config.distractor_count):
+        world_map, used = place(world_map, used, blocks[index])
+
+    probe = state.replace(map=world_map, player_position=player_position)
+    if target is not None:
+        world_map = world_map.at[target_position[0], target_position[1]].set(
+            target.value
+        )
+        target_mask = (
+            jnp.zeros(world_map.shape, dtype=jnp.bool_)
+            .at[target_position[0], target_position[1]]
+            .set(True)
+        )
+        # Orthogonal adjacency even for crafting, which is the stricter test.
+        bound = interaction_distance(probe.replace(map=world_map), target_mask)
+        blocked = (bound > goal.effective_horizon) | (
+            bound >= DEFAULT_REACHABILITY.unreachable
+        )
+        world_map = jnp.where(blocked & route, BlockType.GRASS.value, world_map)
+    else:
+        neighbours = player_position + jnp.asarray(
+            DIRECTIONS[Action.LEFT.value : Action.DOWN.value + 1]
+        )
+        free = walkable_mask(probe)[neighbours[:, 0], neighbours[:, 1]]
+        fallback = neighbours[jax.random.randint(neighbour_rng, (), 0, 4)]
+        world_map = world_map.at[fallback[0], fallback[1]].set(
+            jnp.where(
+                jnp.any(free),
+                world_map[fallback[0], fallback[1]],
+                BlockType.GRASS.value,
+            )
+        )
+
+    inventory = (
+        _random_inventory(goal.skill_id, inventory_rng)
+        if randomization.random_inventory
+        else _scenario_inventory(goal.skill_id)
+    )
+    return PreparedSkillScenario(
+        state=state.replace(
+            map=world_map,
+            player_position=player_position,
+            player_direction=jax.random.randint(
+                direction_rng,
+                shape=(),
+                minval=Action.LEFT.value,
+                maxval=Action.DOWN.value + 1,
+                dtype=jnp.int32,
+            ),
+            inventory=inventory,
+        ),
+        target_direction=target_direction,
+        target_position=target_position,
+        approach_position=approach_position,
+    )
+
+
+def _randomize_vitals_and_clock(
+    state: Any,
+    goal: SkillGoal,
+    rng: jax.Array,
+    randomization: ScenarioRandomization,
+) -> Any:
+    vitals_rng, clock_rng = jax.random.split(rng)
+    if randomization.random_vitals:
+        health, food, drink, energy = jax.random.randint(vitals_rng, (4,), 3, 10)
+        if goal.skill_id is SkillId.DRINK_WATER:
+            drink = jnp.minimum(drink, 8)
+        state = state.replace(
+            player_health=health,
+            player_food=food,
+            player_drink=drink,
+            player_energy=energy,
+        )
+    if randomization.max_start_timestep:
+        timestep = jax.random.randint(
+            clock_rng,
+            (),
+            0,
+            randomization.max_start_timestep + 1,
+        )
+        state = state.replace(
+            timestep=timestep,
+            light_level=calculate_light_level(timestep, _DEFAULT_PARAMS).astype(
+                jnp.float32
+            ),
+        )
+    return state
+
+
 def prepare_skill_scenario(
     state: Any,
     goal: SkillGoal,
@@ -490,10 +836,20 @@ def prepare_skill_scenario(
         raise ValueError(
             f"{goal.skill_id.value} does not define a local-navigation target."
         )
+    state_rng = None
     if scenario_config.kind is SkillScenario.NEARBY:
         scenario = _prepare_nearby_scenario(state, goal, rng)
-    else:
+    elif scenario_config.kind is SkillScenario.LOCAL_NAVIGATION:
         scenario = _prepare_local_navigation_scenario(
+            state,
+            goal,
+            rng,
+            scenario_config,
+        )
+    else:
+        # Split only here, so the older scenarios keep their exact worlds.
+        rng, state_rng = jax.random.split(rng)
+        scenario = _prepare_randomized_scenario(
             state,
             goal,
             rng,
@@ -516,6 +872,13 @@ def prepare_skill_scenario(
         timestep=0,
         light_level=1.0,
     )
+    if state_rng is not None and scenario_config.randomization is not None:
+        prepared_state = _randomize_vitals_and_clock(
+            prepared_state,
+            goal,
+            state_rng,
+            scenario_config.randomization,
+        )
     return scenario._replace(state=prepared_state)
 
 
@@ -527,6 +890,7 @@ def make_skill_environment(
     min_distance: int = 2,
     max_distance: int = 4,
     distractor_count: int = 6,
+    randomization: ScenarioRandomization | None = None,
 ) -> SkillEnvironment:
     """Create one controlled skill benchmark environment."""
 
@@ -536,6 +900,7 @@ def make_skill_environment(
         min_distance=min_distance,
         max_distance=max_distance,
         distractor_count=distractor_count,
+        randomization=randomization,
     )
     if (
         scenario_config.kind is SkillScenario.LOCAL_NAVIGATION
@@ -547,7 +912,8 @@ def make_skill_environment(
     bundle = make_environment(
         "Craftax-Classic-Symbolic-v1",
         auto_reset=False,
-        max_episode_steps=max(128, horizon + 1),
+        # A randomized clock must not end the episode before the skill does.
+        max_episode_steps=max(128, horizon + 1) + scenario_config.max_start_timestep,
     )
     params = replace(
         bundle.params,
@@ -716,11 +1082,13 @@ def make_vectorized_skill_environment(
     min_distance: int = 2,
     max_distance: int = 4,
     distractor_count: int = 6,
+    randomization: ScenarioRandomization | None = None,
 ) -> VectorizedSkillEnvironment:
     """Create a balanced batch covering every registered skill.
 
-    Local navigation applies to skills with a visible target. ``place_table``
-    remains a nearby scenario because it has no destination to navigate to.
+    Local navigation applies to skills with a visible target, so there
+    ``place_table`` remains a nearby scenario. The randomized scenario covers
+    every skill, ``place_table`` included.
     """
 
     num_skills = len(SKILL_IDS)
@@ -735,12 +1103,17 @@ def make_vectorized_skill_environment(
             horizon=horizon,
             scenario=(
                 normalized_scenario
-                if skill_id in LOCAL_NAVIGATION_SKILLS
+                if skill_id in skills_for_scenario(normalized_scenario)
                 else SkillScenario.NEARBY
             ),
             min_distance=min_distance,
             max_distance=max_distance,
             distractor_count=distractor_count,
+            randomization=(
+                randomization
+                if normalized_scenario is SkillScenario.RANDOMIZED
+                else None
+            ),
         )
         for skill_id in SKILL_IDS
     )
@@ -752,4 +1125,23 @@ def make_vectorized_skill_environment(
     return VectorizedSkillEnvironment(
         environments=environments,
         envs_per_skill=num_envs // num_skills,
+    )
+
+
+def scenario_randomization_from_config(
+    config: SkillPPOConfig,
+) -> ScenarioRandomization | None:
+    """Return the randomization a training config asks for, if any."""
+
+    if SkillScenario(config.skill_scenario) is not SkillScenario.RANDOMIZED:
+        return None
+    return ScenarioRandomization(
+        reserve_route=config.skill_reserve_route,
+        extra_target_count=config.skill_extra_target_count,
+        table_probability=config.skill_table_probability,
+        max_player_offset=config.skill_max_player_offset,
+        clear_probability=config.skill_clear_probability,
+        random_inventory=config.skill_random_inventory,
+        random_vitals=config.skill_random_vitals,
+        max_start_timestep=config.skill_max_start_timestep,
     )

@@ -112,6 +112,16 @@ class SkillPPOConfig(PPOConfig):
     skill_min_distance: int = 2
     skill_max_distance: int = 4
     skill_distractor_count: int = 6
+    # Read only when skill_scenario is "randomized"; see
+    # tiny_sima.envs.skills.ScenarioRandomization for what each one undoes.
+    skill_reserve_route: bool = False
+    skill_extra_target_count: int = 2
+    skill_table_probability: float = 0.5
+    skill_max_player_offset: int = 3
+    skill_clear_probability: float = 0.5
+    skill_random_inventory: bool = True
+    skill_random_vitals: bool = True
+    skill_max_start_timestep: int = 300
 
     def validate(self) -> Self:
         super().validate()
@@ -119,9 +129,10 @@ class SkillPPOConfig(PPOConfig):
             raise ValueError("skill_horizon must be at least 2.")
         if self.skill_embedding_size < 1:
             raise ValueError("skill_embedding_size must be positive.")
-        if self.skill_scenario not in {"nearby", "local_navigation"}:
+        if self.skill_scenario not in {"nearby", "local_navigation", "randomized"}:
             raise ValueError(
-                "skill_scenario must be 'nearby' or 'local_navigation'."
+                "skill_scenario must be 'nearby', 'local_navigation' or "
+                "'randomized'."
             )
         if self.skill_min_distance < 1:
             raise ValueError("skill_min_distance must be positive.")
@@ -133,6 +144,16 @@ class SkillPPOConfig(PPOConfig):
             raise ValueError(
                 "skill_distractor_count must be between 0 and 32."
             )
+        if not 0 <= self.skill_extra_target_count <= 8:
+            raise ValueError("skill_extra_target_count must be between 0 and 8.")
+        if not 0.0 <= self.skill_table_probability <= 1.0:
+            raise ValueError("skill_table_probability must lie in [0, 1].")
+        if not 0 <= self.skill_max_player_offset <= 8:
+            raise ValueError("skill_max_player_offset must be between 0 and 8.")
+        if not 0.0 <= self.skill_clear_probability <= 1.0:
+            raise ValueError("skill_clear_probability must lie in [0, 1].")
+        if self.skill_max_start_timestep < 0:
+            raise ValueError("skill_max_start_timestep cannot be negative.")
         return self
 
 

@@ -18,6 +18,7 @@ from tiny_sima.envs.skills import (
     SkillEpisodeState,
     VectorizedSkillEnvironment,
     make_vectorized_skill_environment,
+    scenario_randomization_from_config,
 )
 from tiny_sima.evaluation.gpu_monitor import (
     NvidiaSmiMonitor,
@@ -45,6 +46,11 @@ from tiny_sima.executor.ppo_common import (
 from tiny_sima.executor.training import run_training_loop, save_final_run
 from tiny_sima.goals import SKILL_IDS
 
+_ENVIRONMENT_NAMES = {
+    "nearby": "Tiny-SIMA-Nearby-Skills-v0",
+    "local_navigation": "Tiny-SIMA-Local-Navigation-Skills-v0",
+    "randomized": "Tiny-SIMA-Randomized-Skills-v0",
+}
 
 class SkillTransition(NamedTuple):
     """One timestep of batched goal-conditioned experience."""
@@ -522,6 +528,7 @@ def train_goal_conditioned(
         interval_seconds=config.gpu_monitor_interval_seconds,
     )
     monitor.start()
+    randomization = scenario_randomization_from_config(config)
     environment = make_vectorized_skill_environment(
         num_envs=config.num_envs,
         horizon=config.skill_horizon,
@@ -529,6 +536,7 @@ def train_goal_conditioned(
         min_distance=config.skill_min_distance,
         max_distance=config.skill_max_distance,
         distractor_count=config.skill_distractor_count,
+        randomization=randomization,
     )
     model = make_goal_conditioned_actor_critic(
         num_actions=environment.spec.num_actions,
@@ -590,11 +598,7 @@ def train_goal_conditioned(
     total_completed_episodes = int(episodes.sum())
     total_completed_successes = int(successes.sum())
     summary = {
-        "environment": (
-            "Tiny-SIMA-Local-Navigation-Skills-v0"
-            if config.skill_scenario == "local_navigation"
-            else "Tiny-SIMA-Nearby-Skills-v0"
-        ),
+        "environment": _ENVIRONMENT_NAMES[config.skill_scenario],
         "device": str(jax.devices()[0]),
         "timesteps": config.total_timesteps,
         "updates": config.num_updates,
@@ -605,6 +609,9 @@ def train_goal_conditioned(
         "skill_min_distance": config.skill_min_distance,
         "skill_max_distance": config.skill_max_distance,
         "skill_distractor_count": config.skill_distractor_count,
+        "skill_randomization": (
+            None if randomization is None else randomization.to_dict()
+        ),
         "stratified_minibatches": True,
         "normalize_advantages_per_skill": (config.normalize_advantages_per_skill),
         "total_seconds": loop.total_seconds,

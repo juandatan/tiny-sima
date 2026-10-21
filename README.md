@@ -207,6 +207,15 @@ The local-navigation trainer uses randomized visible targets and controlled
 distractors for the five spatial skills. `place_table` remains a balanced
 nearby-target task because it has no destination to navigate toward.
 
+Train on the randomized distribution, which keeps every local-navigation
+control as a switch so each can be ablated on its own:
+
+```bash
+tiny-sima-train-skills --config configs/skill_ppo_randomized_debug.yaml
+# After the debug run succeeds (about 10M steps, 96 environments):
+tiny-sima-train-skills --config configs/skill_ppo_randomized_10m.yaml
+```
+
 Evaluate a trained executor on randomized local-navigation scenarios:
 
 ```bash
@@ -244,7 +253,8 @@ TINY_SIMA_RUN_VLM_SMOKE=1 \
 
 The larger Phase 1 configuration is available at `configs/ppo_1m.yaml`.
 The longer Phase 3 configurations are available at
-`configs/skill_ppo_1m.yaml` and `configs/skill_ppo_local_1m.yaml`.
+`configs/skill_ppo_1m.yaml` and `configs/skill_ppo_local_1m.yaml`, and the
+executor-improvement configuration at `configs/skill_ppo_randomized_10m.yaml`.
 Generated runs and checkpoints are written under `runs/` and are not tracked
 by Git.
 
@@ -699,6 +709,57 @@ Tasks:
   recorded, the last with greedy decoding and both repairs. A run of the
   restructured ladder is pending.**
 
+#### Executor improvement
+
+The ladder put the ceiling on the executor. The planner differs not at all
+between the scripted default plan and the collect-first reordering of the same
+skills, yet with a stochastic executor one succeeds in 0.25 of episodes and the
+other in 0.61. The gap is therefore in the states each order hands the
+executor, and `local_navigation` trains on none of them: every episode starts
+at the map centre in a cleared window, with one target, a reserved straight
+route, the minimal inventory, and the clock at dawn. A chain boundary differs
+in each of those ways.
+
+The work is ordered so each step is measured before the next one is paid for:
+
+1. `benchmark_executor` runs both fixed plans over the same 512 worlds with a
+   greedy executor and records every first-attempt boundary, so success reads
+   by skill and interaction-distance band. The benchmark uses seed 101,
+   disjoint from the calibration seeds.
+2. `probe_counterfactuals` edits those boundary states one training difference
+   at a time - remove tables, clear the view, reset the inventory, the vitals,
+   or the clock - and reruns the option from the same key, so a rescued
+   boundary attributes a failure to a cause. Replay agreement on the unedited
+   state checks that the comparison is exact. `failed_rollout_features`
+   describes what a failed option actually did, such as reaching the target
+   without facing it, or never getting near it.
+3. The `randomized` scenario undoes each `local_navigation` control through a
+   `ScenarioRandomization` knob: obstacles on the route, extra targets no
+   closer than the sampled one, a crafting table in view, a player offset from
+   the centre, natural rather than cleared terrain, random holdings and
+   vitals, and a start time up to step 300. With every knob at its
+   `local_navigation` value it reproduces that setup, so each one can be
+   switched off as an ablation, and every world stays solvable within the
+   horizon. All six skills, including `place_table`, train on it.
+4. `notebooks/07_improve_executor.ipynb` runs the steps in order. It trains
+   three randomized seeds and a step-matched `local_navigation` control,
+   compares each against the one-million-step baseline with paired tests on
+   the benchmark worlds, checks that `local_navigation` success has not
+   regressed, and repeats the comparison with a stochastic executor. The
+   stochastic run is the success criterion, because it is the setting the
+   0.25 and 0.61 were measured in.
+
+Tasks:
+
+- Benchmark the executor alone on both fixed plans. **Implemented.**
+- Attribute boundary failures with counterfactual edits. **Implemented.**
+- Train on a randomized scenario with every control switchable.
+  **Implemented; the 10M-step runs are pending.**
+- Refit the competence prior on the new executor and rerun notebook 06.
+- If the gap remains, mine boundary states from chain rollouts on disjoint
+  seeds, then consider prioritized level replay or behaviour cloning from the
+  scripted policy.
+
 ### Phase 5: Memory and visual grounding
 
 Goal: study how observations and memory affect planning.
@@ -793,7 +854,8 @@ tiny-sima/
 │   ├── 03_evaluate_skills.ipynb
 │   ├── 04_train_goal_conditioned.ipynb
 │   ├── 05_hierarchical_evaluation.ipynb
-│   └── 06_evaluate_vlm_planner.ipynb
+│   ├── 06_evaluate_vlm_planner.ipynb
+│   └── 07_improve_executor.ipynb
 ├── src/
 │   └── tiny_sima/
 │       ├── envs/
@@ -1230,4 +1292,26 @@ Planner ladder restructured on October 20, 2026:
   refuses results that do not pair. Notebook 06 prints a paired table for the
   comparisons each pair of conditions isolates.
 - All 201 regular automated tests pass locally; the real-model VLM smoke test
+  remains opt-in. Ruff and Pyright report no issues.
+
+Executor improvement started on October 21, 2026:
+
+- Added `evaluation/executor_diagnostics.py`: the executor-only benchmark over
+  both fixed plans, boundary success by skill and distance band,
+  counterfactual boundary edits with a replay-agreement check, and
+  failed-rollout features. A greedy executor in a mob-free world replays a
+  boundary exactly, so an edit's effect is not sampling noise.
+- Added the `randomized` skill scenario and its eight `skill_*` configuration
+  knobs. Its reset draws randomness only in its own branch, so `nearby` and
+  `local_navigation` worlds are bit-identical to before for every seed. The
+  straight-route scripted policy refuses randomized worlds; the chain
+  evaluator's breadth-first policy solves every one tested.
+- Added `configs/skill_ppo_randomized_debug.yaml`, which trained end to end
+  in 68 s on CPU, and `configs/skill_ppo_randomized_10m.yaml`.
+- Added `notebooks/07_improve_executor.ipynb` with `smoke` and `full`
+  presets. Runs that already have a summary are not retrained.
+- Notebook 06 now saves fits beside the checkpoint they measure, so pointing
+  `CHECKPOINT` at a new executor cannot overwrite the baseline's competence
+  prior.
+- All 250 regular automated tests pass locally; the real-model VLM smoke test
   remains opt-in. Ruff and Pyright report no issues.

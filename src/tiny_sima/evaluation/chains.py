@@ -208,10 +208,19 @@ class BatchedChainCarry(NamedTuple):
     environment_steps: jax.Array
     native_return: jax.Array
     last_failed_skill: jax.Array
+    first_outcome: jax.Array
+    first_steps: jax.Array
+    boundary_states: Any
 
 
 class BatchedChainOutput(NamedTuple):
-    """Per-episode metrics produced by the compiled chain evaluator."""
+    """Per-episode metrics produced by the compiled chain evaluator.
+
+    ``first_outcome`` and ``first_steps`` have one column per plan step and
+    describe the first attempt at that step; ``-1`` marks a step never
+    reached. ``boundary_states`` holds the world at the start of each first
+    attempt when recording was requested, and is ``None`` otherwise.
+    """
 
     succeeded: jax.Array
     termination: jax.Array
@@ -220,6 +229,9 @@ class BatchedChainOutput(NamedTuple):
     environment_steps: jax.Array
     native_return: jax.Array
     last_failed_skill: jax.Array
+    first_outcome: jax.Array
+    first_steps: jax.Array
+    boundary_states: Any
 
 
 class SkillExecutor(Protocol):
@@ -756,9 +768,15 @@ def _make_batched_chain_rollout(
     skill_embedding_size: int,
     deterministic: bool,
     is_complete: JaxObjectivePredicate,
+    record_boundaries: bool = False,
 ) -> BatchedRollout:
     """Build and cache one compiled evaluator for a static execution shape."""
 
+    success_outcome = _PROBE_OUTCOMES.index(SkillOutcome.SUCCESS)
+    timeout_outcome = _PROBE_OUTCOMES.index(SkillOutcome.TIMEOUT)
+    terminated_outcome = _PROBE_OUTCOMES.index(SkillOutcome.ENVIRONMENT_TERMINATED)
+    lost_outcome = _PROBE_OUTCOMES.index(SkillOutcome.PRECONDITION_LOST)
+    infeasible_outcome = _PROBE_OUTCOMES.index(SkillOutcome.INFEASIBLE)
     environment = make_skill_chain_environment(
         distractor_count=distractor_count,
     )
@@ -795,6 +813,15 @@ def _make_batched_chain_rollout(
             dtype=jnp.int32,
         )
         initially_succeeded = jax.vmap(is_complete)(reset.state)
+        episode_rows = jnp.arange(num_episodes)
+        boundary_states = (
+            jax.tree_util.tree_map(
+                lambda leaf: jnp.repeat(leaf[:, None], plan_length, axis=1),
+                reset.state,
+            )
+            if record_boundaries
+            else None
+        )
         initial_carry = BatchedChainCarry(
             rng=rollout_rng,
             state=reset.state,
@@ -826,6 +853,17 @@ def _make_batched_chain_rollout(
                 -1,
                 dtype=jnp.int32,
             ),
+            first_outcome=jnp.full(
+                (num_episodes, plan_length),
+                -1,
+                dtype=jnp.int32,
+            ),
+            first_steps=jnp.full(
+                (num_episodes, plan_length),
+                -1,
+                dtype=jnp.int32,
+            ),
+            boundary_states=boundary_states,
         )
 
         def continue_evaluation(
@@ -860,6 +898,25 @@ def _make_batched_chain_rollout(
                 & ~decision_limit_reached
                 & ~no_viable_skill
             )
+            # Retries reuse a plan step, so a step whose outcome is already
+            # set is not a first attempt and must not overwrite its record.
+            first_attempt = carry.first_outcome[episode_rows, safe_plan_index] < 0
+            boundary_states = carry.boundary_states
+            if record_boundaries:
+                starting = active & at_option_boundary & first_attempt
+
+                def record_start(buffer: jax.Array, leaf: jax.Array) -> jax.Array:
+                    mask_shape = (num_episodes,) + (1,) * (leaf.ndim - 1)
+                    current = buffer[episode_rows, safe_plan_index]
+                    return buffer.at[episode_rows, safe_plan_index].set(
+                        jnp.where(starting.reshape(mask_shape), leaf, current)
+                    )
+
+                boundary_states = jax.tree_util.tree_map(
+                    record_start,
+                    carry.boundary_states,
+                    carry.state,
+                )
 
             model_output = apply_goal_conditioned_actor_critic(
                 model,
@@ -917,6 +974,37 @@ def _make_batched_chain_rollout(
                 failed
                 & ~failure_limit
                 & (~precondition_after | environment_terminated)
+            )
+            # Outcome codes follow the probe so the two can be compared.
+            outcome_code = jnp.where(timeout, timeout_outcome, terminated_outcome)
+            outcome_code = jnp.where(
+                failed & ~precondition_after,
+                lost_outcome,
+                outcome_code,
+            )
+            outcome_code = jnp.where(success, success_outcome, outcome_code)
+            infeasible_start = no_viable_skill & ~plan_exhausted
+            outcome_code = jnp.where(
+                infeasible_start,
+                infeasible_outcome,
+                outcome_code,
+            )
+            record_outcome = (option_ended | infeasible_start) & first_attempt
+            first_outcome = carry.first_outcome.at[
+                episode_rows, safe_plan_index
+            ].set(
+                jnp.where(
+                    record_outcome,
+                    outcome_code,
+                    carry.first_outcome[episode_rows, safe_plan_index],
+                )
+            )
+            first_steps = carry.first_steps.at[episode_rows, safe_plan_index].set(
+                jnp.where(
+                    record_outcome,
+                    jnp.where(infeasible_start, 0, option_steps),
+                    carry.first_steps[episode_rows, safe_plan_index],
+                )
             )
             plan_index = carry.plan_index + success.astype(jnp.int32)
             objective_complete = jax.vmap(is_complete)(state)
@@ -985,6 +1073,9 @@ def _make_batched_chain_rollout(
                     skill_ids,
                     carry.last_failed_skill,
                 ),
+                first_outcome=first_outcome,
+                first_steps=first_steps,
+                boundary_states=boundary_states,
             )
             return iteration + 1, next_carry
 
@@ -1001,6 +1092,9 @@ def _make_batched_chain_rollout(
             environment_steps=final_carry.environment_steps,
             native_return=final_carry.native_return,
             last_failed_skill=final_carry.last_failed_skill,
+            first_outcome=final_carry.first_outcome,
+            first_steps=final_carry.first_steps,
+            boundary_states=final_carry.boundary_states,
         )
 
     return jax.jit(rollout)
@@ -1016,15 +1110,27 @@ def evaluate_learned_skill_chain_batched(
     max_decisions: int = 12,
     max_failures_per_skill: int = 2,
     distractor_count: int = 3,
+    plan: Sequence[SkillId] | None = None,
+    record_boundaries: bool = False,
 ) -> dict[str, Any]:
-    """Evaluate a fixed reference plan across parallel JAX environments.
+    """Evaluate a fixed plan across parallel JAX environments.
 
-    This fast path intentionally executes ``chain.reference_skills`` rather
-    than calling an arbitrary Python planner inside ``jax.jit``. Use
-    :func:`evaluate_skill_chain` when planner decisions or detailed traces are
-    required.
+    This fast path intentionally executes a fixed plan, by default
+    ``chain.reference_skills``, rather than calling an arbitrary Python
+    planner inside ``jax.jit``. Use :func:`evaluate_skill_chain` when planner
+    decisions or detailed traces are required.
+
+    The same seed and episode count produce the same starting worlds for any
+    plan, so two plans can be compared episode by episode with
+    :func:`compare_paired_successes`. ``first_attempt_outcomes`` records how
+    the first attempt at each plan step ended. With ``record_boundaries`` the
+    result also carries ``boundary_states``, a host pytree whose leaves have
+    leading ``(episode, plan step)`` axes holding the world at the start of
+    each first attempt; entries for unreached steps hold the reset world and
+    must be ignored where ``first_attempt_outcomes`` is ``None``.
     """
 
+    plan_skills = tuple(chain.reference_skills if plan is None else plan)
     if num_episodes < 1:
         raise ValueError("num_episodes must be positive.")
     if skill_horizon < 1:
@@ -1033,15 +1139,15 @@ def evaluate_learned_skill_chain_batched(
         raise ValueError("max_decisions must be positive.")
     if max_failures_per_skill < 1:
         raise ValueError("max_failures_per_skill must be positive.")
-    if not chain.reference_skills:
-        raise ValueError("A batched chain requires at least one reference skill.")
+    if not plan_skills:
+        raise ValueError("A batched chain requires at least one planned skill.")
     if chain.is_complete_jax is None:
         raise ValueError(
             "A batched chain requires a JAX-compatible completion predicate."
         )
 
-    plan = jnp.asarray(
-        [skill_index(skill_id) for skill_id in chain.reference_skills],
+    plan_array = jnp.asarray(
+        [skill_index(skill_id) for skill_id in plan_skills],
         dtype=jnp.int32,
     )
     cache_hits_before = _make_batched_chain_rollout.cache_info().hits
@@ -1055,13 +1161,14 @@ def evaluate_learned_skill_chain_batched(
         skill_embedding_size=executor.config.skill_embedding_size,
         deterministic=executor.deterministic,
         is_complete=chain.is_complete_jax,
+        record_boundaries=record_boundaries,
     )
     compile_cache_hit = (
         _make_batched_chain_rollout.cache_info().hits > cache_hits_before
     )
     start = time.perf_counter()
-    output = rollout(executor.params, plan, jax.random.PRNGKey(seed))
-    jax.block_until_ready(output)
+    output = rollout(executor.params, plan_array, jax.random.PRNGKey(seed))
+    output = jax.device_get(output)
     total_seconds = time.perf_counter() - start
 
     succeeded = np.asarray(output.succeeded)
@@ -1084,12 +1191,15 @@ def evaluate_learned_skill_chain_batched(
         for skill_id in SKILL_IDS
         if np.any(~succeeded & (last_failed_skills == skill_index(skill_id)))
     }
-    return {
+    first_outcomes = np.asarray(output.first_outcome)
+    first_steps = np.asarray(output.first_steps)
+    result: dict[str, Any] = {
         "chain": chain.name,
         "objective": chain.objective,
         "reference_skills": [
             skill.value for skill in chain.reference_skills
         ],
+        "plan": [skill.value for skill in plan_skills],
         "num_episodes": num_episodes,
         "seed": seed,
         "batched": True,
@@ -1106,7 +1216,28 @@ def evaluate_learned_skill_chain_batched(
         "termination_counts": termination_counts,
         "final_failed_skill_counts": final_failed_skill_counts,
         "total_seconds_including_compile": total_seconds,
+        "episode_successes": [bool(value) for value in succeeded],
+        "episode_completed_skills": [
+            int(value) for value in np.asarray(output.completed_skills)
+        ],
+        "episode_terminations": [
+            list(ChainTermination)[int(code)].value for code in terminations
+        ],
+        "first_attempt_outcomes": [
+            [
+                None if code < 0 else _PROBE_OUTCOMES[int(code)].value
+                for code in row
+            ]
+            for row in first_outcomes
+        ],
+        "first_attempt_steps": [
+            [None if steps < 0 else int(steps) for steps in row]
+            for row in first_steps
+        ],
     }
+    if record_boundaries:
+        result["boundary_states"] = output.boundary_states
+    return result
 
 
 class BatchedProbeCarry(NamedTuple):
@@ -1120,13 +1251,24 @@ class BatchedProbeCarry(NamedTuple):
     initial_metric: jax.Array
     finished: jax.Array
     outcome: jax.Array
+    positions: jax.Array
+    directions: jax.Array
+    actions: jax.Array
 
 
 class BatchedProbeOutput(NamedTuple):
-    """Per-entry probe results: how it ended and how long it took."""
+    """Per-entry probe results: how it ended and how long it took.
+
+    ``positions``, ``directions`` and ``actions`` are time-major traces of
+    shape ``(skill_horizon, batch)``; row ``t`` describes the state after
+    step ``t``. Rows at or beyond an entry's ``steps`` are padding.
+    """
 
     outcome: jax.Array
     steps: jax.Array
+    positions: jax.Array
+    directions: jax.Array
+    actions: jax.Array
 
 
 @dataclass(frozen=True)
@@ -1145,6 +1287,20 @@ class SkillProbe:
     @property
     def succeeded(self) -> bool:
         return self.outcome is SkillOutcome.SUCCESS
+
+
+@dataclass(frozen=True)
+class SkillRolloutTrace:
+    """Where the player went during one probed option.
+
+    ``positions[t]`` and ``directions[t]`` hold the player after action
+    ``actions[t]``; only the first ``probe.steps`` entries are meaningful.
+    """
+
+    probe: SkillProbe
+    positions: np.ndarray
+    directions: np.ndarray
+    actions: np.ndarray
 
 
 _PROBE_OUTCOMES = tuple(SkillOutcome)
@@ -1212,6 +1368,9 @@ def _make_batched_skill_probe(
             initial_metric=_batched_skill_metric(skill_ids, states),
             finished=~precondition,
             outcome=jnp.where(precondition, timeout_code, infeasible_code),
+            positions=jnp.zeros((skill_horizon, batch_size, 2), dtype=jnp.int32),
+            directions=jnp.zeros((skill_horizon, batch_size), dtype=jnp.int32),
+            actions=jnp.zeros((skill_horizon, batch_size), dtype=jnp.int32),
         )
 
         def continue_probing(
@@ -1287,6 +1446,13 @@ def _make_batched_skill_probe(
                 initial_metric=carry.initial_metric,
                 finished=carry.finished | ended,
                 outcome=jnp.where(ended, outcome, carry.outcome),
+                positions=carry.positions.at[iteration].set(
+                    jnp.asarray(state.player_position, dtype=jnp.int32)
+                ),
+                directions=carry.directions.at[iteration].set(
+                    jnp.asarray(state.player_direction, dtype=jnp.int32)
+                ),
+                actions=carry.actions.at[iteration].set(action),
             )
             return iteration + 1, next_carry
 
@@ -1298,6 +1464,9 @@ def _make_batched_skill_probe(
         return BatchedProbeOutput(
             outcome=final_carry.outcome,
             steps=final_carry.steps,
+            positions=final_carry.positions,
+            directions=final_carry.directions,
+            actions=final_carry.actions,
         )
 
     return jax.jit(probe)
@@ -1320,6 +1489,34 @@ def probe_skills_batched(
     padding with throwaway entries is cheaper than recompiling.
     """
 
+    return tuple(
+        trace.probe
+        for trace in trace_skills_batched(
+            executor,
+            states,
+            skill_ids,
+            rng,
+            skill_horizon=skill_horizon,
+            distractor_count=distractor_count,
+        )
+    )
+
+
+def trace_skills_batched(
+    executor: LearnedSkillExecutor,
+    states: Sequence[Any],
+    skill_ids: Sequence[SkillId],
+    rng: jax.Array,
+    *,
+    skill_horizon: int = 64,
+    distractor_count: int = 3,
+) -> tuple[SkillRolloutTrace, ...]:
+    """Probe like :func:`probe_skills_batched` and keep each player path.
+
+    The paths are what failure diagnosis needs: whether a failed option ever
+    stood beside its target, faced it, or stalled in place.
+    """
+
     if len(states) != len(skill_ids):
         raise ValueError("States and skill IDs must describe the same pairs.")
     if not states:
@@ -1335,22 +1532,32 @@ def probe_skills_batched(
         skill_embedding_size=executor.config.skill_embedding_size,
         deterministic=executor.deterministic,
     )
-    output = probe(
-        executor.params,
-        _stack_states(states),
-        jnp.asarray(
-            [skill_index(skill_id) for skill_id in skill_ids],
-            dtype=jnp.int32,
-        ),
-        rng,
+    output = jax.device_get(
+        probe(
+            executor.params,
+            _stack_states(states),
+            jnp.asarray(
+                [skill_index(skill_id) for skill_id in skill_ids],
+                dtype=jnp.int32,
+            ),
+            rng,
+        )
     )
     outcomes = np.asarray(output.outcome)
     steps = np.asarray(output.steps)
+    positions = np.asarray(output.positions)
+    directions = np.asarray(output.directions)
+    actions = np.asarray(output.actions)
     return tuple(
-        SkillProbe(
-            skill_id=skill_id,
-            outcome=_PROBE_OUTCOMES[int(outcomes[index])],
-            steps=int(steps[index]),
+        SkillRolloutTrace(
+            probe=SkillProbe(
+                skill_id=skill_id,
+                outcome=_PROBE_OUTCOMES[int(outcomes[index])],
+                steps=int(steps[index]),
+            ),
+            positions=positions[:, index],
+            directions=directions[:, index],
+            actions=actions[:, index],
         )
         for index, skill_id in enumerate(skill_ids)
     )
@@ -1845,13 +2052,15 @@ def compare_paired_successes(
     reference: dict[str, Any],
     candidate: dict[str, Any],
 ) -> dict[str, Any]:
-    """Compare two :func:`evaluate_skill_chain` results episode by episode.
+    """Compare two chain results episode by episode.
 
-    Results evaluated with the same seed and episode count reset episode ``i``
-    into the same world, so their outcomes pair up. The exact McNemar test
-    reads only the discordant pairs, which removes the variance between worlds
-    that an unpaired test on two success rates has to carry: at 64 episodes
-    and success near 0.25, Fisher's test cannot separate 0.30 from 0.22.
+    Either result may come from :func:`evaluate_skill_chain` or from
+    :func:`evaluate_learned_skill_chain_batched`; both reset episode ``i``
+    into the same world for the same seed and episode count, so their
+    outcomes pair up. The exact McNemar test reads only the discordant pairs,
+    which removes the variance between worlds that an unpaired test on two
+    success rates has to carry: at 64 episodes and success near 0.25,
+    Fisher's test cannot separate 0.30 from 0.22.
     """
 
     for key in ("seed", "num_episodes"):
@@ -1860,14 +2069,27 @@ def compare_paired_successes(
                 f"Paired results need the same {key}: "
                 f"{reference[key]} and {candidate[key]}."
             )
-    pairs = [
-        (first.succeeded, second.succeeded)
-        for first, second in zip(
-            reference["episodes"],
-            candidate["episodes"],
-            strict=True,
-        )
-    ]
+    return paired_success_summary(
+        _episode_successes(reference),
+        _episode_successes(candidate),
+    )
+
+
+def _episode_successes(result: dict[str, Any]) -> list[bool]:
+    if "episode_successes" in result:
+        return [bool(value) for value in result["episode_successes"]]
+    return [episode.succeeded for episode in result["episodes"]]
+
+
+def paired_success_summary(
+    reference: Sequence[bool],
+    candidate: Sequence[bool],
+) -> dict[str, Any]:
+    """Run the exact McNemar test on two aligned success sequences."""
+
+    pairs = list(zip(reference, candidate, strict=True))
+    if not pairs:
+        raise ValueError("A paired comparison needs at least one pair.")
     reference_only = sum(first and not second for first, second in pairs)
     candidate_only = sum(second and not first for first, second in pairs)
     discordant = reference_only + candidate_only
