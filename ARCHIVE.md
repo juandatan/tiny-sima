@@ -1,9 +1,11 @@
 # Tiny-SIMA archive
 
 Material moved out of [README.md](README.md) on October 21, 2026, when the
-README was reduced to the current findings and status. Everything here was
-accurate when it was written. Later runs supersede some of it: condition names
-changed on October 20, and the README's tables hold the latest numbers.
+README was reduced to the current findings and status, and on October 22, when
+the executor-improvement phase finished. Everything here was accurate when it
+was written. Later runs supersede some of it: condition names changed on
+October 20, the executor changed on October 22, and the README's tables hold
+the latest numbers.
 
 Contents:
 
@@ -16,6 +18,12 @@ Contents:
   format, replanning triggers, and memory as first planned.
 - [Feature inventory](#feature-inventory-as-of-october-21-2026): the
   implemented-features list as of October 21, 2026.
+- [Planner ablations with the baseline executor](#planner-ablations-with-the-baseline-executor):
+  the October 21 ladder, closed loop, and feasibility fits with the
+  one-million-step `local_navigation` executor, reproduced on October 22.
+- [Executor improvement plan and diagnostics](#executor-improvement-plan-and-diagnostics):
+  the plan as written before training, and notebook 07's benchmark,
+  counterfactual, and evaluation tables.
 - [Changelog](#changelog): dated status entries from October 8, 2026 onward.
 
 ## Phase 1 measurements
@@ -481,6 +489,276 @@ Implemented:
 - One oracle trajectory shared by every prefix-ablation condition.
 - Static notebook checks for parse errors, stale imports, and undefined names.
 
+## Planner ablations with the baseline executor
+
+These results come from notebook 06 on October 21, 2026, with the
+one-million-step `local_navigation` executor, `runs/skill-ppo-local-1m`. The
+October 22 run reproduced every closed-loop number below exactly. Its prefix
+ladder matched too, except `baseline_plus_competence_prior`, which by then
+used the candidate executor's prior. Evaluation seed 51 was used for both
+parts:
+
+- **Prefix ladder:** 8 episodes x 6 boundaries, on states the scripted oracle
+  reaches, so every condition is scored on identical states. At 3 of the 48
+  boundaries the oracle's skill is out of reach, so a grounded planner can
+  accept at most 45.
+- **Closed loop:** 64 episodes with a stochastic executor. Every condition
+  starts episode `i` in the same world, so conditions are compared with an
+  exact McNemar test.
+
+| Condition | Prompt | Can term | Prefix accepted (strict) | Ungrounded top choice | Closed-loop success |
+| --- | --- | --- | ---: | ---: | ---: |
+| `scripted_oracle` | none, default order | none | 1.000 | 0.000 | 0.250 |
+| `scripted_collect_first` | none, wood first | none | n/a | n/a | **0.609** |
+| `feasibility_only` | none, constant utility | reachability | 0.729 | 0.000 | 0.172 |
+| `vlm_plus_reachability` | available-first, seeded order | reachability | 0.938 (0.917) | 0.042 | 0.297 |
+| `vlm_fixed_order` | available-first, catalog order | reachability | 0.896 (0.750) | 0.042 | 0.203 |
+| `vlm_only` | available-first, seeded order | none | 0.896 (0.875) | 0.042 | 0.266 |
+| `baseline_prompt_only` | baseline | none | 0.312 | 0.729 | 0.000 |
+| `baseline_plus_reachability` | baseline | reachability | 0.958 | 0.729 | 0.266 |
+| `baseline_plus_competence_prior` | baseline | competence prior | 1.000 | 0.729 | 0.266 |
+
+The paired closed-loop comparisons:
+
+| Reference | Candidate | Both | Ref only | Cand only | Diff | p | Isolates |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `scripted_oracle` | `scripted_collect_first` | 11 | 5 | 28 | +0.359 | <0.001 | plan order |
+| `scripted_collect_first` | `vlm_plus_reachability` | 14 | 25 | 5 | -0.312 | <0.001 | VLM against the best fixed plan |
+| `feasibility_only` | `vlm_plus_reachability` | 3 | 8 | 16 | +0.125 | 0.152 | VLM against no utility |
+| `vlm_fixed_order` | `vlm_plus_reachability` | 6 | 7 | 13 | +0.094 | 0.263 | position bias |
+| `vlm_only` | `vlm_plus_reachability` | 17 | 0 | 2 | +0.031 | 0.500 | Can under the grounded prompt |
+| `baseline_prompt_only` | `baseline_plus_reachability` | 0 | 0 | 17 | +0.266 | <0.001 | Can as the grounding |
+| `baseline_plus_reachability` | `baseline_plus_competence_prior` | 14 | 3 | 3 | +0.000 | 1.000 | which Can |
+| `baseline_plus_reachability` | `vlm_plus_reachability` | 6 | 11 | 13 | +0.031 | 0.839 | prompt against Can grounding |
+
+What the tables showed:
+
+1. **Grounding works in the prompt or in the Can term, and either is
+   enough.**
+   - The available-first prompt cuts the ungrounded top choice from 0.729 to
+     0.042.
+   - Under the baseline prompt, the Can term does the grounding. Without it,
+     the planner succeeds in no episode, and 61 of 64 episodes end on an
+     infeasible skill, mostly `craft_wood_pickaxe`. With reachability it
+     succeeds in 17, and those 17 discordant pairs all favour reachability.
+   - Under the available-first prompt, adding the Can term changes two
+     episodes.
+2. **Which Can term is used does not show in the closed loop.** Reachability
+   and the competence prior each succeed in 17 of 64 episodes, with 3
+   discordant pairs each way. On the prefix ladder the prior accepts 48 of 48
+   and reachability 46. Both are above the achievable 45, because they are
+   credited when they choose an unreachable reference skill.
+3. **Seeded order scores at or above catalog order in every run, but never
+   significantly.** In this run it won 19 against 13 (p = 0.26).
+   - At the last boundary, catalog order misses in 3 of 8 episodes against 1
+     for seeded order. In earlier runs, catalog order's misses there were
+     `collect_wood`, which it always lists first, chosen over an available
+     `collect_stone`.
+   - Catalog order also needed a ranking repair in 0.146 of responses, against
+     0.021 for seeded order.
+4. **The VLM does not beat the best fixed plan.**
+   - `vlm_plus_reachability` loses to `scripted_collect_first`, 19 against 39
+     (p < 0.001).
+   - It beats `feasibility_only` by 0.125, which is not significant
+     (p = 0.15).
+   - The available-first conditions complete more skills than the default
+     scripted plan, 6.3 to 7.2 against 3.9, yet finish the chain about as
+     often, 0.203 to 0.297 against 0.250. They hit the 12-decision limit in 11
+     or 12 episodes, repeating sub-goals after timeouts. The grounded
+     baseline-prompt conditions hit it in 5 or 6, and `feasibility_only` in
+     33.
+5. **The executor sets the ceiling.**
+   - Plan order alone moves the scripted plan from 0.250 to 0.609, with 28
+     discordant pairs against 5.
+   - All 48 of the default plan's failures are timeouts, 41 of them in
+     `collect_wood`.
+   - `collect_wood` is the final failed skill in 36 to 41 of 64 episodes under
+     every VLM condition except `baseline_prompt_only`.
+   - Held out, `collect_wood` succeeds 0.941 of the time when the target is
+     two steps away or closer, and 0.581 at three to six steps.
+   - At these success rates, detecting a 0.10 difference takes about 300
+     unpaired episodes an arm. Planner differences of that size stay
+     unreadable until the executor's variance comes down.
+
+The feasibility fits for this executor, probed at every chain boundary, 432
+probes on the fit seed (7) and 432 on the held-out seed (23):
+
+- **Competence prior:** held-out AUC 0.738 and Brier score 0.208, over the 192
+  probes whose precondition held.
+- **Reachability:** splits success 0.739 against 0.041. Eleven skills the
+  predicate called unreachable were completed anyway, by walking out of the
+  observation window. Each of those is an episode a hard gate would have
+  thrown away.
+- **Critic:** held-out AUC 0.369, below chance. Isotonic calibration brings
+  its error (ECE) to 0.047 only because the fit collapses onto the base rate.
+
+## Executor improvement plan and diagnostics
+
+The plan below was the README's "Current work" section from October 21, 2026,
+written before any 10M-step run. The measurements after it come from
+notebook 07's `full` preset on seed 101, and from seed 202 for the randomized
+evaluation.
+
+### The plan as written
+
+Plan order changes nothing about the planner, so the gap between the two fixed
+plans is in the states each order hands the executor. `local_navigation`
+trains on none of those states. Every episode starts:
+
+- at the map centre, in a cleared window;
+- with one target and a reserved straight route;
+- with the minimal inventory;
+- at dawn.
+
+A chain boundary differs in each of those ways.
+
+The work is ordered so that each step is measured before the next is paid for:
+
+1. **Benchmark the executor alone.** `benchmark_executor` runs both fixed
+   plans over 512 worlds with a greedy executor. It records every
+   first-attempt boundary, so success can be read by skill and by distance
+   band. It uses seed 101, which is disjoint from the calibration and
+   evaluation seeds.
+2. **Attribute failures.** `probe_counterfactuals` edits the boundary states
+   one training difference at a time:
+   - remove tables;
+   - clear the view;
+   - reset the inventory, the vitals, or the clock.
+
+   It then reruns the option from the same key. A replay-agreement check on
+   the unedited state confirms that the comparison is exact.
+   `failed_rollout_features` describes what a failed option did, such as
+   reaching the target without facing it.
+3. **Widen the training distribution.** The `randomized` scenario undoes each
+   `local_navigation` control through one `ScenarioRandomization` knob:
+   - obstacles on the route;
+   - extra targets no closer than the sampled one;
+   - a table in view;
+   - a player offset from the centre;
+   - natural rather than cleared terrain;
+   - random holdings and vitals;
+   - a start time up to step 300.
+
+   With every knob at its `local_navigation` value it reproduces that setup,
+   so each knob can be ablated on its own. Every world stays solvable, and all
+   six skills, including `place_table`, train on it.
+4. **Train and select.** `notebooks/07_improve_executor.ipynb` trains three
+   randomized seeds and a step-matched `local_navigation` control. It compares
+   each against the baseline on the benchmark worlds, greedy and stochastic,
+   and checks that `local_navigation` success has not regressed. It then
+   writes the best run to `runs/executor-improvement-full/selected_executor.json`.
+5. **Verify in the full system.** Notebook 06 reads that file and measures the
+   baseline and the candidate side by side:
+   - It fits a competence prior for each executor.
+   - It pairs their probes on identical oracle states, which compares the
+     executors with the planner held fixed.
+   - It runs every closed-loop condition under both executors on the same
+     worlds.
+
+   Its `executor` preset runs only this comparison.
+
+**Success criterion.** The candidate closes most of the 0.250-to-0.609
+plan-order gap, and its `scripted_oracle` beats the baseline's in the paired
+executor table, without a `local_navigation` regression.
+
+Tasks, with their state on October 21:
+
+- Benchmark the executor on both fixed plans. **Implemented.**
+- Attribute boundary failures with counterfactual edits. **Implemented.**
+- Train on the randomized scenario, with every control switchable.
+  **Implemented; the 10M-step runs are pending.**
+- Compare executors in notebook 06, with a refitted competence prior.
+  **Implemented; pending the selected run.**
+- If the gap remains: mine boundary states from chain rollouts on disjoint
+  seeds, then consider prioritized level replay or behaviour cloning from the
+  scripted policy.
+
+The gap closed, so the last task was not needed.
+
+### Baseline benchmark and attribution
+
+With a greedy executor, the baseline completed the default plan in 0.086 of
+512 worlds and the collect-first plan in 0.248, a gap of +0.162 (33 against
+116 discordant). The default plan's third `collect_wood`, the first one after
+the table is placed, is where that gap lives:
+
+| Skill | Occurrence | Table present | n | Success |
+| --- | ---: | --- | ---: | ---: |
+| `collect_wood` | 1 | no | 512 | 0.973 |
+| `collect_wood` | 2 | no | 503 | 0.903 |
+| `place_table` | 1 | no | 467 | 1.000 |
+| `collect_wood` | 3 | yes | 467 | 0.158 |
+| `craft_wood_pickaxe` | 1 | yes | 87 | 0.977 |
+| `collect_stone` | 1 | yes | 85 | 0.447 |
+
+Counterfactual edits over the 4,639 recorded boundaries, each paired against
+the unedited replay:
+
+| Edit | n | Ref only | Edit only | Diff | p |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `remove_tables` | 4,207 | 16 | 511 | +0.118 | <0.001 |
+| `clear_view` | 4,639 | 23 | 795 | +0.166 | <0.001 |
+| `training_inventory` | 4,639 | 22 | 85 | +0.014 | <0.001 |
+| `training_vitals` | 4,639 | 41 | 45 | +0.001 | 0.747 |
+| `training_clock` | 4,639 | 5 | 8 | +0.001 | 0.581 |
+| all | 4,639 | 28 | 793 | +0.165 | <0.001 |
+
+- Clearing the view lifted `collect_wood` from 0.781 to 0.977 and
+  `collect_stone` from 0.342 to 0.781. Removing tables lifted them to 0.893
+  and 0.723.
+- The unedited replay agreed with the chain at 0.998 of boundaries, not
+  1.000, and the notebook flagged it. The edits are near-exact rather than
+  exact, which does not affect effects of this size.
+- Of 934 failed first attempts, 648 were `collect_wood` and 283
+  `collect_stone`. A failed `collect_wood` came near its target in 0.202 of
+  attempts and faced it in 0.080, visited 3.5 distinct positions, and spent
+  0.946 of its steps revisiting them. The policy stayed within a few tiles
+  rather than failing at the interaction.
+
+### Training and selection
+
+The three randomized seeds and the `local-matched` control each trained for
+9,830,400 steps with 96 environments and a 64-step skill horizon, in 1,601 to
+1,781 s. Training macro success, by step:
+
+| Run | 1.5M | 2.15M | 3.1M | 4.9M | 9.8M |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `randomized-seed0` | 0.912 | 0.988 | 0.996 | 0.995 | 0.999 |
+| `randomized-seed1` | 0.943 | 0.989 | 0.990 | 0.997 | 1.000 |
+| `randomized-seed2` | 0.943 | 0.988 | 0.988 | 0.998 | 1.000 |
+| `local-matched-seed0` | 0.956 | 0.972 | 0.993 | 0.999 | 1.000 |
+
+The 512-world benchmark on seed 101:
+
+| Executor | Greedy default | Greedy collect-first | Greedy gap | Stochastic default | Stochastic collect-first | Stochastic gap |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline | 0.086 | 0.248 | +0.162 | 0.309 | 0.627 | +0.318 |
+| `randomized-seed0` | 0.996 | 0.998 | +0.002 | 0.996 | 0.994 | -0.002 |
+| `randomized-seed1` | 0.988 | 0.988 | +0.000 | 0.996 | 0.994 | -0.002 |
+| `randomized-seed2` | 0.982 | 0.986 | +0.004 | 0.994 | 0.996 | +0.002 |
+| `local-matched-seed0` | 0.395 | 0.648 | +0.254 | 0.516 | 0.834 | +0.318 |
+
+Held-out randomized worlds on seed 202, by skill:
+
+| Skill | Baseline | `randomized-seed0` | `randomized-seed1` | `randomized-seed2` | `local-matched-seed0` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `collect_wood` | 0.582 | 1.000 | 1.000 | 1.000 | 0.859 |
+| `collect_stone` | 0.547 | 1.000 | 1.000 | 1.000 | 0.922 |
+| `drink_water` | 0.480 | 0.996 | 0.996 | 0.996 | 0.906 |
+| `place_table` | 0.902 | 1.000 | 1.000 | 1.000 | 0.898 |
+| `craft_wood_pickaxe` | 0.676 | 1.000 | 1.000 | 1.000 | 0.953 |
+| `craft_wood_sword` | 0.715 | 1.000 | 1.000 | 1.000 | 0.984 |
+
+The `local_navigation` regression check put every new run, `local-matched`
+included, at 1.000 on all five skills it covers. The baseline scored 0.922
+for wood, 0.684 for stone, 0.594 for water, and 1.000 for both crafting
+skills.
+
+Notebook 07 selects the randomized run with the best stochastic default-plan
+success. `randomized-seed0` and `randomized-seed1` tied at 0.996, and the
+first in order was kept. The selection cell's printed output was not saved
+with the notebook; notebook 06's candidate path confirms the choice.
+
 ## Changelog
 
 Verified locally on October 8, 2026:
@@ -889,9 +1167,9 @@ Executor improvement started on October 21, 2026:
 
 Notebook 06 adapted and README reorganized on October 21, 2026:
 
-- Read the first full run of the restructured ladder. The README's
-  [Latest findings](README.md#latest-findings) section records its prefix,
-  closed-loop, and paired tables.
+- Read the first full run of the restructured ladder. Its prefix,
+  closed-loop, and paired tables are in
+  [Planner ablations with the baseline executor](#planner-ablations-with-the-baseline-executor).
 - Notebook 06 now measures the baseline executor against the one notebook 07
   selects. It fits a competence prior for each executor and pairs their probes
   on identical oracle states. It also runs every closed-loop condition under
@@ -901,3 +1179,39 @@ Notebook 06 adapted and README reorganized on October 21, 2026:
 - Notebook 07 writes `selected_executor.json` with the run it selected and the
   seed it selected on, and notebook 06 reads it.
 - Moved superseded README material and this changelog into `ARCHIVE.md`.
+
+Executor improvement completed on October 22, 2026:
+
+- Ran notebook 07's `full` preset. Three `randomized` seeds and a step-matched
+  `local_navigation` control trained for 9.8M steps each, in about 27 to 30
+  minutes apiece. On the stochastic benchmark, seed 101, every randomized seed
+  completed both fixed plans in 0.994 to 0.996 of 512 worlds, against 0.309
+  and 0.627 for the baseline. The plan-order gap fell from +0.318 to between
+  -0.002 and +0.002. Nothing regressed on `local_navigation`. The tables are
+  in [Executor improvement plan and diagnostics](#executor-improvement-plan-and-diagnostics).
+- Recorded the `local-matched` control as a refuted approach. Ten million steps
+  on `local_navigation` raised default-plan success from 0.309 to 0.516 but left
+  the gap at +0.318, so the scenario closed the gap, not the budget or the
+  horizon.
+- Selected `randomized-seed0` on stochastic default-plan success, at 0.996.
+- Ran notebook 06's `full` preset with both executors. The baseline executor
+  reproduced the October 21 closed loop exactly. Under the candidate, the
+  scripted oracle succeeded in 64 of 64 episodes against 16 (48 discordant
+  pairs against 0). The plan-order gap went from +0.359 to -0.016, and
+  `vlm_plus_reachability` from 0.297 to 0.781.
+- Paired held-out probes from identical oracle states: the candidate
+  succeeded in 0.442 of 432 against 0.301 (62 discordant against 1), 0.994
+  against 0.739 where the target was reachable.
+- The competence prior refitted on the candidate is flat: every cell is
+  p = 1.000, with held-out base rate 0.995 and AUC 0.500. Its closed loop is
+  identical to reachability's, 62 of 64 each with no discordant pair.
+  Recorded as a refuted approach under a strong executor. The candidate's
+  critic AUC is 0.437, still below chance.
+- Read the new bottleneck. Every `vlm_plus_reachability` failure ends at the
+  12-decision limit with no skill failure, at 8.28 skills an episode. The
+  ungrounded `baseline` prompt with reachability now beats the grounded
+  `available_first` prompt, 62 against 50 of 64 (13 discordant against 1,
+  p = 0.002). That reverses the baseline executor's +0.031 (p = 0.84).
+- Moved the baseline-executor ladder, its feasibility fits, and the
+  executor-improvement plan from the README into this archive. The README's
+  current work is now planner sequencing.

@@ -7,7 +7,7 @@ import json
 import math
 import time
 from collections import Counter, deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
@@ -172,6 +172,10 @@ class ChainStepTrace:
     candidate_scores: tuple[SkillScore, ...]
     planner_ranking: tuple[SkillId, ...]
     planner_raw_response: str | None
+    # The skills that progress the objective from the state this decision was
+    # made in, read from the chain's valid_next_skills -- the set the prefix
+    # ladder calls accepted. Empty when the chain does not define one.
+    accepted_skills: tuple[SkillId, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1878,6 +1882,12 @@ def evaluate_chain_episodes(
                     candidate_scores=decision.scores,
                     planner_ranking=selection.utility_ranking,
                     planner_raw_response=selection.utility_raw_response,
+                    # cursor.state is still the state the decision was made in.
+                    accepted_skills=(
+                        chain.valid_next_skills(cursor.state)
+                        if chain.valid_next_skills is not None
+                        else ()
+                    ),
                 )
             )
             cursor.state = result.state
@@ -2078,7 +2088,13 @@ def compare_paired_successes(
 def _episode_successes(result: dict[str, Any]) -> list[bool]:
     if "episode_successes" in result:
         return [bool(value) for value in result["episode_successes"]]
-    return [episode.succeeded for episode in result["episodes"]]
+    # Episodes are ChainEpisodeResult objects, or their records once saved.
+    def succeeded(episode: Any) -> bool:
+        if isinstance(episode, Mapping):
+            return episode["succeeded"]
+        return episode.succeeded
+
+    return [bool(succeeded(episode)) for episode in result["episodes"]]
 
 
 def paired_success_summary(
@@ -2110,50 +2126,64 @@ def paired_success_summary(
     }
 
 
-def _json_ready_result(result: dict[str, Any]) -> dict[str, Any]:
-    episodes = []
-    for episode in result["episodes"]:
-        episodes.append(
+def chain_episode_record(episode: ChainEpisodeResult) -> dict[str, Any]:
+    """Serialize one chain episode, per-decision trace included, for JSON.
+
+    Every field is a plain Python value, so the record survives
+    ``json.dumps`` without a ``default`` hook and reads back unchanged. The
+    planner's raw response is kept per decision because it is the only
+    record of what the utility model saw as progress.
+    """
+
+    return {
+        "succeeded": bool(episode.succeeded),
+        "completed_skills": int(episode.completed_skills),
+        "decisions": int(episode.decisions),
+        "environment_steps": int(episode.environment_steps),
+        "native_return": float(episode.native_return),
+        "termination": episode.termination.value,
+        "planner_error": episode.planner_error,
+        "planner_raw_response": episode.planner_raw_response,
+        "trace": [
             {
-                "succeeded": episode.succeeded,
-                "completed_skills": episode.completed_skills,
-                "decisions": episode.decisions,
-                "environment_steps": episode.environment_steps,
-                "native_return": episode.native_return,
-                "termination": episode.termination.value,
-                "planner_error": episode.planner_error,
-                "planner_raw_response": episode.planner_raw_response,
-                "trace": [
+                "decision_index": int(trace.decision_index),
+                "requested_skill": trace.requested_skill.value,
+                "outcome": trace.outcome.value,
+                "steps": int(trace.steps),
+                "native_return": float(trace.native_return),
+                "utility": float(trace.utility),
+                "feasibility": float(trace.feasibility),
+                "combined_score": float(trace.combined_score),
+                "accepted_skills": [
+                    skill_id.value for skill_id in trace.accepted_skills
+                ],
+                "planner_ranking": [
+                    skill_id.value for skill_id in trace.planner_ranking
+                ],
+                "planner_raw_response": trace.planner_raw_response,
+                "candidate_scores": [
                     {
-                        "decision_index": trace.decision_index,
-                        "requested_skill": trace.requested_skill.value,
-                        "outcome": trace.outcome.value,
-                        "steps": trace.steps,
-                        "native_return": trace.native_return,
-                        "utility": trace.utility,
-                        "feasibility": trace.feasibility,
-                        "combined_score": trace.combined_score,
-                        "planner_ranking": [
-                            skill_id.value
-                            for skill_id in trace.planner_ranking
-                        ],
-                        "planner_raw_response": trace.planner_raw_response,
-                        "candidate_scores": [
-                            {
-                                "skill_id": score.skill_id.value,
-                                "utility": score.utility,
-                                "feasibility": score.feasibility,
-                                "failure_penalty": score.failure_penalty,
-                                "combined": score.combined,
-                            }
-                            for score in trace.candidate_scores
-                        ],
+                        "skill_id": score.skill_id.value,
+                        "utility": float(score.utility),
+                        "feasibility": float(score.feasibility),
+                        "failure_penalty": float(score.failure_penalty),
+                        "combined": float(score.combined),
                     }
-                    for trace in episode.trace
+                    for score in trace.candidate_scores
                 ],
             }
-        )
-    return {**result, "episodes": episodes}
+            for trace in episode.trace
+        ],
+    }
+
+
+def json_ready_chain_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Return an :func:`evaluate_skill_chain` result with serialized episodes."""
+
+    return {
+        **result,
+        "episodes": [chain_episode_record(episode) for episode in result["episodes"]],
+    }
 
 
 def main() -> None:
@@ -2200,7 +2230,7 @@ def main() -> None:
         max_failures_per_skill=args.max_failures_per_skill,
         distractor_count=args.distractor_count,
     )
-    print(json.dumps(_json_ready_result(result), indent=2, sort_keys=True))
+    print(json.dumps(json_ready_chain_result(result), indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import dataclasses
+import json
 from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any
@@ -28,6 +29,7 @@ from tiny_sima.evaluation.chains import (
     evaluate_chain_episodes,
     evaluate_learned_skill_chain_batched,
     evaluate_skill_chain,
+    json_ready_chain_result,
     probe_skills_batched,
 )
 from tiny_sima.executor.model import (
@@ -728,3 +730,44 @@ def test_conditions_on_one_seed_pair_episode_by_episode() -> None:
 
     assert comparison["num_pairs"] == 3
     assert comparison["reference_only"] == comparison["candidate_only"] == 0
+
+
+def test_paired_comparison_reads_serialized_episodes_without_successes_key() -> None:
+    # A result reloaded from a saved closed loop has dict episodes and no
+    # episode_successes key unless the caller added one; pairing must still
+    # read success off each record rather than off an object attribute.
+    result = evaluate_skill_chain(ScriptedSkillExecutor(), num_episodes=3, seed=5)
+    serialized = json.loads(json.dumps(json_ready_chain_result(result)))
+
+    comparison = compare_paired_successes(serialized, serialized)
+
+    assert comparison["num_pairs"] == 3
+    assert comparison["reference_only"] == comparison["candidate_only"] == 0
+
+
+def test_serialized_result_keeps_every_decision_through_json() -> None:
+    result = evaluate_skill_chain(
+        ScriptedSkillExecutor(),
+        num_episodes=2,
+        seed=3,
+        skill_horizon=32,
+    )
+
+    serialized = json_ready_chain_result(result)
+    # No default hook: every value must already be plain JSON.
+    restored = json.loads(json.dumps(serialized))
+
+    assert restored == serialized
+    assert restored["success_rate"] == result["success_rate"]
+    for episode, record in zip(result["episodes"], restored["episodes"], strict=True):
+        assert record["succeeded"] is episode.succeeded
+        assert record["termination"] == episode.termination.value
+        assert len(record["trace"]) == record["decisions"] == episode.decisions
+        for trace, step in zip(episode.trace, record["trace"], strict=True):
+            assert step["requested_skill"] == trace.requested_skill.value
+            assert step["outcome"] == trace.outcome.value
+            assert step["steps"] == trace.steps
+            assert len(step["candidate_scores"]) == len(SKILL_IDS)
+            # The oracle only ever requests a skill the objective accepts from
+            # the state it decided in, so the set is the pre-decision one.
+            assert step["requested_skill"] in step["accepted_skills"]
