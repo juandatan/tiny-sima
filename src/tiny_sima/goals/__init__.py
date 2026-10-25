@@ -17,6 +17,7 @@ from tiny_sima.goals.reachability import (
     walkable_mask,
 )
 from tiny_sima.goals.skills import (
+    ALL_SKILL_IDS,
     SKILL_IDS,
     SKILL_REGISTRY,
     SKILL_TO_INDEX,
@@ -26,6 +27,7 @@ from tiny_sima.goals.skills import (
     SkillSpec,
     StateEffect,
     StateRequirement,
+    executor_skill_ids,
     get_skill_spec,
     planner_skill_catalog,
     skill_catalog,
@@ -41,6 +43,7 @@ from tiny_sima.goals.skills import (
 )
 
 __all__ = [
+    "ALL_SKILL_IDS",
     "DEFAULT_REACHABILITY",
     "OBSERVATION_RADIUS",
     "SKILL_REGISTRY",
@@ -55,6 +58,7 @@ __all__ = [
     "StateEffect",
     "StateRequirement",
     "block_mask",
+    "executor_skill_ids",
     "get_skill_spec",
     "interaction_distance",
     "planner_skill_catalog",

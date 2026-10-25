@@ -1215,3 +1215,26 @@ Executor improvement completed on October 22, 2026:
 - Moved the baseline-executor ladder, its feasibility fits, and the
   executor-improvement plan from the README into this archive. The README's
   current work is now planner sequencing.
+
+Planner sequencing diagnosed on October 25, 2026:
+
+- Read the October 22 closed-loop traces in notebook 06, candidate executor,
+  seed 51. 162 of `vlm_plus_reachability`'s 163 off-objective decisions were
+  `say_led`. `baseline_plus_reachability` solved 13 of the 14 worlds it lost;
+  its own waste was a second wood pickaxe (23 decisions) and extra wood (25).
+- Made `baseline_plus_reachability` the main condition. Recorded
+  `available_first` as a refuted approach for the main condition, 50 against
+  62 of 64 (13 discordant against 1, p = 0.002), kept as an ablation.
+  `DEFAULT_PROMPT_STYLE` is unchanged so that saved ablation runs keep their
+  meaning; the notebook names the baseline style explicitly.
+- Added `SkipHeldCraftFeasibility` and the
+  `baseline_plus_reachability_skip_held` condition.
+- Added `craft_stone_pickaxe` as an opt-in seventh skill (`num_skills: 7`),
+  the `wood_to_stone_pickaxe` chain with four trees and a 16-decision limit,
+  its collect-first plan, and seven-skill training configs and notebook 07
+  presets. Six-skill checkpoints, competence priors, and system prompts are
+  byte-identical to before. Executors now refuse skills they were not trained
+  on, because JAX clamps an out-of-range embedding index silently.
+- Executor benchmarks pair local-navigation results by skill, so a
+  seven-skill run compares against the six-skill baseline.
+- Added notebook 06's `CHAIN` and `CONFIRM` knobs.

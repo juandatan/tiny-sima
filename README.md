@@ -20,7 +20,7 @@ that policy says which skills are currently possible?
 
 ## Status
 
-As of October 22, 2026:
+As of October 25, 2026:
 
 - **Phases 1 to 3 are complete.** The environment, PPO baseline, skill
   benchmark, and goal-conditioned executor are done.
@@ -39,8 +39,14 @@ As of October 22, 2026:
   skill failed in any of the 64 episodes. The ungrounded `baseline` prompt
   with the reachability Can term now beats the grounded `available_first`
   prompt, 62 against 50 (p = 0.002).
-- **Current work is planner sequencing.** It starts with reading the
-  decision-limit episodes, before any planner change is measured.
+- **The sequencing diagnosis is done, and the main condition changed.** 162
+  of the `available_first` prompt's 163 off-objective decisions were the
+  VLM's own first choice, so `baseline_plus_reachability` is now the main
+  condition and `available_first` an ablation. Its remaining waste is a
+  second wood pickaxe (23 decisions over 64 episodes) and extra wood (25).
+- **Current work is the last Phase 4 measurement.** A held-craft veto, a
+  seventh skill (`craft_stone_pickaxe`), and a longer stone-pickaxe chain are
+  implemented and tested, but not yet measured on the GPU.
 - **Phases 5 and 6, memory and full evaluation, have not started.**
 
 ## System overview
@@ -77,8 +83,9 @@ is called once per option boundary, not per frame. It sees:
 
 Generation is schema-constrained with Outlines and greedy, so a response is a
 function of the prompt. The schema's field order works as a scaffold. Under
-the default `available_first` prompt style, the model must echo which skills
-are available before it may name a choice. It then emits a full ranking, and
+the `available_first` prompt style, now an ablation, the model must echo which
+skills are available before it may name a choice. The main condition uses the
+`baseline` style, which leaves grounding to the Can term. It then emits a full ranking, and
 the rank sets the skill's utility by a reciprocal-square rule. Rankings that
 repeat a skill, or that do not put the selected skill first, are repaired at
 parse time and flagged.
@@ -95,7 +102,9 @@ parse time and flagged.
 The final score is `utility * feasibility * failure_penalty`.
 
 **Executor.** One recurrent PPO policy, conditioned on a learned embedding of
-the skill ID, handles all six skills:
+the skill ID, handles all six skills. A seventh, `craft_stone_pickaxe`, is
+opt-in through `num_skills: 7`; the first six keep their embedding indices, so
+six-skill checkpoints, priors, and prompts load unchanged:
 
 - `collect_wood`
 - `collect_stone`
@@ -115,8 +124,12 @@ every executor change is paired against.
 with the objective `wood -> wood -> table -> wood -> wood pickaxe -> stone`.
 The reference order is private to the scripted baseline. The planner sees only
 the objective and its own outcomes, and success is read from the final Craftax
-state. An episode ends at success, after 12 decisions, or when one skill has
-failed twice.
+state. An episode ends at success, after twice the reference plan's length in
+decisions (12 here), or when one skill has failed twice.
+
+The longer `wood_to_stone_pickaxe` chain adds a fourth wood and the stone
+pickaxe: eight reference decisions, a limit of 16, and four trees per world,
+since a mined tree is gone. It needs a seven-skill executor.
 
 **Memory.** The memory package is still a placeholder. Recent outcomes in the
 planner context are the only memory so far.
@@ -349,30 +362,49 @@ the gap and trained it away. The full plan and diagnostics are in
   oracle went from 16 to 64 of 64 (48 discordant pairs against 0), and the
   plan-order gap from +0.359 to -0.016. That meets the success criterion.
 
-## Current work: planner sequencing
+## Current work: closing Phase 4
 
-The executor now completes the skills the strongest conditions choose. The
-0.203 between `vlm_plus_reachability` and `scripted_collect_first` is in which
-skills the planner picks and in what order. The prefix ladder cannot measure
-that, because it scores single choices on oracle states, so the closed loop
-is the measurement.
+**The diagnosis.** Notebook 06 read the per-decision traces of the October 22
+closed loop, candidate executor, seed 51:
 
-The work is ordered so that the diagnosis comes before any planner change:
+- `vlm_plus_reachability` made 163 off-objective decisions, and 162 were
+  `say_led`: the VLM ranked an unaccepted skill first and the planner took it.
+  The Can term was not the cause.
+- `baseline_plus_reachability` solved 13 of the 14 worlds the grounded prompt
+  lost. Its own waste was a second `craft_wood_pickaxe`, 23 decisions, and
+  wood beyond what the chain needs, 25.
+- The executor finished nearly every skill asked of it, so the remaining gap
+  is the planner's.
 
-1. **Diagnose from per-decision traces.** Read the 14 decision-limit episodes
-   of `vlm_plus_reachability`, and the 13 episodes that only
-   `baseline_plus_reachability` solved. For each wasted decision, record
-   which skill was chosen, whether its effect was already satisfied, and what
-   `available_now` and the assessment said. That also tests the echo
-   hypothesis.
-2. **Improve the planner, measured in the closed loop on the new executor.**
-   The candidates are:
-   - decision history and inventory progress toward the objective in the
-     prompt;
-   - a hybrid prompt, or one with no `available_now` echo;
-   - skipping skills whose effect is already satisfied.
+**What changed:**
 
-**The bar** is `scripted_collect_first`, at 63 of 64.
+1. **Main condition.** `baseline_plus_reachability` replaces
+   `vlm_plus_reachability`, which is kept as an ablation and recorded as
+   refuted: 50 against 62 of 64 (13 discordant against 1, p = 0.002).
+2. **Held-craft veto.** `SkipHeldCraftFeasibility` scores zero any craft
+   whose only effects are tools already held. It reads the skill registry's
+   declared effects, never the chain's accepted set, so it cannot leak the
+   objective. `baseline_plus_reachability_skip_held` pairs it against the main
+   condition.
+3. **A longer chain.** The `wood_to_stone_pickaxe` chain and a seventh skill,
+   `craft_stone_pickaxe` (one wood and one stone at a table). The six-skill
+   chain is saturated: the oracle solves 64 of 64 and the main condition 62.
+   Training config: `configs/skill_ppo_stone_pickaxe_randomized_10m.yaml`, or
+   notebook 07's `stone_pickaxe` preset.
+4. **Confirmation seed.** Notebook 06's `CONFIRM` reruns on seed 202, which
+   no planner choice was made on.
+
+**To run, in order:**
+
+1. Notebook 06 `full` on seed 51, then with `CONFIRM = True`. The veto is
+   adopted as the main condition only if it holds on both.
+2. Notebook 07 `stone_pickaxe`, which trains three seven-skill seeds and
+   records the selected one.
+3. Notebook 06 with `CHAIN = WOOD_TO_STONE_PICKAXE_CHAIN` and the
+   seven-skill executor selected. Read `scripted_oracle` first: the planner
+   conditions cannot beat what the executor finishes.
+
+**The bar** stays the collect-first scripted plan on each chain.
 
 ### Seeds
 
@@ -385,7 +417,7 @@ a result reported on another:
 | 23 | Held-out scoring of both feasibility heads |
 | 51 | Planner prefix ladder and closed-loop evaluation |
 | 101 | Executor benchmark and run selection, in notebook 07 |
-| 202 | Randomized-scenario evaluation |
+| 202 | Randomized-scenario evaluation in notebook 07; confirmation of planner choices in notebook 06 (`CONFIRM`) |
 
 Boundary states mined for training must come from seeds disjoint from all of
 these.
@@ -397,7 +429,7 @@ these.
 | 1. Environment and baseline | A reproducible Craftax PPO-RNN setup with throughput and memory measured | Complete |
 | 2. Skill benchmark | Six skills with preconditions, success predicates, sparse rewards, and scripted and random baselines | Complete |
 | 3. Goal-conditioned executor | One policy for every skill, trained on `local_navigation`, then on the `randomized` scenario | Complete |
-| 4. Hierarchical planner | A frozen VLM in a SayCan loop, with a grounded ablation ladder | Planner and executor measured; planner sequencing in progress |
+| 4. Hierarchical planner | A frozen VLM in a SayCan loop, with a grounded ablation ladder | Sequencing diagnosed; held-craft veto and stone-pickaxe chain awaiting measurement |
 | 5. Memory and visual grounding | Structured episodic memory; symbolic against pixel inputs; frame history; paraphrased instructions | Not started |
 | 6. Full evaluation | Long-horizon objectives, multi-seed ablations, compute accounting, and documented failures | Not started |
 
@@ -408,21 +440,18 @@ failed as one.
 
 Next steps, in order:
 
-1. **Diagnose planner sequencing** from the per-decision closed-loop traces
-   notebook 06 saves. Start with the 14 decision-limit episodes of
-   `vlm_plus_reachability` and the 13 that only `baseline_plus_reachability`
-   solved.
-2. **Improve the planner**, measured in the closed loop on the new executor:
-   decision history and inventory progress in the prompt, a hybrid or no-echo
-   prompt, and skipping skills whose effect is already satisfied. The bar is
-   `scripted_collect_first`, at 63 of 64.
-3. **Move to a harder objective.** A longer chain, such as stone pickaxe,
-   then furnace, then iron, needs new skills and new executor training. About
-   3M steps should suffice: training macro success reached 0.988 to 0.989 in
-   every randomized seed by 2.15M steps.
+1. **Measure the held-craft veto** in notebook 06 on seed 51, then confirm on
+   seed 202.
+2. **Train the seven-skill executor** with notebook 07's `stone_pickaxe`
+   preset, and check that it still pairs with the baseline on the six-skill
+   benchmark.
+3. **Run the stone-pickaxe chain** in notebook 06. That closes Phase 4.
 4. **Cut evaluation cost.** Reuse the saved baseline-executor closed loops,
-   which took 1,776 s of this run against 1,611 s for the candidate. Consider
-   dropping the baseline executor from notebook 06's `full` preset.
+   which took 1,776 s of the October 22 run against 1,611 s for the
+   candidate. `MEASURE_BASELINE` now defaults to off.
+5. **Longer chains in Phase 6.** A furnace and iron need further skills; about
+   3M training steps should suffice per added stage, since training macro
+   success reached 0.988 in every randomized seed by 2.15M steps.
 
 Phase 4 items still open:
 
@@ -461,6 +490,10 @@ tiny-sima-train-skills --config configs/skill_ppo_local_1m.yaml
 # Current executor: the randomized scenario, about 10M steps, 96 environments.
 tiny-sima-train-skills --config configs/skill_ppo_randomized_debug.yaml
 tiny-sima-train-skills --config configs/skill_ppo_randomized_10m.yaml
+
+# Seven skills, for the stone-pickaxe chain: 112 environments, 16 per skill.
+tiny-sima-train-skills --config configs/skill_ppo_stone_pickaxe_randomized_debug.yaml
+tiny-sima-train-skills --config configs/skill_ppo_stone_pickaxe_randomized_10m.yaml
 ```
 
 The current executor itself, `runs/executor-improvement-full/randomized-seed0`,

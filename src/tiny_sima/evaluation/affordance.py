@@ -33,12 +33,12 @@ from typing import Any
 import jax
 import numpy as np
 
-from tiny_sima.envs.chains import make_skill_chain_environment
 from tiny_sima.evaluation.chains import (
     WOOD_TO_STONE_CHAIN,
     LearnedSkillExecutor,
     ScriptedSkillExecutor,
     SkillChainSpec,
+    chain_environment,
     probe_skills_batched,
 )
 from tiny_sima.goals import (
@@ -112,7 +112,7 @@ def collect_affordance_samples(
     skills = tuple(candidate_skills)
     if not skills:
         raise ValueError("At least one candidate skill is required.")
-    environment = make_skill_chain_environment(distractor_count=distractor_count)
+    environment = chain_environment(chain, distractor_count=distractor_count)
     oracle = ScriptedSkillExecutor()
     # The reachability gate reads only the state, but the scorer interface takes
     # a planner context, so a bare objective stands in for one here.
@@ -333,6 +333,7 @@ def fit_affordance_competence_prior(
     prior_strength: float = DEFAULT_PRIOR_STRENGTH,
     floor: float = DEFAULT_FLOOR,
     config: ReachabilityConfig = DEFAULT_REACHABILITY,
+    skills: Sequence[SkillId] = SKILL_IDS,
 ) -> CompetencePrior:
     """Fit the ``(skill, reachable, steps)`` competence head from probes.
 
@@ -354,6 +355,7 @@ def fit_affordance_competence_prior(
         prior_strength=prior_strength,
         floor=floor,
         config=config,
+        skills=skills,
     )
 
 

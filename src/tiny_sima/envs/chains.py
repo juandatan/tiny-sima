@@ -26,6 +26,7 @@ class SkillChainEnvironment:
 
     bundle: CraftaxBundle
     distractor_count: int = 3
+    tree_count: int = 3
 
     def reset(self, rng: jax.Array) -> SkillChainReset:
         world_rng, scenario_rng = jax.random.split(rng)
@@ -34,6 +35,7 @@ class SkillChainEnvironment:
             state,
             scenario_rng,
             distractor_count=self.distractor_count,
+            tree_count=self.tree_count,
         )
         return SkillChainReset(
             observation=self.bundle.env.get_obs(state),
@@ -59,11 +61,19 @@ def prepare_chain_scenario(
     rng: jax.Array,
     *,
     distractor_count: int = 3,
+    tree_count: int = 3,
 ) -> Any:
-    """Create a randomized but solvable wood-to-stone crafting world."""
+    """Create a randomized but solvable wood-to-stone crafting world.
+
+    Mining a tree turns it to grass, so ``tree_count`` bounds the wood the
+    world holds: three pay for the table and a wood pickaxe, a fourth for a
+    stone pickaxe as well. The default keeps the original worlds unchanged.
+    """
 
     if not 0 <= distractor_count <= 4:
         raise ValueError("distractor_count must be between zero and four.")
+    if not 1 <= tree_count <= 4:
+        raise ValueError("tree_count must be between one and four.")
 
     position_rng, direction_rng = jax.random.split(rng)
     center_row = state.map.shape[0] // 2
@@ -93,10 +103,7 @@ def prepare_chain_scenario(
         dtype=jnp.int32,
     )
     shuffled_offsets = jax.random.permutation(position_rng, candidate_offsets)
-    required_blocks = [
-        BlockType.TREE,
-        BlockType.TREE,
-        BlockType.TREE,
+    required_blocks = [BlockType.TREE] * tree_count + [
         BlockType.STONE,
         BlockType.WATER,
     ]
@@ -107,6 +114,11 @@ def prepare_chain_scenario(
         BlockType.PLANT,
     ]
     blocks = required_blocks + distractor_blocks[:distractor_count]
+    if len(blocks) > candidate_offsets.shape[0]:
+        raise ValueError(
+            f"{len(blocks)} blocks do not fit in "
+            f"{candidate_offsets.shape[0]} placement slots."
+        )
     for index, block in enumerate(blocks):
         position = player_position + shuffled_offsets[index]
         clean_map = clean_map.at[position[0], position[1]].set(block.value)
@@ -142,6 +154,7 @@ def make_skill_chain_environment(
     *,
     max_episode_steps: int = 512,
     distractor_count: int = 3,
+    tree_count: int = 3,
 ) -> SkillChainEnvironment:
     """Create the controlled persistent environment used by chain evals."""
 
@@ -163,4 +176,5 @@ def make_skill_chain_environment(
             spec=bundle.spec,
         ),
         distractor_count=distractor_count,
+        tree_count=tree_count,
     )

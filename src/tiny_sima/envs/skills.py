@@ -31,6 +31,7 @@ from tiny_sima.goals.skills import (
     SKILL_IDS,
     SkillGoal,
     SkillId,
+    executor_skill_ids,
     skill_index,
     skill_metric,
     skill_precondition,
@@ -306,17 +307,24 @@ LOCAL_NAVIGATION_SKILLS: tuple[SkillId, ...] = (
     SkillId.DRINK_WATER,
     SkillId.CRAFT_WOOD_PICKAXE,
     SkillId.CRAFT_WOOD_SWORD,
+    SkillId.CRAFT_STONE_PICKAXE,
 )
 
 
 def skills_for_scenario(
     scenario: SkillScenario | str,
+    skill_ids: tuple[SkillId, ...] = SKILL_IDS,
 ) -> tuple[SkillId, ...]:
-    """Return the skills to which a controlled scenario meaningfully applies."""
+    """Return the skills to which a controlled scenario meaningfully applies.
+
+    ``skill_ids`` is the executor's catalog; the result keeps its order.
+    """
 
     if SkillScenario(scenario) is SkillScenario.LOCAL_NAVIGATION:
-        return LOCAL_NAVIGATION_SKILLS
-    return SKILL_IDS
+        return tuple(
+            skill_id for skill_id in skill_ids if skill_id in LOCAL_NAVIGATION_SKILLS
+        )
+    return skill_ids
 
 
 def _target_block(skill_id: SkillId) -> BlockType | None:
@@ -329,6 +337,7 @@ def _target_block(skill_id: SkillId) -> BlockType | None:
     if skill_id in {
         SkillId.CRAFT_WOOD_PICKAXE,
         SkillId.CRAFT_WOOD_SWORD,
+        SkillId.CRAFT_STONE_PICKAXE,
     }:
         return BlockType.CRAFTING_TABLE
     if skill_id is SkillId.PLACE_TABLE:
@@ -347,6 +356,10 @@ def _scenario_inventory(skill_id: SkillId) -> Inventory:
         SkillId.CRAFT_WOOD_SWORD,
     }:
         return replace(inventory, wood=1)
+    if skill_id is SkillId.CRAFT_STONE_PICKAXE:
+        # The stone could only have been mined with a wood pickaxe, so a
+        # chain always reaches this craft holding one.
+        return replace(inventory, wood=1, stone=1, wood_pickaxe=1)
     return inventory
 
 
@@ -551,7 +564,13 @@ def _prepare_local_navigation_scenario(
 _RESOURCE_SKILLS = frozenset(
     {SkillId.COLLECT_WOOD, SkillId.COLLECT_STONE, SkillId.DRINK_WATER}
 )
-_TABLE_SKILLS = frozenset({SkillId.CRAFT_WOOD_PICKAXE, SkillId.CRAFT_WOOD_SWORD})
+_TABLE_SKILLS = frozenset(
+    {
+        SkillId.CRAFT_WOOD_PICKAXE,
+        SkillId.CRAFT_WOOD_SWORD,
+        SkillId.CRAFT_STONE_PICKAXE,
+    }
+)
 _DEFAULT_PARAMS = EnvParams()
 
 
@@ -613,7 +632,7 @@ def _random_inventory(skill_id: SkillId, rng: jax.Array) -> Inventory:
         base,
         wood=base.wood + wood,
         sapling=sapling,
-        stone=stone,
+        stone=base.stone + stone,
         wood_pickaxe=jnp.maximum(base.wood_pickaxe, pickaxe),
         wood_sword=sword,
     )
@@ -1083,18 +1102,19 @@ def make_vectorized_skill_environment(
     max_distance: int = 4,
     distractor_count: int = 6,
     randomization: ScenarioRandomization | None = None,
+    num_skills: int = len(SKILL_IDS),
 ) -> VectorizedSkillEnvironment:
-    """Create a balanced batch covering every registered skill.
+    """Create a balanced batch covering the executor's first ``num_skills``.
 
     Local navigation applies to skills with a visible target, so there
     ``place_table`` remains a nearby scenario. The randomized scenario covers
     every skill, ``place_table`` included.
     """
 
-    num_skills = len(SKILL_IDS)
+    skill_ids = executor_skill_ids(num_skills)
     if num_envs < num_skills or num_envs % num_skills:
         raise ValueError(
-            f"num_envs must be divisible by the {num_skills} registered skills."
+            f"num_envs must be divisible by the {num_skills} executor skills."
         )
     normalized_scenario = SkillScenario(scenario)
     environments = tuple(
@@ -1103,7 +1123,7 @@ def make_vectorized_skill_environment(
             horizon=horizon,
             scenario=(
                 normalized_scenario
-                if skill_id in skills_for_scenario(normalized_scenario)
+                if skill_id in skills_for_scenario(normalized_scenario, skill_ids)
                 else SkillScenario.NEARBY
             ),
             min_distance=min_distance,
@@ -1115,7 +1135,7 @@ def make_vectorized_skill_environment(
                 else None
             ),
         )
-        for skill_id in SKILL_IDS
+        for skill_id in skill_ids
     )
     expected_indices = tuple(
         skill_index(environment.goal.skill_id) for environment in environments

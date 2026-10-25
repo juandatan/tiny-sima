@@ -18,7 +18,13 @@ from tiny_sima.evaluation.skills import (
     evaluate_skill_policy,
     scripted_skill_action,
 )
-from tiny_sima.goals.skills import SKILL_REGISTRY, SkillId, skill_precondition
+from tiny_sima.goals.skills import (
+    ALL_SKILL_IDS,
+    SKILL_IDS,
+    SKILL_REGISTRY,
+    SkillId,
+    skill_precondition,
+)
 
 
 @pytest.mark.parametrize("skill_id", list(SKILL_REGISTRY))
@@ -165,7 +171,7 @@ def test_vectorized_local_training_keeps_place_table_nearby() -> None:
         skill_environment.goal.skill_id: skill_environment.scenario
         for skill_environment in environment.environments
     }
-    for skill_id in LOCAL_NAVIGATION_SKILLS:
+    for skill_id in skills_for_scenario(SkillScenario.LOCAL_NAVIGATION):
         assert scenarios[skill_id] == SkillScenarioConfig(
             SkillScenario.LOCAL_NAVIGATION,
             min_distance=3,
@@ -195,8 +201,12 @@ def test_local_navigation_scripted_policy_succeeds(
 
 
 def test_local_navigation_excludes_non_navigation_skills() -> None:
-    assert skills_for_scenario(SkillScenario.LOCAL_NAVIGATION) == (
-        LOCAL_NAVIGATION_SKILLS
+    assert skills_for_scenario(SkillScenario.LOCAL_NAVIGATION) == tuple(
+        skill_id for skill_id in LOCAL_NAVIGATION_SKILLS if skill_id in SKILL_IDS
+    )
+    assert (
+        skills_for_scenario(SkillScenario.LOCAL_NAVIGATION, ALL_SKILL_IDS)
+        == LOCAL_NAVIGATION_SKILLS
     )
     with pytest.raises(ValueError, match="does not define"):
         make_skill_environment(

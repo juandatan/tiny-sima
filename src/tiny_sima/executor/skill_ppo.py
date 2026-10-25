@@ -44,7 +44,7 @@ from tiny_sima.executor.ppo_common import (
     stratified_minibatch_indices,
 )
 from tiny_sima.executor.training import run_training_loop, save_final_run
-from tiny_sima.goals import SKILL_IDS
+from tiny_sima.goals import executor_skill_ids
 
 _ENVIRONMENT_NAMES = {
     "nearby": "Tiny-SIMA-Nearby-Skills-v0",
@@ -479,7 +479,7 @@ def make_skill_update(
             ),
             "macro_success_rate": macro_success_rate,
         }
-        for index, skill_id in enumerate(SKILL_IDS):
+        for index, skill_id in enumerate(executor_skill_ids(config.num_skills)):
             prefix = f"skill/{skill_id.value}"
             episodes = completed_by_skill[index]
             rollout_metrics[f"{prefix}/completed_episodes"] = episodes
@@ -516,8 +516,8 @@ def train_goal_conditioned(
     """Train and checkpoint the categorical goal-conditioned executor."""
 
     config = config.validate()
-    if config.num_envs % len(SKILL_IDS):
-        raise ValueError(f"num_envs must be divisible by {len(SKILL_IDS)} skills.")
+    if config.num_envs % config.num_skills:
+        raise ValueError(f"num_envs must be divisible by {config.num_skills} skills.")
 
     run_dir = Path(output_dir or config.output_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -537,6 +537,7 @@ def train_goal_conditioned(
         max_distance=config.skill_max_distance,
         distractor_count=config.skill_distractor_count,
         randomization=randomization,
+        num_skills=config.num_skills,
     )
     model = make_goal_conditioned_actor_critic(
         num_actions=environment.spec.num_actions,
@@ -588,7 +589,7 @@ def train_goal_conditioned(
                 else None
             ),
         }
-        for index, skill_id in enumerate(SKILL_IDS)
+        for index, skill_id in enumerate(executor_skill_ids(config.num_skills))
     }
     per_skill_success_rates = [
         metrics["success_rate"]
@@ -603,7 +604,7 @@ def train_goal_conditioned(
         "timesteps": config.total_timesteps,
         "updates": config.num_updates,
         "num_envs": config.num_envs,
-        "num_skills": len(SKILL_IDS),
+        "num_skills": config.num_skills,
         "skill_horizon": config.skill_horizon,
         "skill_scenario": config.skill_scenario,
         "skill_min_distance": config.skill_min_distance,

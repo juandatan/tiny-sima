@@ -221,7 +221,7 @@ def make_critic_affordance_scorer(
     environment = make_skill_chain_environment()
     model = make_goal_conditioned_actor_critic(
         num_actions=environment.bundle.spec.num_actions,
-        num_skills=len(SKILL_IDS),
+        num_skills=checkpoint.config.num_skills,
         hidden_size=checkpoint.config.hidden_size,
         skill_embedding_size=checkpoint.config.skill_embedding_size,
     )

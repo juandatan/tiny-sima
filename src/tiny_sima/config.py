@@ -107,6 +107,10 @@ class SkillPPOConfig(PPOConfig):
 
     skill_horizon: int = 8
     skill_embedding_size: int = 32
+    # The executor knows the first num_skills entries of
+    # tiny_sima.goals.ALL_SKILL_IDS. Six is the catalog before the stone
+    # pickaxe, and the value older configs, which lack the field, load as.
+    num_skills: int = 6
     normalize_advantages_per_skill: bool = False
     skill_scenario: str = "nearby"
     skill_min_distance: int = 2
@@ -129,6 +133,12 @@ class SkillPPOConfig(PPOConfig):
             raise ValueError("skill_horizon must be at least 2.")
         if self.skill_embedding_size < 1:
             raise ValueError("skill_embedding_size must be positive.")
+        from tiny_sima.goals.skills import ALL_SKILL_IDS
+
+        if not 1 <= self.num_skills <= len(ALL_SKILL_IDS):
+            raise ValueError(
+                f"num_skills must be between 1 and {len(ALL_SKILL_IDS)}."
+            )
         if self.skill_scenario not in {"nearby", "local_navigation", "randomized"}:
             raise ValueError(
                 "skill_scenario must be 'nearby', 'local_navigation' or "

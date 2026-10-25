@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal
@@ -20,6 +21,9 @@ class SkillId(str, Enum):
     PLACE_TABLE = "place_table"
     CRAFT_WOOD_PICKAXE = "craft_wood_pickaxe"
     CRAFT_WOOD_SWORD = "craft_wood_sword"
+    # Appended last so the six indices above keep their meaning in existing
+    # checkpoints, priors and recorded results.
+    CRAFT_STONE_PICKAXE = "craft_stone_pickaxe"
 
 
 RequirementComparison = Literal["at_least", "less_than", "equals"]
@@ -246,12 +250,53 @@ SKILL_REGISTRY: dict[SkillId, SkillSpec] = {
         default_horizon=64,
         interaction_action=Action.MAKE_WOOD_SWORD,
     ),
+    SkillId.CRAFT_STONE_PICKAXE: SkillSpec(
+        skill_id=SkillId.CRAFT_STONE_PICKAXE,
+        instruction="Craft a stone pickaxe at a crafting table.",
+        description=(
+            "Spend one wood and one stone at a crafting table to make a "
+            "stone pickaxe."
+        ),
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("inventory.wood", "at_least", 1),
+                StateRequirement("inventory.stone", "at_least", 1),
+                StateRequirement(
+                    "world.crafting_table_reachable",
+                    "equals",
+                    True,
+                ),
+            ),
+            effects=(
+                StateEffect("inventory.wood", "decrease", 1),
+                StateEffect("inventory.stone", "decrease", 1),
+                StateEffect("inventory.stone_pickaxe", "increase", 1),
+            ),
+        ),
+        default_horizon=64,
+        interaction_action=Action.MAKE_STONE_PICKAXE,
+    ),
 }
 
-SKILL_IDS: tuple[SkillId, ...] = tuple(SKILL_REGISTRY)
+# Every skill the registry defines, in categorical index order.
+ALL_SKILL_IDS: tuple[SkillId, ...] = tuple(SKILL_REGISTRY)
+# The six-skill catalog every executor before the stone-pickaxe stage was
+# trained on, and the default candidate set of the planner. Keeping it the
+# default leaves those checkpoints, priors and planner prompts unchanged.
+SKILL_IDS: tuple[SkillId, ...] = ALL_SKILL_IDS[:6]
 SKILL_TO_INDEX: dict[SkillId, int] = {
-    skill_id: index for index, skill_id in enumerate(SKILL_IDS)
+    skill_id: index for index, skill_id in enumerate(ALL_SKILL_IDS)
 }
+
+
+def executor_skill_ids(num_skills: int) -> tuple[SkillId, ...]:
+    """Return the skills an executor trained on ``num_skills`` indices knows."""
+
+    if not 1 <= num_skills <= len(ALL_SKILL_IDS):
+        raise ValueError(
+            f"num_skills must be between 1 and {len(ALL_SKILL_IDS)}."
+        )
+    return ALL_SKILL_IDS[:num_skills]
 
 
 def get_skill_spec(skill_id: SkillId | str) -> SkillSpec:
@@ -270,7 +315,7 @@ def skill_id_from_index(index: int) -> SkillId:
     """Return the skill associated with a categorical executor index."""
 
     try:
-        return SKILL_IDS[index]
+        return ALL_SKILL_IDS[index]
     except IndexError as error:
         raise ValueError(f"Unknown skill index: {index}") from error
 
@@ -292,7 +337,9 @@ def skill_catalog() -> list[dict[str, Any]]:
     ]
 
 
-def planner_skill_catalog() -> list[dict[str, Any]]:
+def planner_skill_catalog(
+    skill_ids: Sequence[SkillId] = SKILL_IDS,
+) -> list[dict[str, Any]]:
     """Return only the static semantics needed for high-level planning."""
 
     return [
@@ -301,7 +348,7 @@ def planner_skill_catalog() -> list[dict[str, Any]]:
             "description": spec.description,
             **spec.mechanics.to_dict(),
         }
-        for spec in SKILL_REGISTRY.values()
+        for spec in (get_skill_spec(skill_id) for skill_id in skill_ids)
     ]
 
 
@@ -325,6 +372,8 @@ def skill_metric(skill_id: SkillId | str, state: Any) -> jax.Array:
         return jnp.asarray(state.inventory.wood_pickaxe)
     if skill_id is SkillId.CRAFT_WOOD_SWORD:
         return jnp.asarray(state.inventory.wood_sword)
+    if skill_id is SkillId.CRAFT_STONE_PICKAXE:
+        return jnp.asarray(state.inventory.stone_pickaxe)
     raise AssertionError(f"Unhandled skill: {skill_id}")
 
 
@@ -356,6 +405,13 @@ def skill_precondition(goal: SkillGoal, state: Any) -> jax.Array:
         return (
             alive
             & (jnp.asarray(state.inventory.wood) >= goal.quantity)
+            & jnp.any(state.map == BlockType.CRAFTING_TABLE.value)
+        )
+    if skill_id is SkillId.CRAFT_STONE_PICKAXE:
+        return (
+            alive
+            & (jnp.asarray(state.inventory.wood) >= goal.quantity)
+            & (jnp.asarray(state.inventory.stone) >= goal.quantity)
             & jnp.any(state.map == BlockType.CRAFTING_TABLE.value)
         )
     raise AssertionError(f"Unhandled skill: {skill_id}")

@@ -41,6 +41,7 @@ from tiny_sima.executor.model import (
 from tiny_sima.goals import (
     SKILL_IDS,
     SkillId,
+    executor_skill_ids,
     get_skill_spec,
     skill_index,
 )
@@ -83,6 +84,15 @@ class LoadedGoalConditionedCheckpoint(NamedTuple):
 
     params: Any
     config: SkillPPOConfig
+
+
+def _require_executor_skill(config: SkillPPOConfig, skill_id: SkillId) -> None:
+    # An out-of-range embedding index clamps rather than failing in JAX.
+    if skill_id not in executor_skill_ids(config.num_skills):
+        raise ValueError(
+            f"An executor with {config.num_skills} skills cannot run "
+            f"{skill_id.value}."
+        )
 
 
 def _probe_actions(
@@ -146,13 +156,14 @@ def diagnose_goal_conditioned_skill(
         raise ValueError("num_scenarios must be positive.")
 
     normalized_skill_id = SkillId(skill_id)
+    _require_executor_skill(config, normalized_skill_id)
     environment = make_skill_environment(
         normalized_skill_id,
         horizon=config.skill_horizon,
     )
     model = make_goal_conditioned_actor_critic(
         num_actions=environment.bundle.spec.num_actions,
-        num_skills=len(SKILL_IDS),
+        num_skills=config.num_skills,
         hidden_size=config.hidden_size,
         skill_embedding_size=config.skill_embedding_size,
     )
@@ -312,7 +323,7 @@ def diagnose_goal_conditioned_policy(
             num_scenarios=num_scenarios_per_skill,
             seed=seed + index,
         )
-        for index, skill_id in enumerate(SKILL_IDS)
+        for index, skill_id in enumerate(executor_skill_ids(config.num_skills))
     ]
 
 
@@ -337,6 +348,7 @@ def evaluate_goal_conditioned_skill(
         raise ValueError("num_episodes must be positive.")
 
     normalized_skill_id = SkillId(skill_id)
+    _require_executor_skill(config, normalized_skill_id)
     evaluation_horizon = config.skill_horizon if horizon is None else horizon
     environment = make_skill_environment(
         normalized_skill_id,
@@ -349,7 +361,7 @@ def evaluate_goal_conditioned_skill(
     )
     model = make_goal_conditioned_actor_critic(
         num_actions=environment.bundle.spec.num_actions,
-        num_skills=len(SKILL_IDS),
+        num_skills=config.num_skills,
         hidden_size=config.hidden_size,
         skill_embedding_size=config.skill_embedding_size,
     )
@@ -467,7 +479,10 @@ def evaluate_goal_conditioned_policy(
 ) -> list[dict[str, Any]]:
     """Evaluate every requested skill independently."""
 
-    scenario_skills = skills_for_scenario(scenario)
+    scenario_skills = skills_for_scenario(
+        scenario,
+        executor_skill_ids(config.num_skills),
+    )
     return [
         evaluate_goal_conditioned_skill(
             params,
@@ -548,7 +563,7 @@ def load_goal_conditioned_checkpoint(
     )
     model = make_goal_conditioned_actor_critic(
         num_actions=environment.bundle.spec.num_actions,
-        num_skills=len(SKILL_IDS),
+        num_skills=config.num_skills,
         hidden_size=config.hidden_size,
         skill_embedding_size=config.skill_embedding_size,
     )

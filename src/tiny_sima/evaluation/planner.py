@@ -9,11 +9,11 @@ from typing import Any
 import jax
 import numpy as np
 
-from tiny_sima.envs.chains import make_skill_chain_environment
 from tiny_sima.evaluation.chains import (
     WOOD_TO_STONE_CHAIN,
     ScriptedSkillExecutor,
     SkillChainSpec,
+    chain_environment,
 )
 from tiny_sima.goals import (
     DEFAULT_REACHABILITY,
@@ -115,9 +115,7 @@ def collect_prefix_trajectory(
 
     if num_episodes < 1:
         raise ValueError("num_episodes must be positive.")
-    environment = make_skill_chain_environment(
-        distractor_count=distractor_count,
-    )
+    environment = chain_environment(chain, distractor_count=distractor_count)
     executor = ScriptedSkillExecutor()
     episode_keys = jax.random.split(jax.random.PRNGKey(seed), num_episodes)
     boundaries: list[tuple[PrefixBoundary, ...]] = []

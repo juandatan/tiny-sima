@@ -47,9 +47,11 @@ from tiny_sima.executor.model import (
     select_action,
 )
 from tiny_sima.goals import (
+    ALL_SKILL_IDS,
     SKILL_IDS,
     SkillGoal,
     SkillId,
+    executor_skill_ids,
     get_skill_spec,
     skill_index,
     skill_metric,
@@ -73,7 +75,11 @@ ValidNextSkills = Callable[[Any], tuple[SkillId, ...]]
 
 
 class SkillChainSpec(NamedTuple):
-    """A state-based objective with an optional scripted reference plan."""
+    """A state-based objective with an optional scripted reference plan.
+
+    ``skills`` is the catalog the planner chooses from, and ``tree_count``
+    the wood the world holds, since every mined tree is gone.
+    """
 
     name: str
     objective: str
@@ -81,6 +87,31 @@ class SkillChainSpec(NamedTuple):
     is_complete: ObjectivePredicate
     is_complete_jax: JaxObjectivePredicate | None = None
     valid_next_skills: ValidNextSkills | None = None
+    skills: tuple[SkillId, ...] = SKILL_IDS
+    tree_count: int = 3
+
+
+def chain_decision_limit(chain: SkillChainSpec) -> int:
+    """Return the default decision budget: twice the reference plan.
+
+    Twice the six-skill reference is the twelve decisions the wood-to-stone
+    chain has always had, so the rule leaves its results unchanged.
+    """
+
+    return 2 * len(chain.reference_skills)
+
+
+def chain_environment(
+    chain: SkillChainSpec,
+    *,
+    distractor_count: int = 3,
+) -> SkillChainEnvironment:
+    """Create the persistent world a chain is posed in."""
+
+    return make_skill_chain_environment(
+        distractor_count=distractor_count,
+        tree_count=chain.tree_count,
+    )
 
 
 def _wood_to_stone_complete_jax(state: Any) -> jax.Array:
@@ -134,6 +165,83 @@ WOOD_TO_STONE_CHAIN = SkillChainSpec(
     is_complete_jax=_wood_to_stone_complete_jax,
     valid_next_skills=_wood_to_stone_valid_next_skills,
 )
+
+
+def _stone_pickaxe_complete_jax(state: Any) -> jax.Array:
+    return jnp.asarray(state.inventory.stone_pickaxe) > 0
+
+
+def _stone_pickaxe_complete(state: Any) -> bool:
+    return bool(np.asarray(_stone_pickaxe_complete_jax(state)))
+
+
+def _stone_pickaxe_valid_next_skills(state: Any) -> tuple[SkillId, ...]:
+    """Return objective-progressing skills, including valid plan reorderings.
+
+    The stone pickaxe costs one wood and one stone at a table, and the stone
+    needs a wood pickaxe: four wood in all when nothing is held yet.
+    """
+
+    inventory = state.inventory
+    wood = int(np.asarray(inventory.wood))
+    stone = int(np.asarray(inventory.stone))
+    wood_pickaxe = int(np.asarray(inventory.wood_pickaxe))
+    stone_pickaxe = int(np.asarray(inventory.stone_pickaxe))
+    has_table = bool(
+        np.any(np.asarray(state.map) == BlockType.CRAFTING_TABLE.value)
+    )
+    if stone_pickaxe > 0:
+        return ()
+    needs_wood_pickaxe = wood_pickaxe == 0 and stone == 0
+    if not has_table:
+        wood_needed = 2 + int(needs_wood_pickaxe) + 1
+        if wood >= wood_needed:
+            return (SkillId.PLACE_TABLE,)
+        if wood >= 2:
+            return (SkillId.COLLECT_WOOD, SkillId.PLACE_TABLE)
+        return (SkillId.COLLECT_WOOD,)
+    if needs_wood_pickaxe:
+        if wood >= 2:
+            return (SkillId.CRAFT_WOOD_PICKAXE,)
+        if wood == 1:
+            return (SkillId.CRAFT_WOOD_PICKAXE, SkillId.COLLECT_WOOD)
+        return (SkillId.COLLECT_WOOD,)
+    if wood >= 1 and stone >= 1:
+        return (SkillId.CRAFT_STONE_PICKAXE,)
+    missing = []
+    if wood == 0:
+        missing.append(SkillId.COLLECT_WOOD)
+    if stone == 0:
+        missing.append(SkillId.COLLECT_STONE)
+    return tuple(missing)
+
+
+WOOD_TO_STONE_PICKAXE_CHAIN = SkillChainSpec(
+    name="wood_to_stone_pickaxe",
+    objective=(
+        "Craft a wooden pickaxe, use it to collect stone, and craft a stone "
+        "pickaxe."
+    ),
+    reference_skills=(
+        SkillId.COLLECT_WOOD,
+        SkillId.COLLECT_WOOD,
+        SkillId.PLACE_TABLE,
+        SkillId.COLLECT_WOOD,
+        SkillId.CRAFT_WOOD_PICKAXE,
+        SkillId.COLLECT_WOOD,
+        SkillId.COLLECT_STONE,
+        SkillId.CRAFT_STONE_PICKAXE,
+    ),
+    is_complete=_stone_pickaxe_complete,
+    is_complete_jax=_stone_pickaxe_complete_jax,
+    valid_next_skills=_stone_pickaxe_valid_next_skills,
+    skills=ALL_SKILL_IDS,
+    tree_count=4,
+)
+
+SKILL_CHAINS: dict[str, SkillChainSpec] = {
+    chain.name: chain for chain in (WOOD_TO_STONE_CHAIN, WOOD_TO_STONE_PICKAXE_CHAIN)
+}
 
 
 class ChainTermination(str, Enum):
@@ -268,6 +376,7 @@ _INTERACTION_BLOCKS = {
     SkillId.DRINK_WATER: BlockType.WATER,
     SkillId.CRAFT_WOOD_PICKAXE: BlockType.CRAFTING_TABLE,
     SkillId.CRAFT_WOOD_SWORD: BlockType.CRAFTING_TABLE,
+    SkillId.CRAFT_STONE_PICKAXE: BlockType.CRAFTING_TABLE,
 }
 
 _CARDINAL_ACTIONS = (
@@ -360,6 +469,7 @@ def _scripted_action(state: Any, skill_id: SkillId) -> int:
     if skill_id in {
         SkillId.CRAFT_WOOD_PICKAXE,
         SkillId.CRAFT_WOOD_SWORD,
+        SkillId.CRAFT_STONE_PICKAXE,
     }:
         return get_skill_spec(skill_id).interaction_action.value
     if int(state.player_direction) != target.target_direction:
@@ -523,6 +633,29 @@ class LearnedSkillExecutor:
     model: GoalConditionedActorCriticRNN
     deterministic: bool = True
 
+    @property
+    def skill_ids(self) -> tuple[SkillId, ...]:
+        """The skills this checkpoint was trained to execute."""
+
+        return executor_skill_ids(self.config.num_skills)
+
+    def require_skills(self, skill_ids: Sequence[SkillId]) -> None:
+        """Refuse a skill outside the checkpoint's embedding table.
+
+        JAX clamps an out-of-range embedding index, so a six-skill executor
+        asked for skill seven would silently run skill six instead.
+        """
+
+        unsupported = sorted(
+            {SkillId(skill_id).value for skill_id in skill_ids}
+            - {skill_id.value for skill_id in self.skill_ids}
+        )
+        if unsupported:
+            raise ValueError(
+                f"This executor knows {self.config.num_skills} skills and "
+                f"cannot run: {', '.join(unsupported)}."
+            )
+
     def execute(
         self,
         environment: SkillChainEnvironment,
@@ -569,6 +702,7 @@ class LearnedSkillExecutor:
             raise ValueError(f"batch_size {size} is smaller than {count} attempts.")
         if horizon < 1:
             raise ValueError("horizon must be positive.")
+        self.require_skills(skill_ids)
 
         padding = size - count
         run = _batched_skill_execution(
@@ -578,6 +712,7 @@ class LearnedSkillExecutor:
             num_actions=environment.bundle.spec.num_actions,
             hidden_size=self.config.hidden_size,
             skill_embedding_size=self.config.skill_embedding_size,
+            num_skills=self.config.num_skills,
             deterministic=self.deterministic,
         )
         output = run(
@@ -622,7 +757,7 @@ def make_learned_skill_executor(
     environment = make_skill_chain_environment()
     model = make_goal_conditioned_actor_critic(
         num_actions=environment.bundle.spec.num_actions,
-        num_skills=len(SKILL_IDS),
+        num_skills=checkpoint.config.num_skills,
         hidden_size=checkpoint.config.hidden_size,
         skill_embedding_size=checkpoint.config.skill_embedding_size,
     )
@@ -659,6 +794,7 @@ def _dynamic_skill_metric(skill_id: jax.Array, state: Any) -> jax.Array:
         ),
         lambda value: jnp.asarray(value.inventory.wood_pickaxe),
         lambda value: jnp.asarray(value.inventory.wood_sword),
+        lambda value: jnp.asarray(value.inventory.stone_pickaxe),
     )
     return jax.lax.switch(skill_id, branches, state)
 
@@ -700,6 +836,9 @@ def _dynamic_skill_precondition(
             & jnp.any(value.map == BlockType.CRAFTING_TABLE.value)
         )
 
+    def craft_stone_tool(value: Any) -> jax.Array:
+        return craft_wood_tool(value) & (jnp.asarray(value.inventory.stone) >= 1)
+
     branches = (
         collect_wood,
         collect_stone,
@@ -707,6 +846,7 @@ def _dynamic_skill_precondition(
         place_table,
         craft_wood_tool,
         craft_wood_tool,
+        craft_stone_tool,
     )
     return jax.lax.switch(skill_id, branches, state)
 
@@ -742,7 +882,7 @@ def _record_skill_failures(
 
     failure_delta = jax.nn.one_hot(
         skill_ids,
-        len(SKILL_IDS),
+        failures_by_skill.shape[1],
         dtype=jnp.int32,
     ) * failed[:, None]
     updated = failures_by_skill + failure_delta
@@ -773,6 +913,8 @@ def _make_batched_chain_rollout(
     deterministic: bool,
     is_complete: JaxObjectivePredicate,
     record_boundaries: bool = False,
+    num_skills: int = len(SKILL_IDS),
+    tree_count: int = 3,
 ) -> BatchedRollout:
     """Build and cache one compiled evaluator for a static execution shape."""
 
@@ -783,10 +925,11 @@ def _make_batched_chain_rollout(
     infeasible_outcome = _PROBE_OUTCOMES.index(SkillOutcome.INFEASIBLE)
     environment = make_skill_chain_environment(
         distractor_count=distractor_count,
+        tree_count=tree_count,
     )
     model = make_goal_conditioned_actor_critic(
         num_actions=environment.bundle.spec.num_actions,
-        num_skills=len(SKILL_IDS),
+        num_skills=num_skills,
         hidden_size=hidden_size,
         skill_embedding_size=skill_embedding_size,
     )
@@ -838,7 +981,7 @@ def _make_batched_chain_rollout(
                 reset.state,
             ),
             failures_by_skill=jnp.zeros(
-                (num_episodes, len(SKILL_IDS)),
+                (num_episodes, num_skills),
                 dtype=jnp.int32,
             ),
             finished=initially_succeeded,
@@ -1111,7 +1254,7 @@ def evaluate_learned_skill_chain_batched(
     num_episodes: int = 64,
     seed: int = 0,
     skill_horizon: int = 64,
-    max_decisions: int = 12,
+    max_decisions: int | None = None,
     max_failures_per_skill: int = 2,
     distractor_count: int = 3,
     plan: Sequence[SkillId] | None = None,
@@ -1132,9 +1275,12 @@ def evaluate_learned_skill_chain_batched(
     leading ``(episode, plan step)`` axes holding the world at the start of
     each first attempt; entries for unreached steps hold the reset world and
     must be ignored where ``first_attempt_outcomes`` is ``None``.
+    ``max_decisions`` defaults to :func:`chain_decision_limit`.
     """
 
     plan_skills = tuple(chain.reference_skills if plan is None else plan)
+    if max_decisions is None:
+        max_decisions = chain_decision_limit(chain)
     if num_episodes < 1:
         raise ValueError("num_episodes must be positive.")
     if skill_horizon < 1:
@@ -1149,6 +1295,7 @@ def evaluate_learned_skill_chain_batched(
         raise ValueError(
             "A batched chain requires a JAX-compatible completion predicate."
         )
+    executor.require_skills(plan_skills)
 
     plan_array = jnp.asarray(
         [skill_index(skill_id) for skill_id in plan_skills],
@@ -1166,6 +1313,8 @@ def evaluate_learned_skill_chain_batched(
         deterministic=executor.deterministic,
         is_complete=chain.is_complete_jax,
         record_boundaries=record_boundaries,
+        num_skills=executor.config.num_skills,
+        tree_count=chain.tree_count,
     )
     compile_cache_hit = (
         _make_batched_chain_rollout.cache_info().hits > cache_hits_before
@@ -1192,7 +1341,7 @@ def evaluate_learned_skill_chain_batched(
                 ~succeeded & (last_failed_skills == skill_index(skill_id))
             )
         )
-        for skill_id in SKILL_IDS
+        for skill_id in ALL_SKILL_IDS
         if np.any(~succeeded & (last_failed_skills == skill_index(skill_id)))
     }
     first_outcomes = np.asarray(output.first_outcome)
@@ -1333,6 +1482,7 @@ def _make_batched_skill_probe(
     hidden_size: int,
     skill_embedding_size: int,
     deterministic: bool,
+    num_skills: int = len(SKILL_IDS),
 ) -> BatchedProbe:
     """Build and cache one compiled probe for a static batch shape.
 
@@ -1346,7 +1496,7 @@ def _make_batched_skill_probe(
     environment = make_skill_chain_environment(distractor_count=distractor_count)
     model = make_goal_conditioned_actor_critic(
         num_actions=environment.bundle.spec.num_actions,
-        num_skills=len(SKILL_IDS),
+        num_skills=num_skills,
         hidden_size=hidden_size,
         skill_embedding_size=skill_embedding_size,
     )
@@ -1527,6 +1677,7 @@ def trace_skills_batched(
         return ()
     if skill_horizon < 1:
         raise ValueError("skill_horizon must be positive.")
+    executor.require_skills(skill_ids)
 
     probe = _make_batched_skill_probe(
         batch_size=len(states),
@@ -1535,6 +1686,7 @@ def trace_skills_batched(
         hidden_size=executor.config.hidden_size,
         skill_embedding_size=executor.config.skill_embedding_size,
         deterministic=executor.deterministic,
+        num_skills=executor.config.num_skills,
     )
     output = jax.device_get(
         probe(
@@ -1619,6 +1771,7 @@ def _batched_skill_execution(
     hidden_size: int,
     skill_embedding_size: int,
     deterministic: bool,
+    num_skills: int = len(SKILL_IDS),
 ) -> BatchedExecution:
     """Build and cache one compiled executor for a static batch shape.
 
@@ -1640,6 +1793,7 @@ def _batched_skill_execution(
         num_actions,
         hidden_size,
         skill_embedding_size,
+        num_skills,
         deterministic,
     )
     cached = _BATCHED_EXECUTIONS.get(key)
@@ -1648,7 +1802,7 @@ def _batched_skill_execution(
 
     model = make_goal_conditioned_actor_critic(
         num_actions=num_actions,
-        num_skills=len(SKILL_IDS),
+        num_skills=num_skills,
         hidden_size=hidden_size,
         skill_embedding_size=skill_embedding_size,
     )
@@ -1790,7 +1944,7 @@ def evaluate_chain_episodes(
     *,
     chain: SkillChainSpec = WOOD_TO_STONE_CHAIN,
     skill_horizon: int = 64,
-    max_decisions: int = 12,
+    max_decisions: int | None = None,
     max_failures_per_skill: int = 2,
 ) -> list[ChainEpisodeResult]:
     """Run independent planner/executor episodes in lockstep by decision.
@@ -1801,8 +1955,16 @@ def evaluate_chain_episodes(
     decodes together, and its skills run in one
     :meth:`LearnedSkillExecutor.execute_many` call. Each episode keeps its
     own key, so the results are those of running the episodes one by one.
+    ``max_decisions`` defaults to :func:`chain_decision_limit`.
     """
 
+    if max_decisions is None:
+        max_decisions = chain_decision_limit(chain)
+    if environment.tree_count != chain.tree_count:
+        raise ValueError(
+            f"Chain {chain.name} needs {chain.tree_count} trees; the "
+            f"environment places {environment.tree_count}."
+        )
     cursors: list[_ChainCursor] = []
     for rng in rngs:
         reset_rng, episode_rng = jax.random.split(rng)
@@ -1944,7 +2106,7 @@ def evaluate_chain_episode(
     *,
     chain: SkillChainSpec = WOOD_TO_STONE_CHAIN,
     skill_horizon: int = 64,
-    max_decisions: int = 12,
+    max_decisions: int | None = None,
     max_failures_per_skill: int = 2,
 ) -> ChainEpisodeResult:
     """Run one event-driven planner/executor episode without state resets."""
@@ -1969,20 +2131,25 @@ def evaluate_skill_chain(
     num_episodes: int = 16,
     seed: int = 0,
     skill_horizon: int = 64,
-    max_decisions: int = 12,
+    max_decisions: int | None = None,
     max_failures_per_skill: int = 2,
     distractor_count: int = 3,
 ) -> dict[str, Any]:
-    """Evaluate a planner/executor pair over randomized persistent worlds."""
+    """Evaluate a planner/executor pair over randomized persistent worlds.
+
+    The default planner follows the reference plan over ``chain.skills``,
+    and ``max_decisions`` defaults to :func:`chain_decision_limit`.
+    """
 
     if num_episodes < 1:
         raise ValueError("num_episodes must be positive.")
     active_planner = planner or SayCanPlanner(
-        utility_scorer=SequentialUtilityScorer(chain.reference_skills)
+        utility_scorer=SequentialUtilityScorer(chain.reference_skills),
+        candidate_skills=chain.skills,
     )
-    environment = make_skill_chain_environment(
-        distractor_count=distractor_count,
-    )
+    if isinstance(executor, LearnedSkillExecutor):
+        executor.require_skills(active_planner.candidate_skills)
+    environment = chain_environment(chain, distractor_count=distractor_count)
     episode_keys = jax.random.split(jax.random.PRNGKey(seed), num_episodes)
     episodes = evaluate_chain_episodes(
         active_planner,
@@ -2201,7 +2368,17 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=16)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--skill-horizon", type=int, default=64)
-    parser.add_argument("--max-decisions", type=int, default=12)
+    parser.add_argument(
+        "--chain",
+        choices=tuple(SKILL_CHAINS),
+        default=WOOD_TO_STONE_CHAIN.name,
+    )
+    parser.add_argument(
+        "--max-decisions",
+        type=int,
+        default=None,
+        help="Defaults to twice the chain's reference plan.",
+    )
     parser.add_argument("--max-failures-per-skill", type=int, default=2)
     parser.add_argument("--distractor-count", type=int, default=3)
     parser.add_argument(
@@ -2223,6 +2400,7 @@ def main() -> None:
 
     result = evaluate_skill_chain(
         executor,
+        chain=SKILL_CHAINS[args.chain],
         num_episodes=args.episodes,
         seed=args.seed,
         skill_horizon=args.skill_horizon,

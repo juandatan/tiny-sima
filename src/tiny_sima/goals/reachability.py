@@ -311,6 +311,7 @@ def _skill_target(
     if skill_id in {
         SkillId.CRAFT_WOOD_PICKAXE,
         SkillId.CRAFT_WOOD_SWORD,
+        SkillId.CRAFT_STONE_PICKAXE,
     }:
         return block_mask(state, BlockType.CRAFTING_TABLE), True
     raise AssertionError(f"Unhandled skill: {skill_id}")

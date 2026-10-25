@@ -38,7 +38,6 @@ from tiny_sima.goals import (
     ReachabilityConfig,
     SkillGoal,
     SkillId,
-    skill_index,
     skill_interaction_distance,
     skill_precondition,
     travel_distance_map,
@@ -98,8 +97,10 @@ def _shrink(successes: float, count: float, parent: float, strength: float) -> f
 class CompetencePrior:
     """Per-skill success rates conditioned on reachability and distance.
 
-    ``rates[skill_index(skill)][cell]`` is ``P(success)`` for that skill in that
-    distance band, with column zero meaning the target is out of reach. The
+    ``rates[skills.index(skill)][cell]`` is ``P(success)`` for that skill in
+    that distance band, with column zero meaning the target is out of reach.
+    ``skills`` is the catalog of the executor the table was fitted on; a skill
+    outside it scores zero, since that executor cannot run it. The
     symbolic precondition still vetoes outright -- a crafting skill with no
     table nearby cannot succeed by any distance -- so this fills in the graded
     part that :class:`~tiny_sima.planner.saycan.ReachabilityFeasibilityScorer`
@@ -113,10 +114,11 @@ class CompetencePrior:
     floor: float = DEFAULT_FLOOR
     config: ReachabilityConfig = DEFAULT_REACHABILITY
     candidate_skills: tuple[SkillId, ...] = SKILL_IDS
+    skills: tuple[SkillId, ...] = SKILL_IDS
 
     def __post_init__(self) -> None:
         width = num_distance_cells(self.distance_edges)
-        if len(self.rates) != len(SKILL_IDS):
+        if len(self.rates) != len(self.skills):
             raise ValueError("A competence prior needs one row per catalog skill.")
         if any(len(row) != width for row in self.rates):
             raise ValueError("Rate rows must match the distance band count.")
@@ -126,7 +128,7 @@ class CompetencePrior:
     def success_probability(self, skill_id: SkillId, steps: int | None) -> float:
         """Return the fitted success rate for one skill at one distance."""
 
-        row = self.rates[skill_index(skill_id)]
+        row = self.rates[self._row(skill_id)]
         return max(row[distance_cell(steps, self.distance_edges)], self.floor)
 
     def support(self, skill_id: SkillId, steps: int | None) -> int:
@@ -140,12 +142,20 @@ class CompetencePrior:
     def rate_by_cell(self, skill_id: SkillId, cell: int) -> float:
         """Return the fitted rate for one table column."""
 
-        return max(self.rates[skill_index(skill_id)][cell], self.floor)
+        return max(self.rates[self._row(skill_id)][cell], self.floor)
 
     def support_by_cell(self, skill_id: SkillId, cell: int) -> int:
         """Return how many probes were observed in one table column."""
 
-        return self.counts[skill_index(skill_id)][cell]
+        return self.counts[self._row(skill_id)][cell]
+
+    def _row(self, skill_id: SkillId) -> int:
+        try:
+            return self.skills.index(SkillId(skill_id))
+        except ValueError as error:
+            raise ValueError(
+                f"The competence prior has no row for {SkillId(skill_id).value}."
+            ) from error
 
     def score_all_feasibility(
         self,
@@ -161,7 +171,9 @@ class CompetencePrior:
         scores: dict[SkillId, float] = {}
         for skill_id in candidate_skills:
             goal = SkillGoal(skill_id)
-            if not bool(np.asarray(skill_precondition(goal, state))):
+            if skill_id not in self.skills or not bool(
+                np.asarray(skill_precondition(goal, state))
+            ):
                 scores[skill_id] = 0.0
                 continue
             bound = int(
@@ -197,7 +209,7 @@ class CompetencePrior:
             "base_rate": self.base_rate,
             "distance_edges": list(self.distance_edges),
             "floor": self.floor,
-            "skills": [skill_id.value for skill_id in SKILL_IDS],
+            "skills": [skill_id.value for skill_id in self.skills],
         }
 
     @classmethod
@@ -207,13 +219,12 @@ class CompetencePrior:
         *,
         config: ReachabilityConfig = DEFAULT_REACHABILITY,
     ) -> CompetencePrior:
-        """Rebuild a prior from :meth:`to_dict` output."""
+        """Rebuild a prior from :meth:`to_dict` output.
 
-        skills = payload.get("skills")
-        if skills is not None and list(skills) != [
-            skill_id.value for skill_id in SKILL_IDS
-        ]:
-            raise ValueError("Saved competence prior does not match the catalog.")
+        A table saved before priors recorded their skills is a six-skill one.
+        """
+
+        skills = tuple(SkillId(value) for value in payload.get("skills", SKILL_IDS))
         return cls(
             rates=tuple(
                 tuple(float(value) for value in row) for row in payload["rates"]
@@ -225,6 +236,7 @@ class CompetencePrior:
             distance_edges=tuple(int(edge) for edge in payload["distance_edges"]),
             floor=float(payload.get("floor", DEFAULT_FLOOR)),
             config=config,
+            skills=skills,
         )
 
     def save(self, path: str | Path) -> None:
@@ -255,6 +267,7 @@ def fit_competence_prior(
     prior_strength: float = DEFAULT_PRIOR_STRENGTH,
     floor: float = DEFAULT_FLOOR,
     config: ReachabilityConfig = DEFAULT_REACHABILITY,
+    skills: Sequence[SkillId] = SKILL_IDS,
 ) -> CompetencePrior:
     """Fit the competence table from labelled probes by shrinkage.
 
@@ -284,8 +297,15 @@ def fit_competence_prior(
         [distance_cell(steps, edges) for steps in steps_to_target],
         dtype=np.int64,
     )
+    catalog = tuple(SkillId(skill_id) for skill_id in skills)
+    unknown = {SkillId(skill_id) for skill_id in skill_ids} - set(catalog)
+    if unknown:
+        raise ValueError(
+            "Probes name skills outside the catalog: "
+            + ", ".join(sorted(skill_id.value for skill_id in unknown))
+        )
     rows = np.asarray(
-        [skill_index(skill_id) for skill_id in skill_ids],
+        [catalog.index(SkillId(skill_id)) for skill_id in skill_ids],
         dtype=np.int64,
     )
     reachable = cells != UNREACHABLE_CELL
@@ -304,7 +324,7 @@ def fit_competence_prior(
 
     rates: list[tuple[float, ...]] = []
     counts: list[tuple[int, ...]] = []
-    for row_index in range(len(SKILL_IDS)):
+    for row_index in range(len(catalog)):
         row_rates = [0.0] * width
         row_counts = [0] * width
         for is_reachable in (False, True):
@@ -342,4 +362,5 @@ def fit_competence_prior(
         distance_edges=edges,
         floor=floor,
         config=config,
+        skills=catalog,
     )

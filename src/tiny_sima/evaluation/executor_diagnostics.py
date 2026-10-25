@@ -32,6 +32,7 @@ from craftax.craftax_classic.constants import DIRECTIONS, Action, BlockType
 from tiny_sima.envs.skills import _scenario_inventory
 from tiny_sima.evaluation.chains import (
     WOOD_TO_STONE_CHAIN,
+    WOOD_TO_STONE_PICKAXE_CHAIN,
     LearnedSkillExecutor,
     SkillChainSpec,
     SkillRolloutTrace,
@@ -42,9 +43,9 @@ from tiny_sima.evaluation.chains import (
 )
 from tiny_sima.evaluation.goal_conditioned import evaluate_goal_conditioned_policy
 from tiny_sima.goals import (
+    ALL_SKILL_IDS,
     DEFAULT_REACHABILITY,
     OBSERVATION_RADIUS,
-    SKILL_IDS,
     SkillGoal,
     SkillId,
     skill_interaction_distance,
@@ -63,6 +64,24 @@ COLLECT_FIRST_PLAN: tuple[SkillId, ...] = (
     SkillId.COLLECT_STONE,
 )
 
+# The same reordering for the stone-pickaxe chain: all four wood before the
+# table, so no collect_wood is requested from a world already thinned of trees.
+STONE_PICKAXE_COLLECT_FIRST_PLAN: tuple[SkillId, ...] = (
+    SkillId.COLLECT_WOOD,
+    SkillId.COLLECT_WOOD,
+    SkillId.COLLECT_WOOD,
+    SkillId.COLLECT_WOOD,
+    SkillId.PLACE_TABLE,
+    SkillId.CRAFT_WOOD_PICKAXE,
+    SkillId.COLLECT_STONE,
+    SkillId.CRAFT_STONE_PICKAXE,
+)
+
+COLLECT_FIRST_PLANS: dict[str, tuple[SkillId, ...]] = {
+    WOOD_TO_STONE_CHAIN.name: COLLECT_FIRST_PLAN,
+    WOOD_TO_STONE_PICKAXE_CHAIN.name: STONE_PICKAXE_COLLECT_FIRST_PLAN,
+}
+
 # Held out from the planner calibration seeds (7, 23, 51), so that executor
 # comparisons never select on worlds the planner ladder was tuned against.
 EXECUTOR_BENCHMARK_SEED = 101
@@ -73,9 +92,16 @@ TARGET_BLOCKS: dict[SkillId, BlockType] = {
     SkillId.DRINK_WATER: BlockType.WATER,
     SkillId.CRAFT_WOOD_PICKAXE: BlockType.CRAFTING_TABLE,
     SkillId.CRAFT_WOOD_SWORD: BlockType.CRAFTING_TABLE,
+    SkillId.CRAFT_STONE_PICKAXE: BlockType.CRAFTING_TABLE,
 }
 
-_CRAFTING_SKILLS = frozenset({SkillId.CRAFT_WOOD_PICKAXE, SkillId.CRAFT_WOOD_SWORD})
+_CRAFTING_SKILLS = frozenset(
+    {
+        SkillId.CRAFT_WOOD_PICKAXE,
+        SkillId.CRAFT_WOOD_SWORD,
+        SkillId.CRAFT_STONE_PICKAXE,
+    }
+)
 _MOVEMENT_ACTIONS = frozenset(
     {Action.LEFT.value, Action.RIGHT.value, Action.UP.value, Action.DOWN.value}
 )
@@ -190,13 +216,13 @@ def _single_boundary_features(state: Any, skill_index: jax.Array) -> dict[str, A
     bounds = jnp.stack(
         [
             skill_interaction_distance(SkillGoal(skill_id), state, distances=distances)
-            for skill_id in SKILL_IDS
+            for skill_id in ALL_SKILL_IDS
         ]
     )
     targets = jnp.stack(
         [
             jnp.count_nonzero(_target_mask(state, skill_id) & view)
-            for skill_id in SKILL_IDS
+            for skill_id in ALL_SKILL_IDS
         ]
     )
     obstacles = jnp.count_nonzero(view & ~walkable)
@@ -244,7 +270,11 @@ def chain_boundaries(
         states,
     )
     flat_skills = jnp.asarray(
-        [SKILL_IDS.index(skill_id) for _ in range(num_episodes) for skill_id in plan],
+        [
+            ALL_SKILL_IDS.index(skill_id)
+            for _ in range(num_episodes)
+            for skill_id in plan
+        ],
         dtype=jnp.int32,
     )
     features = jax.device_get(_boundary_features(flat_states, flat_skills))
@@ -333,7 +363,7 @@ class CounterfactualEdit:
     name: str
     description: str
     apply: Callable[[Any, SkillId], Any]
-    applies_to: frozenset[SkillId] = frozenset(SKILL_IDS)
+    applies_to: frozenset[SkillId] = frozenset(ALL_SKILL_IDS)
 
 
 def _remove_tables(state: Any, skill_id: SkillId) -> Any:
@@ -385,7 +415,7 @@ def _training_clock(state: Any, skill_id: SkillId) -> Any:
     )
 
 
-_NON_TABLE_SKILLS = frozenset(set(SKILL_IDS) - _CRAFTING_SKILLS)
+_NON_TABLE_SKILLS = frozenset(set(ALL_SKILL_IDS) - _CRAFTING_SKILLS)
 
 COUNTERFACTUAL_EDITS: tuple[CounterfactualEdit, ...] = (
     CounterfactualEdit(
@@ -643,10 +673,16 @@ def failed_rollout_features(
     return rows
 
 
-PLANS: dict[str, tuple[SkillId, ...]] = {
-    "default": WOOD_TO_STONE_CHAIN.reference_skills,
-    "collect_first": COLLECT_FIRST_PLAN,
-}
+def chain_plans(chain: SkillChainSpec) -> dict[str, tuple[SkillId, ...]]:
+    """Return the chain's reference plan and its collect-first reordering."""
+
+    return {
+        "default": chain.reference_skills,
+        "collect_first": COLLECT_FIRST_PLANS[chain.name],
+    }
+
+
+PLANS: dict[str, tuple[SkillId, ...]] = chain_plans(WOOD_TO_STONE_CHAIN)
 
 
 def benchmark_executor(
@@ -669,7 +705,7 @@ def benchmark_executor(
     has to show up there.
     """
 
-    selected_plans = PLANS if plans is None else plans
+    selected_plans = chain_plans(chain) if plans is None else plans
     chains = {
         name: evaluate_learned_skill_chain_batched(
             executor,
@@ -730,6 +766,9 @@ def compare_executor_benchmarks(
     """
 
     plans = [name for name in reference["chains"] if name in candidate["chains"]]
+    candidate_local = {
+        result["skill_id"]: result for result in candidate["local_navigation"]
+    }
     return {
         "plans": {
             name: compare_paired_successes(
@@ -751,17 +790,16 @@ def compare_executor_benchmarks(
             }
             for name in plans
         },
+        # Paired by skill, over the skills both executors know, so a run that
+        # adds a skill still compares against one that lacks it.
         "local_navigation": [
             {
                 "skill_id": old["skill_id"],
                 "reference": old["success_rate"],
-                "candidate": new["success_rate"],
+                "candidate": candidate_local[old["skill_id"]]["success_rate"],
             }
-            for old, new in zip(
-                reference["local_navigation"],
-                candidate["local_navigation"],
-                strict=True,
-            )
+            for old in reference["local_navigation"]
+            if old["skill_id"] in candidate_local
         ],
     }
 

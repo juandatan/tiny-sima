@@ -37,7 +37,7 @@ from tiny_sima.evaluation.executor_diagnostics import (
     success_table,
     summarize_rollout_features,
 )
-from tiny_sima.goals import OBSERVATION_RADIUS, SKILL_IDS, SkillId, view_mask
+from tiny_sima.goals import ALL_SKILL_IDS, OBSERVATION_RADIUS, SkillId, view_mask
 from tiny_sima.planner.saycan import SkillOutcome
 
 _EDITS = {edit.name: edit for edit in COUNTERFACTUAL_EDITS}
@@ -537,9 +537,25 @@ def test_benchmark_pairs_plans_and_serializes(executor: LearnedSkillExecutor) ->
     for bands in comparison["bands"].values():
         assert bands["reference"] == bands["candidate"]
     assert comparison["local_navigation"] == []
+    # A run with a seventh skill still pairs on the six the baseline knows.
+    six = [
+        {"skill_id": skill.value, "success_rate": 0.5}
+        for skill in ALL_SKILL_IDS[:-1]
+    ]
+    seven = [{**row, "success_rate": 0.75} for row in six] + [
+        {"skill_id": ALL_SKILL_IDS[-1].value, "success_rate": 0.25}
+    ]
+    widened = compare_executor_benchmarks(
+        {**benchmark, "local_navigation": six},
+        {**benchmark, "local_navigation": seven},
+    )
+    assert [row["skill_id"] for row in widened["local_navigation"]] == [
+        row["skill_id"] for row in six
+    ]
+    assert {row["candidate"] for row in widened["local_navigation"]} == {0.75}
 
 
 def test_every_edit_names_a_known_skill_set() -> None:
     for edit in COUNTERFACTUAL_EDITS:
-        assert edit.applies_to <= frozenset(SKILL_IDS)
+        assert edit.applies_to <= frozenset(ALL_SKILL_IDS)
         assert edit.applies_to

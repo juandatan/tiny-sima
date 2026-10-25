@@ -31,6 +31,7 @@ SKILL_ABBREVIATIONS = {
     "place_table": "table",
     "craft_wood_pickaxe": "pickaxe",
     "craft_wood_sword": "sword",
+    "craft_stone_pickaxe": "stone_pickaxe",
 }
 
 # Say against Can for one choice, keyed by whether the Say term's first choice

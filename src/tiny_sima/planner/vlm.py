@@ -17,7 +17,9 @@ from craftax.craftax_classic.constants import BlockType
 from tiny_sima.config import VLMPlannerConfig
 from tiny_sima.envs.craftax import render_state
 from tiny_sima.goals import (
+    ALL_SKILL_IDS,
     DEFAULT_REACHABILITY,
+    SKILL_IDS,
     ReachabilityConfig,
     SkillGoal,
     SkillId,
@@ -452,83 +454,101 @@ def summarize_state(
     )
 
 
-_MECHANICS_LINE = "Known game mechanics: " + json.dumps(
-    planner_skill_catalog(),
-    separators=(",", ":"),
-    sort_keys=True,
+def _mechanics_line(candidate_skills: Sequence[SkillId]) -> str:
+    """Describe the candidates' mechanics, in registry order.
+
+    Registry order makes the line depend only on which skills are offered,
+    and the six-skill catalog renders the line every earlier prompt had.
+    """
+
+    offered = set(candidate_skills)
+    return "Known game mechanics: " + json.dumps(
+        planner_skill_catalog(
+            [skill_id for skill_id in ALL_SKILL_IDS if skill_id in offered]
+        ),
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+_BASELINE_INSTRUCTIONS = (
+    "You are the high-level planner for a Craftax survival agent.",
+    "You may rely on the supplied game-mechanics catalog as authoritative "
+    "knowledge of skill requirements, resource costs, and successful "
+    "effects.",
+    "At each option boundary, rank only the supplied skills by how useful "
+    "they are as the next requested skill from the current state.",
+    "The ranking is recomputed after every completed or failed skill.",
+    "Prioritize unmet prerequisites in execution order. Once a prerequisite "
+    "is achieved, promote the next unmet objective step and demote redundant "
+    "repetitions unless another repetition is necessary.",
+    "A separate affordance model checks whether each skill is executable, "
+    "but state progress and recent outcomes must still affect usefulness.",
+    "A requirement named world.<resource>_reachable means the player can "
+    "walk to that resource and interact with it within the skill horizon, "
+    "searching only the area currently visible. The matching "
+    "world.<resource>_steps value is the fewest steps that needs, or null "
+    "when the resource is out of range. A resource that is not reachable "
+    "cannot be collected from where the player stands now, so prefer a "
+    "skill that makes progress immediately; choose an out-of-range resource "
+    "only when nothing nearer advances the objective.",
+    "First assess current objective progress, then choose the best next "
+    "skill, then rank the complete catalog consistently with that choice.",
 )
 
 
-PLANNER_SYSTEM_PROMPT = "\n".join(
-    (
-        "You are the high-level planner for a Craftax survival agent.",
-        "You may rely on the supplied game-mechanics catalog as authoritative "
-        "knowledge of skill requirements, resource costs, and successful "
-        "effects.",
-        "At each option boundary, rank only the supplied skills by how useful "
-        "they are as the next requested skill from the current state.",
-        "The ranking is recomputed after every completed or failed skill.",
-        "Prioritize unmet prerequisites in execution order. Once a prerequisite "
-        "is achieved, promote the next unmet objective step and demote redundant "
-        "repetitions unless another repetition is necessary.",
-        "A separate affordance model checks whether each skill is executable, "
-        "but state progress and recent outcomes must still affect usefulness.",
-        "A requirement named world.<resource>_reachable means the player can "
-        "walk to that resource and interact with it within the skill horizon, "
-        "searching only the area currently visible. The matching "
-        "world.<resource>_steps value is the fewest steps that needs, or null "
-        "when the resource is out of range. A resource that is not reachable "
-        "cannot be collected from where the player stands now, so prefer a "
-        "skill that makes progress immediately; choose an out-of-range resource "
-        "only when nothing nearer advances the objective.",
-        "First assess current objective progress, then choose the best next "
-        "skill, then rank the complete catalog consistently with that choice.",
-        _MECHANICS_LINE,
-    )
-)
-
-
-AVAILABLE_FIRST_SYSTEM_PROMPT = "\n".join(
-    (
-        "You are the high-level planner for a Craftax survival agent.",
-        "You may rely on the supplied game-mechanics catalog as authoritative "
-        "knowledge of skill requirements, resource costs, and successful "
-        "effects.",
-        "At each option boundary, rank only the supplied skills by how useful "
-        "they are as the next requested skill from the current state.",
-        "The ranking is recomputed after every completed or failed skill, so a "
-        "skill you cannot do now costs nothing to defer.",
-        # The baseline told the planner that a separate affordance model would
-        # handle executability. It then ranked an unreachable skill first at
-        # three boundaries in four, and no downstream factor can undo that, so
-        # availability is the planner's responsibility here.
-        "Usefulness means useful as the very next requested skill, which "
-        "includes being doable now. A skill that cannot start from where the "
-        "player stands is not a useful next step however central it is to the "
-        "objective.",
-        "Each candidate arrives with available_now and blocked_reason already "
-        "computed for you. Treat them as ground truth and do not re-derive "
-        "them from the screenshot.",
-        "Among the available skills, prioritize unmet prerequisites in "
-        "execution order; once a prerequisite is achieved, promote the next "
-        "unmet objective step and demote redundant repetitions unless another "
-        "repetition is necessary.",
-        "Report the available skills before choosing one, then choose from "
-        "what you reported, then rank the complete catalog starting with that "
-        "choice.",
-        _MECHANICS_LINE,
-    )
+_AVAILABLE_FIRST_INSTRUCTIONS = (
+    "You are the high-level planner for a Craftax survival agent.",
+    "You may rely on the supplied game-mechanics catalog as authoritative "
+    "knowledge of skill requirements, resource costs, and successful "
+    "effects.",
+    "At each option boundary, rank only the supplied skills by how useful "
+    "they are as the next requested skill from the current state.",
+    "The ranking is recomputed after every completed or failed skill, so a "
+    "skill you cannot do now costs nothing to defer.",
+    # The baseline told the planner that a separate affordance model would
+    # handle executability. It then ranked an unreachable skill first at
+    # three boundaries in four, and no downstream factor can undo that, so
+    # availability is the planner's responsibility here.
+    "Usefulness means useful as the very next requested skill, which "
+    "includes being doable now. A skill that cannot start from where the "
+    "player stands is not a useful next step however central it is to the "
+    "objective.",
+    "Each candidate arrives with available_now and blocked_reason already "
+    "computed for you. Treat them as ground truth and do not re-derive "
+    "them from the screenshot.",
+    "Among the available skills, prioritize unmet prerequisites in "
+    "execution order; once a prerequisite is achieved, promote the next "
+    "unmet objective step and demote redundant repetitions unless another "
+    "repetition is necessary.",
+    "Report the available skills before choosing one, then choose from "
+    "what you reported, then rank the complete catalog starting with that "
+    "choice.",
 )
 
 
 def build_planner_system_prompt(
     style: PlannerPromptStyle = DEFAULT_PROMPT_STYLE,
+    candidate_skills: Sequence[SkillId] = SKILL_IDS,
 ) -> str:
-    """Return stable planner instructions sent with the system role."""
+    """Return stable planner instructions sent with the system role.
 
-    if style is PlannerPromptStyle.BASELINE:
-        return PLANNER_SYSTEM_PROMPT
-    return AVAILABLE_FIRST_SYSTEM_PROMPT
+    The mechanics catalog covers only the offered skills, so a planner never
+    reads about a skill it cannot request.
+    """
+
+    instructions = (
+        _BASELINE_INSTRUCTIONS
+        if style is PlannerPromptStyle.BASELINE
+        else _AVAILABLE_FIRST_INSTRUCTIONS
+    )
+    return "\n".join((*instructions, _mechanics_line(candidate_skills)))
+
+
+PLANNER_SYSTEM_PROMPT = build_planner_system_prompt(PlannerPromptStyle.BASELINE)
+AVAILABLE_FIRST_SYSTEM_PROMPT = build_planner_system_prompt(
+    PlannerPromptStyle.AVAILABLE_FIRST
+)
 
 
 def _candidate_entries(
@@ -745,7 +765,10 @@ class VLMUtilityScorer:
             self.config.environment_name,
             block_pixel_size=self.config.block_pixel_size,
         )
-        system_prompt = build_planner_system_prompt(self.prompt_style)
+        system_prompt = build_planner_system_prompt(
+            self.prompt_style,
+            candidate_skills,
+        )
         user_prompt = build_planner_prompt(
             state,
             context,

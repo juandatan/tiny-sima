@@ -12,9 +12,11 @@ import numpy as np
 from tiny_sima.goals import (
     DEFAULT_REACHABILITY,
     SKILL_IDS,
+    SKILL_REGISTRY,
     ReachabilityConfig,
     SkillGoal,
     SkillId,
+    get_skill_spec,
     skill_feasibility_score,
     skill_precondition,
     travel_distance_map,
@@ -288,6 +290,103 @@ class ReachabilityFeasibilityScorer:
 
 
 reachability_feasibility = ReachabilityFeasibilityScorer()
+
+
+def _held_tool_thresholds() -> dict[str, int]:
+    """Return each tool field with the most any requirement asks of it.
+
+    A tool is an inventory field some skill increases and none decreases: no
+    recipe spends it, so once a requirement on it holds it holds for good.
+    """
+
+    increased: set[str] = set()
+    decreased: set[str] = set()
+    thresholds: dict[str, int] = {}
+    for spec in SKILL_REGISTRY.values():
+        for effect in spec.mechanics.effects:
+            if effect.operation == "increase":
+                increased.add(effect.field)
+            elif effect.operation == "decrease":
+                decreased.add(effect.field)
+        for requirement in spec.mechanics.requires:
+            if requirement.comparison == "at_least":
+                thresholds[requirement.field] = max(
+                    thresholds.get(requirement.field, 1),
+                    int(requirement.value),
+                )
+    return {
+        field: thresholds.get(field, 1)
+        for field in sorted(increased - decreased)
+        if field.startswith("inventory.")
+    }
+
+
+def redundant_craft(state: Any, skill_id: SkillId) -> bool:
+    """Return whether a skill only makes tools the player already holds.
+
+    The rule reads nothing but the static skill mechanics the planner prompt
+    already shows: a second wood pickaxe satisfies no requirement the first
+    did not. Skills that also gather or spend a consumable are never
+    redundant, so it cannot veto wood, stone, a table or a drink.
+    """
+
+    thresholds = _HELD_TOOL_THRESHOLDS
+    increased = [
+        effect.field
+        for effect in get_skill_spec(skill_id).mechanics.effects
+        if effect.operation == "increase"
+    ]
+    if not increased or any(field not in thresholds for field in increased):
+        return False
+    inventory = state.inventory
+    return all(
+        int(np.asarray(getattr(inventory, field.removeprefix("inventory."))))
+        >= thresholds[field]
+        for field in increased
+    )
+
+
+@dataclass(frozen=True)
+class SkipHeldCraftFeasibility:
+    """Veto crafts whose result is already held, and defer the rest.
+
+    Under the reachability Can term the remaining waste was a second wood
+    pickaxe: 23 decisions over 64 seed-51 episodes. This wrapper scores such
+    a craft zero and otherwise returns the wrapped scorer's value.
+    """
+
+    base: FeasibilityScorer | BatchedFeasibilityScorer = reachability_feasibility
+
+    def score_all_feasibility(
+        self,
+        state: Any,
+        context: PlannerContext,
+        candidate_skills: tuple[SkillId, ...],
+    ) -> dict[SkillId, float]:
+        if isinstance(self.base, BatchedFeasibilityScorer):
+            scores = dict(
+                self.base.score_all_feasibility(state, context, candidate_skills)
+            )
+        else:
+            scores = {
+                skill_id: float(self.base(state, context, skill_id))
+                for skill_id in candidate_skills
+            }
+        return {
+            skill_id: 0.0 if redundant_craft(state, skill_id) else value
+            for skill_id, value in scores.items()
+        }
+
+    def __call__(
+        self,
+        state: Any,
+        context: PlannerContext,
+        skill_id: SkillId,
+    ) -> float:
+        return self.score_all_feasibility(state, context, (skill_id,))[skill_id]
+
+
+_HELD_TOOL_THRESHOLDS = _held_tool_thresholds()
 
 
 def _planner_selection(
