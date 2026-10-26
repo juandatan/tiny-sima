@@ -1238,3 +1238,26 @@ Planner sequencing diagnosed on October 25, 2026:
 - Executor benchmarks pair local-navigation results by skill, so a
   seven-skill run compares against the six-skill baseline.
 - Added notebook 06's `CHAIN` and `CONFIRM` knobs.
+
+Held-craft veto refuted on October 26, 2026:
+
+- Notebook 06 `full`, candidate executor, seed 51. The main condition solved
+  61 of 64, and `baseline_plus_reachability_skip_held` 59, with 3 discordant
+  episodes to 1 against the veto (p = 0.625). Recorded as a refuted approach.
+  It cut `craft_wood_pickaxe` waste from 22 decisions to 0, and surplus
+  `collect_wood` rose from 39 to 74.
+- All of the main condition's failures stall at the same state: the wood
+  pickaxe is held and stone is out of view. The baseline prompt demotes an
+  out-of-view target, the reachability term discounts it to 0.25, and
+  `1/rank^2` utilities make stone ranked fifth worth 0.01 against 0.25 for
+  wood. The oracle solved 64 of 64, so the executor finds stone when asked.
+- Considered and not built: an explore skill. The collect skills already
+  search, and the planner would face the same choice.
+- Added the `objective_first` prompt style. It is the baseline without the
+  instruction to demote an out-of-view target, with the baseline's schema and
+  assessment limit. The `baseline` and `available_first` prompts are
+  byte-identical to before. Added the `objective_first_plus_reachability`
+  and `objective_first_plus_competence_prior` conditions.
+- Added `collect_search_trajectory` and `is_search_boundary`, a prefix test on
+  the out-of-view states the oracle's own prefixes never reach: 14 states from
+  16 episodes on seed 51.

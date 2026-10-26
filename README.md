@@ -20,7 +20,7 @@ that policy says which skills are currently possible?
 
 ## Status
 
-As of October 25, 2026:
+As of October 26, 2026:
 
 - **Phases 1 to 3 are complete.** The environment, PPO baseline, skill
   benchmark, and goal-conditioned executor are done.
@@ -44,9 +44,16 @@ As of October 25, 2026:
   VLM's own first choice, so `baseline_plus_reachability` is now the main
   condition and `available_first` an ablation. Its remaining waste is a
   second wood pickaxe (23 decisions over 64 episodes) and extra wood (25).
-- **Current work is the last Phase 4 measurement.** A held-craft veto, a
-  seventh skill (`craft_stone_pickaxe`), and a longer stone-pickaxe chain are
-  implemented and tested, but not yet measured on the GPU.
+- **The held-craft veto is refuted, and the stall it hid is diagnosed.** On
+  seed 51 the main condition solved 61 of 64 and the veto 59 (3 discordant
+  episodes to 1 against it). The veto removed the second pickaxe, and the
+  planner collected surplus wood instead. Every failure stalls before stone:
+  the wood pickaxe is held, stone is out of view, and both the prompt and the
+  Can term discount it.
+- **Current work is the last Phase 4 measurement.** The `objective_first`
+  prompt, a search-state test, a seventh skill (`craft_stone_pickaxe`), and a
+  longer stone-pickaxe chain are implemented and tested, but not yet measured
+  on the GPU.
 - **Phases 5 and 6, memory and full evaluation, have not started.**
 
 ## System overview
@@ -315,6 +322,7 @@ What the probes show:
 | Competence prior as the Can term, under a strong executor | Refitted on the randomized executor, every cell is p = 1.000: held-out base rate 0.995 and AUC 0.500. Its closed loop matched reachability, 62 of 64 each with no discordant pair. Under the baseline executor (AUC 0.738) it also matched, 17 each with 3 discordant pairs each way. | Kept as `baseline_plus_competence_prior`, refitted for each executor. |
 | More training on `local_navigation` alone | The step-matched `local-matched-seed0` control raised stochastic default-plan success on seed 101 from 0.309 to 0.516, but left the plan-order gap at +0.318, the baseline's own gap. The randomized seeds closed it to between -0.002 and +0.002. | Kept as the control run in notebook 07. |
 | Symbolic preconditions as the Can term | They test whether a block exists anywhere on the 64x64 map, which is true almost everywhere. `vlm_plus_symbolic` matched reachability exactly. | Kept inside every Can term; retired as a condition. |
+| Held-craft veto (`baseline_plus_reachability_skip_held`) | 59 against 61 of 64 for the main condition on seed 51, 3 discordant episodes to 1 against it (p = 0.625). The pickaxe waste fell from 22 decisions to 0, and surplus wood rose from 39 to 74: the next-ranked skill in view took the vetoed one's place. | Kept in the ladder; `SkipHeldCraftFeasibility` stays in the library. |
 | Hard reachability gate | The four-episode scripted chain fell from 1.0 to 0.5 success, with the lost episodes ending in `no_viable_skill`. | Replaced by grading, with unknown targets at 0.25. |
 | Sampled decoding | `vlm_only` fell from 43 to 38 accepted of 48 on identical states. | Greedy decoding by default. |
 | Per-skill advantage normalization | It collapsed the unsolved interaction skills in a debug ablation. | Available, off by default. |
@@ -394,10 +402,48 @@ closed loop, candidate executor, seed 51:
 4. **Confirmation seed.** Notebook 06's `CONFIRM` reruns on seed 202, which
    no planner choice was made on.
 
+**The stall before stone.** The seed 51 run refuted the veto (59 against 61,
+3 discordant to 1 against) and located the remaining failures. All three of
+the main condition's lost episodes, and the veto's, end the same way: the
+wood pickaxe is held, stone is out of view, and the planner collects wood until
+the decision limit. The executor is not the cause. Every `collect_stone` the
+main condition requested succeeded, and the oracle, which asks for stone
+regardless, solved all 64 worlds. Three factors compound:
+
+- The `baseline` prompt tells the model to rank an out-of-view target below
+  any skill that can progress now, so it ranks stone fourth or fifth.
+- The reachability Can term discounts the out-of-view target again, to 0.25.
+- Rank utilities are `1/rank^2`. Stone ranked fifth scores 0.01, against
+  0.25 for wood ranked second. Even ranked first, stone only ties a reachable
+  wood ranked second, and ties keep catalog order, which puts wood first.
+
+An explore skill was considered and not built: the collect skills already
+search, and the planner would face the same choice between exploring and
+collecting wood that it gets wrong now.
+
+5. **`objective_first` prompt.** The baseline prompt without the instruction
+   to demote an out-of-view target, and with surplus resources and held tools
+   named as non-progress. The schema and the assessment limit are the
+   baseline's, and the `baseline` and `available_first` prompts are
+   byte-identical to before. It runs as `objective_first_plus_reachability`
+   and `objective_first_plus_competence_prior`. The prior replaces the 0.25
+   guess with the executor's measured success when searching, which this
+   executor puts near 1.
+6. **Search-state test.** The prefix ladder follows the oracle, which reaches
+   stone while it is nearby, so it never showed the stall.
+   `collect_search_trajectory` detours from each oracle boundary with
+   `collect_wood` until the only accepted step collects a resource that is
+   out of view. Seed 51 gives 14 such states from 16 episodes. It reports
+   `say_accepted`, the VLM's own first choice, beside `accepted`, so the prompt
+   and the Can term are measured apart.
+
 **To run, in order:**
 
-1. Notebook 06 `full` on seed 51, then with `CONFIRM = True`. The veto is
-   adopted as the main condition only if it holds on both.
+1. Notebook 06 `full` on seed 51, then with `CONFIRM = True`. The veto run
+   is done. The seed 202 run in progress confirms the main condition.
+   Afterwards, run `full` on seed 51 again for the `objective_first` rows and
+   the search-state test. An `objective_first` condition becomes the main
+   condition only if it also holds on seed 202.
 2. Notebook 07 `stone_pickaxe`, which trains three seven-skill seeds and
    records the selected one.
 3. Notebook 06 with `CHAIN = WOOD_TO_STONE_PICKAXE_CHAIN` and the
@@ -429,7 +475,7 @@ these.
 | 1. Environment and baseline | A reproducible Craftax PPO-RNN setup with throughput and memory measured | Complete |
 | 2. Skill benchmark | Six skills with preconditions, success predicates, sparse rewards, and scripted and random baselines | Complete |
 | 3. Goal-conditioned executor | One policy for every skill, trained on `local_navigation`, then on the `randomized` scenario | Complete |
-| 4. Hierarchical planner | A frozen VLM in a SayCan loop, with a grounded ablation ladder | Sequencing diagnosed; held-craft veto and stone-pickaxe chain awaiting measurement |
+| 4. Hierarchical planner | A frozen VLM in a SayCan loop, with a grounded ablation ladder | Held-craft veto refuted; `objective_first` prompt and stone-pickaxe chain awaiting measurement |
 | 5. Memory and visual grounding | Structured episodic memory; symbolic against pixel inputs; frame history; paraphrased instructions | Not started |
 | 6. Full evaluation | Long-horizon objectives, multi-seed ablations, compute accounting, and documented failures | Not started |
 
@@ -440,8 +486,8 @@ failed as one.
 
 Next steps, in order:
 
-1. **Measure the held-craft veto** in notebook 06 on seed 51, then confirm on
-   seed 202.
+1. **Measure `objective_first`** and the search-state test in notebook 06 on
+   seed 51, then confirm the chosen main condition on seed 202.
 2. **Train the seven-skill executor** with notebook 07's `stone_pickaxe`
    preset, and check that it still pairs with the baseline on the six-skill
    benchmark.

@@ -50,20 +50,33 @@ class PlannerPromptStyle(str, Enum):
     field ahead of the choice, which the prompt supplies verbatim as structured
     input -- turning "consider what is reachable" from an instruction a 2B model
     may skip into a copy step it must emit before it can choose.
+
+    ``OBJECTIVE_FIRST`` is ``BASELINE`` with reachability left to the Can term
+    alone. ``BASELINE`` tells the model to rank an out-of-view target below any
+    skill that can make progress now, and the Can term then discounts the same
+    target again, so once the wood pickaxe was held and stone was out of view
+    the model ranked stone fourth or fifth and the planner collected surplus
+    wood until the decision limit. This style asks for usefulness to the
+    objective only, says that surplus resources and held tools are not
+    progress, and keeps the baseline's schema and assessment limit, so the
+    instructions are the only change.
     """
 
     BASELINE = "baseline"
     AVAILABLE_FIRST = "available_first"
+    OBJECTIVE_FIRST = "objective_first"
 
 
 DEFAULT_PROMPT_STYLE = PlannerPromptStyle.AVAILABLE_FIRST
 
 # The baseline keeps the limit it was measured with. At 96 characters the
 # available-first assessments were cut off mid-sentence and drifted out of
-# English near the cutoff, so that style gets more room.
+# English near the cutoff, so that style gets more room. The objective-first
+# style keeps the baseline's, so that its instructions are the only change.
 _PROGRESS_ASSESSMENT_LIMITS = {
     PlannerPromptStyle.BASELINE: 96,
     PlannerPromptStyle.AVAILABLE_FIRST: 160,
+    PlannerPromptStyle.OBJECTIVE_FIRST: 96,
 }
 
 
@@ -527,6 +540,43 @@ _AVAILABLE_FIRST_INSTRUCTIONS = (
 )
 
 
+_OBJECTIVE_FIRST_INSTRUCTIONS = (
+    "You are the high-level planner for a Craftax survival agent.",
+    "You may rely on the supplied game-mechanics catalog as authoritative "
+    "knowledge of skill requirements, resource costs, and successful "
+    "effects.",
+    "At each option boundary, rank only the supplied skills by how much "
+    "each advances the objective as the next requested skill from the "
+    "current state.",
+    "The ranking is recomputed after every completed or failed skill.",
+    "Prioritize unmet prerequisites in execution order. Once a prerequisite "
+    "is achieved, promote the next unmet objective step and demote redundant "
+    "repetitions unless another repetition is necessary.",
+    # The two wastes the sequencing diagnosis found under the baseline prompt:
+    # a second wood pickaxe, and wood collected while stone was the next step.
+    "A tool already in the inventory is a completed step, so crafting it "
+    "again does not advance the objective. Collecting more of a resource "
+    "than the remaining recipes consume does not advance it either.",
+    # The baseline demoted an out-of-view target here and the Can term
+    # discounted it again, which is what stalled the planner before stone.
+    "Judge usefulness only. A separate affordance model weighs how far each "
+    "skill's target is and discounts a distant one, so do not demote a skill "
+    "because its target is out of view. Requesting such a skill makes the "
+    "player walk off and search for its target, which is the right request "
+    "when that skill is the next unmet objective step.",
+    "First assess current objective progress, then choose the most useful "
+    "next skill, then rank the complete catalog consistently with that "
+    "choice.",
+)
+
+
+_INSTRUCTIONS = {
+    PlannerPromptStyle.BASELINE: _BASELINE_INSTRUCTIONS,
+    PlannerPromptStyle.AVAILABLE_FIRST: _AVAILABLE_FIRST_INSTRUCTIONS,
+    PlannerPromptStyle.OBJECTIVE_FIRST: _OBJECTIVE_FIRST_INSTRUCTIONS,
+}
+
+
 def build_planner_system_prompt(
     style: PlannerPromptStyle = DEFAULT_PROMPT_STYLE,
     candidate_skills: Sequence[SkillId] = SKILL_IDS,
@@ -537,12 +587,7 @@ def build_planner_system_prompt(
     reads about a skill it cannot request.
     """
 
-    instructions = (
-        _BASELINE_INSTRUCTIONS
-        if style is PlannerPromptStyle.BASELINE
-        else _AVAILABLE_FIRST_INSTRUCTIONS
-    )
-    return "\n".join((*instructions, _mechanics_line(candidate_skills)))
+    return "\n".join((*_INSTRUCTIONS[style], _mechanics_line(candidate_skills)))
 
 
 PLANNER_SYSTEM_PROMPT = build_planner_system_prompt(PlannerPromptStyle.BASELINE)
@@ -659,6 +704,29 @@ def build_planner_prompt(
                 "overall goal.",
                 "Rank completed or redundant prerequisites below the next unmet "
                 "objective step unless repeating them is necessary.",
+                "First give a progress assessment of at most 96 characters. "
+                "Then select the best next skill and rank it first in the full "
+                "ordering.",
+            )
+        )
+    if style is PlannerPromptStyle.OBJECTIVE_FIRST:
+        return "\n".join(
+            (
+                *header,
+                f"Candidate skills: {json.dumps(catalog)}",
+                "Inspect the screenshot and structured state. Rank every "
+                "candidate exactly once from most to least useful for the "
+                "objective as the next skill.",
+                "A candidate whose steps_to_target is null has no target in "
+                "view, so requesting it means walking off to search. That "
+                "changes how far the player walks, not how useful the skill "
+                "is: rank it by its place in the objective like any other.",
+                "The first skill must be the next unmet objective step given "
+                "progress already made, not merely the skill most associated "
+                "with the overall goal.",
+                "Rank completed steps, tools already held and resources beyond "
+                "what the remaining recipes consume below the next unmet "
+                "objective step.",
                 "First give a progress assessment of at most 96 characters. "
                 "Then select the best next skill and rank it first in the full "
                 "ordering.",
