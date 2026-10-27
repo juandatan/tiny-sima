@@ -7,6 +7,7 @@ import pytest
 from tiny_sima.config import SkillPPOConfig
 from tiny_sima.envs.chains import make_skill_chain_environment
 from tiny_sima.envs.skills import make_vectorized_skill_environment
+from tiny_sima.evaluation.affordance import AffordanceSample, evaluate_competence_prior
 from tiny_sima.evaluation.chains import (
     WOOD_TO_STONE_CHAIN,
     WOOD_TO_STONE_PICKAXE_CHAIN,
@@ -33,6 +34,7 @@ from tiny_sima.planner.saycan import (
     PlannerContext,
     SayCanPlanner,
     SequentialUtilityScorer,
+    SkillOutcome,
     reachability_feasibility,
 )
 from tiny_sima.planner.vlm import (
@@ -266,6 +268,31 @@ def test_competence_prior_keeps_its_own_catalog() -> None:
 
     assert restored.skills == ALL_SKILL_IDS
     assert restored.rates == prior.rates
+    # The held-out report reads the same catalog, so the seventh skill's
+    # cells are printed rather than silently dropped.
+    samples = [
+        AffordanceSample(
+            episode=0,
+            boundary=index,
+            skill_id=skill_id,
+            critic_value=0.5,
+            reachability_gate=1.0,
+            reachable=step is not None,
+            precondition=True,
+            steps_to_target=step,
+            succeeded=label,
+            outcome=SkillOutcome.SUCCESS if label else SkillOutcome.TIMEOUT,
+            steps=1,
+        )
+        for index, (skill_id, step, label) in enumerate(
+            zip(skills, steps, labels, strict=True)
+        )
+    ]
+    report = evaluate_competence_prior(samples, prior)
+    assert {cell["skill"] for cell in report["cells"]} == {
+        SkillId.COLLECT_WOOD.value,
+        SkillId.CRAFT_STONE_PICKAXE.value,
+    }
     # A six-skill table saved before priors recorded their catalog.
     six = fit_competence_prior(skills[::2], steps[::2], labels[::2])
     payload = six.to_dict()

@@ -402,7 +402,7 @@ def evaluate_competence_prior(
 
     width = num_distance_cells(prior.distance_edges)
     cells: list[dict[str, Any]] = []
-    for skill_id in prior.candidate_skills:
+    for skill_id in prior.skills:
         for cell in range(width):
             in_cell = [
                 index

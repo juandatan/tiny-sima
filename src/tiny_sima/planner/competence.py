@@ -113,7 +113,6 @@ class CompetencePrior:
     distance_edges: tuple[int, ...] = DEFAULT_DISTANCE_EDGES
     floor: float = DEFAULT_FLOOR
     config: ReachabilityConfig = DEFAULT_REACHABILITY
-    candidate_skills: tuple[SkillId, ...] = SKILL_IDS
     skills: tuple[SkillId, ...] = SKILL_IDS
 
     def __post_init__(self) -> None:
