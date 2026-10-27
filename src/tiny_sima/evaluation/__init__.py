@@ -70,10 +70,13 @@ from tiny_sima.evaluation.planner import (
     PlannerBoundaryTrace,
     PrefixBoundary,
     PrefixTrajectory,
+    collect_detour_trajectory,
     collect_prefix_trajectory,
     collect_search_trajectory,
+    collect_surplus_trajectory,
     evaluate_planner_prefixes,
     is_search_boundary,
+    is_surplus_boundary,
 )
 from tiny_sima.evaluation.policy import evaluate_checkpoint, evaluate_policy
 from tiny_sima.evaluation.sequencing import (
@@ -125,8 +128,10 @@ __all__ = [
     "chain_boundaries",
     "chain_episode_record",
     "collect_affordance_samples",
+    "collect_detour_trajectory",
     "collect_prefix_trajectory",
     "collect_search_trajectory",
+    "collect_surplus_trajectory",
     "compare_executor_benchmarks",
     "compare_paired_successes",
     "decision_kind",
@@ -147,6 +152,7 @@ __all__ = [
     "evaluate_policy",
     "evaluate_planner_prefixes",
     "is_search_boundary",
+    "is_surplus_boundary",
     "evaluate_skill_policy",
     "evaluate_skill_chain",
     "evaluate_skill_suite",

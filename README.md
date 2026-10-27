@@ -437,6 +437,69 @@ collecting wood that it gets wrong now.
    `say_accepted`, the VLM's own first choice, beside `accepted`, so the prompt
    and the Can term are measured apart.
 
+**Miscounting on the stone-pickaxe chain.** The first stone-pickaxe run, on
+seed 202, put `objective_first` ahead (0.641 under the competence prior,
+against 0.469 for the main condition) and the search-state test at 1.000, so
+the out-of-view stall is fixed. The waste left is counting. The model ignored
+the catalog's recipe ("Stone: 0 (5/5 needed)" for a pickaxe that takes one),
+collected stone again while wood was the only accepted step (the commonest
+off-objective choice by far), and ranked `collect_wood` last right after
+collecting one wood. That run was on the confirmation seed, so the fix is
+selected on 51.
+
+7. **`recipe_aware` prompt.** `objective_first` with three fields added to
+   each candidate, all computed from the skill registry and the inventory,
+   never the chain: `inventory_shortfall` against the skill's own declared
+   requirements, `result_held` for a craft of a tool already held, and
+   `fills_shortfall_of`, the candidates whose shortfall it reduces. Its
+   blanket "demote redundant repetitions" is replaced with repetition
+   conditioned on that shortfall. It runs as `recipe_aware_plus_reachability`
+   and `recipe_aware_plus_competence_prior`, each paired against its
+   `objective_first` counterpart.
+8. **Surplus-state test.** `collect_surplus_trajectory` detours from each
+   oracle boundary with `collect_stone` and keeps every state where stone is
+   held and `collect_wood` is the only accepted step: the oracle never
+   reaches it, and it is where the closed loop's commonest off-objective
+   choice was made.
+
+**From the registry rather than the diagnosis.** Items 2, 6, 7 and 8 each
+answered one class of mistake found by reading a closed loop. Every one was a
+mistake the skill registry could already rule out: each skill declares its
+`requires` and `effects`, so the next useful step is a planning problem with
+an exact answer. The next two items solve it once instead of one class at a
+time.
+
+9. **Plan-progress veto.** `PlanProgressFeasibility` runs a breadth-first
+   search over the registry's declared mechanics, from the chain's formal
+   `goal` (for example `inventory.stone_pickaxe >= 1`), and scores zero any
+   skill that starts no shortest plan. World facts mean the target exists on
+   the map; distance stays with the reachability term it wraps. When no plan
+   exists, for example wood short with no tree left, or when every on-plan
+   skill scores zero under that term, it returns the reachability scores
+   unchanged. The plan reproduces both chains' hand-written accepted sets
+   exactly at every ladder, search, surplus and detour state tested. It reads
+   the goal, never the accepted set or the reference plan. It runs as:
+   - `plan_only_plus_reachability`, with no VLM.
+   - `baseline_plus_plan`, paired against the main condition, the held-craft
+     veto and the plan alone.
+   - `recipe_aware_plus_plan`, paired against `recipe_aware_plus_reachability`.
+
+   With the scripted executor on seed 51, `plan_only` solves 16 of 16
+   stone-pickaxe worlds, against 0 of 16 for reachability alone. A hard veto
+   cannot route around a step the executor keeps failing, and `off_plan > 0`
+   is the knob for that.
+10. **Detour-state test.** `collect_detour_trajectory` generalizes the
+    search and surplus tests. From each oracle boundary it requests every
+    skill in the catalog repeatedly and keeps the state after each request
+    the accepted set did not contain, up to two, labelled `<skill>x<k>`. The
+    states are labelled by the chain's exact accepted set, so no hand-written
+    predicate is needed. Seed 51 gives about 43 states per episode on the
+    stone-pickaxe chain, covering surplus stone and wood, a second wood
+    pickaxe, a sword, and drinking with nothing to drink for. Reachability
+    alone accepts 0.46 of them and the plan veto 1.00. Notebook 06 checks
+    plan agreement on every derived trajectory before running any VLM, then
+    prints accuracy per label.
+
 **To run, in order:**
 
 1. Notebook 06 `full` on seed 51, then with `CONFIRM = True`. The veto run
@@ -448,7 +511,10 @@ collecting wood that it gets wrong now.
    records the selected one.
 3. Notebook 06 with `CHAIN = WOOD_TO_STONE_PICKAXE_CHAIN` and the
    seven-skill executor selected. Read `scripted_oracle` first: the planner
-   conditions cannot beat what the executor finishes.
+   conditions cannot beat what the executor finishes. The seed 202 run is
+   done; run `full` on seed 51 for the `recipe_aware` and plan-veto rows and
+   the surplus- and detour-state tests, then confirm the chosen condition on
+   202.
 
 **The bar** stays the collect-first scripted plan on each chain.
 

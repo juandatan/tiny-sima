@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +13,7 @@ import numpy as np
 
 from tiny_sima.evaluation.chains import (
     WOOD_TO_STONE_CHAIN,
+    WOOD_TO_STONE_PICKAXE_CHAIN,
     ScriptedSkillExecutor,
     SkillChainSpec,
     chain_environment,
@@ -22,6 +24,7 @@ from tiny_sima.goals import (
     SkillGoal,
     SkillId,
     skill_feasible,
+    skill_metric,
     skill_precondition,
     travel_distance_map,
 )
@@ -54,6 +57,7 @@ class PlannerBoundaryTrace:
     utility_top_feasible: bool = False
     selected_feasible: bool = False
     utility_repaired: bool = False
+    label: str = ""
 
 
 @dataclass
@@ -68,7 +72,11 @@ class _PrefixEpisode:
 
 @dataclass(frozen=True)
 class PrefixBoundary:
-    """One oracle-reached state at which a planner decision is scored."""
+    """One oracle-reached state at which a planner decision is scored.
+
+    ``label`` names how a derived state was reached from the oracle's, so its
+    accuracy can be reported per kind of state.
+    """
 
     episode: int
     boundary: int
@@ -76,6 +84,7 @@ class PrefixBoundary:
     state: Any
     context: PlannerContext
     accepted_skills: tuple[SkillId, ...]
+    label: str = ""
 
 
 @dataclass(frozen=True)
@@ -235,6 +244,121 @@ def is_search_boundary(
     return True
 
 
+def _run_detour(
+    executor: ScriptedSkillExecutor,
+    environment: Any,
+    state: Any,
+    context: PlannerContext,
+    skill_id: SkillId,
+    key: Any,
+    horizon: int,
+) -> tuple[Any, PlannerContext] | None:
+    """Run one detour skill, recording it as the closed loop would have.
+
+    Returns ``None`` when the skill does not succeed.
+    """
+
+    result = executor.execute(environment, state, skill_id, key, horizon=horizon)
+    if result.outcome is not SkillOutcome.SUCCESS:
+        return None
+    return result.state, PlannerContext(
+        objective=context.objective,
+        history=(
+            *context.history,
+            SkillAttempt(
+                skill_id=skill_id,
+                outcome=result.outcome,
+                steps=result.steps,
+                native_return=result.native_return,
+            ),
+        ),
+    )
+
+
+def _check_derivable(
+    trajectory: PrefixTrajectory,
+    chain: SkillChainSpec,
+    max_detours: int,
+) -> None:
+    if trajectory.chain_name != chain.name:
+        raise ValueError(
+            f"trajectory is for {trajectory.chain_name}, not {chain.name}."
+        )
+    if chain.valid_next_skills is None:
+        raise ValueError(f"{chain.name} defines no accepted skills to compare.")
+    if max_detours < 0:
+        raise ValueError("max_detours must be non-negative.")
+
+
+def _detour_trajectory(
+    trajectory: PrefixTrajectory,
+    *,
+    chain: SkillChainSpec,
+    detour_skill: SkillId,
+    max_detours: int,
+    seed: int,
+    keep: Callable[[Any, tuple[SkillId, ...]], bool],
+    keep_every: bool,
+) -> PrefixTrajectory:
+    """Run ``detour_skill`` from each oracle boundary and keep matching states.
+
+    ``keep`` sees each state and its accepted set, the oracle state first.
+    With ``keep_every`` every match along the detours is kept rather than
+    the first. The detours are recorded in each kept state's history as the
+    closed loop would have recorded them.
+    """
+
+    _check_derivable(trajectory, chain, max_detours)
+    assert chain.valid_next_skills is not None
+    environment = chain_environment(
+        chain,
+        distractor_count=trajectory.distractor_count,
+    )
+    executor = ScriptedSkillExecutor()
+    rollout_key = jax.random.PRNGKey(seed)
+    boundaries: list[tuple[PrefixBoundary, ...]] = []
+    for points in trajectory.boundaries:
+        found: list[PrefixBoundary] = []
+        for point in points:
+            state, context = point.state, point.context
+            for detour in range(max_detours + 1):
+                accepted = chain.valid_next_skills(state)
+                if keep(state, accepted):
+                    found.append(
+                        PrefixBoundary(
+                            episode=point.episode,
+                            boundary=point.boundary,
+                            reference_skill=point.reference_skill,
+                            state=state,
+                            context=context,
+                            accepted_skills=accepted,
+                        )
+                    )
+                    if not keep_every:
+                        break
+                if detour == max_detours or chain.is_complete(state):
+                    break
+                rollout_key, execution_key = jax.random.split(rollout_key)
+                detoured = _run_detour(
+                    executor,
+                    environment,
+                    state,
+                    context,
+                    detour_skill,
+                    execution_key,
+                    trajectory.skill_horizon,
+                )
+                if detoured is None:
+                    break
+                state, context = detoured
+        boundaries.append(tuple(found))
+    return dataclasses.replace(
+        trajectory,
+        boundaries=tuple(boundaries),
+        oracle_progress_failures=0,
+    )
+
+
 def collect_search_trajectory(
     trajectory: PrefixTrajectory,
     *,
@@ -258,14 +382,114 @@ def collect_search_trajectory(
     :func:`evaluate_planner_prefixes` scores it unchanged.
     """
 
-    if trajectory.chain_name != chain.name:
-        raise ValueError(
-            f"trajectory is for {trajectory.chain_name}, not {chain.name}."
-        )
-    if chain.valid_next_skills is None:
-        raise ValueError(f"{chain.name} defines no accepted skills to search for.")
-    if max_detours < 0:
-        raise ValueError("max_detours must be non-negative.")
+    return _detour_trajectory(
+        trajectory,
+        chain=chain,
+        detour_skill=detour_skill,
+        max_detours=max_detours,
+        seed=seed,
+        keep=lambda state, accepted: is_search_boundary(
+            state, accepted, reachability
+        ),
+        keep_every=False,
+    )
+
+
+# Skills that add one unit of a resource to the inventory, so that repeating
+# one is progress exactly while some remaining recipe is short of it.
+COLLECTION_SKILLS = frozenset((SkillId.COLLECT_WOOD, SkillId.COLLECT_STONE))
+
+
+def is_surplus_boundary(
+    state: Any,
+    accepted_skills: tuple[SkillId, ...],
+    surplus_skill: SkillId = SkillId.COLLECT_STONE,
+) -> bool:
+    """Whether collecting more of a resource already held is off-objective.
+
+    True when some accepted skill exists, every accepted skill collects a
+    resource, ``surplus_skill`` is not among them, and it could run now on a
+    player who already holds some of what it collects: requesting it again
+    would succeed and add nothing the objective needs.
+    """
+
+    if surplus_skill not in COLLECTION_SKILLS:
+        raise ValueError(f"{surplus_skill.value} collects no resource.")
+    if (
+        not accepted_skills
+        or surplus_skill in accepted_skills
+        or not COLLECTION_SKILLS.issuperset(accepted_skills)
+    ):
+        return False
+    if int(np.asarray(skill_metric(surplus_skill, state))) < 1:
+        return False
+    return bool(np.asarray(skill_precondition(SkillGoal(surplus_skill), state)))
+
+
+def collect_surplus_trajectory(
+    trajectory: PrefixTrajectory,
+    *,
+    chain: SkillChainSpec = WOOD_TO_STONE_PICKAXE_CHAIN,
+    surplus_skill: SkillId = SkillId.COLLECT_STONE,
+    max_detours: int = 3,
+    seed: int = 0,
+) -> PrefixTrajectory:
+    """Derive the boundaries where a resource is held and another is short.
+
+    The closed loop's commonest off-objective choice under the
+    objective-first prompt on the stone-pickaxe chain: stone held, wood spent
+    on the wood pickaxe, collect wood the only correct step, and the planner
+    collecting stone again, mostly as a repeat. The oracle never holds stone
+    before its last wood, so neither the prefix ladder nor the search test
+    reaches that state. From each oracle boundary this runs ``surplus_skill`` up to
+    ``max_detours`` times and keeps every state :func:`is_surplus_boundary`
+    accepts, so a boundary after one surplus stone and one after three are
+    both scored, each with the stones in its history.
+    """
+
+    return _detour_trajectory(
+        trajectory,
+        chain=chain,
+        detour_skill=surplus_skill,
+        max_detours=max_detours,
+        seed=seed,
+        keep=lambda state, accepted: is_surplus_boundary(
+            state, accepted, surplus_skill
+        ),
+        keep_every=True,
+    )
+
+
+def collect_detour_trajectory(
+    trajectory: PrefixTrajectory,
+    *,
+    chain: SkillChainSpec = WOOD_TO_STONE_CHAIN,
+    detour_skills: tuple[SkillId, ...] | None = None,
+    max_detours: int = 2,
+    seed: int = 0,
+) -> PrefixTrajectory:
+    """Derive every state one repeated off-objective request reaches.
+
+    The search and surplus tests each derive one class of state the closed
+    loop found the planner failing in. This derives them all at once: from
+    each oracle boundary it requests each of ``detour_skills`` (the chain's
+    catalog by default) repeatedly with the scripted executor, and keeps the
+    state after each request the chain's accepted set did not contain, up to
+    ``max_detours`` of them, labelled ``"<skill>x<k>"`` after the ``k``-th.
+    Requests the accepted set did contain advance the world without being
+    kept, so collecting wood past what the recipes need is reached too. Every
+    kept state is labelled by the chain's exact accepted set, so a planner's
+    accuracy on it needs no hand-written predicate. A request that fails ends
+    that skill's detour, since the failure penalty, not the state, is then
+    what the planner should read.
+    """
+
+    _check_derivable(trajectory, chain, max_detours)
+    assert chain.valid_next_skills is not None
+    skills = chain.skills if detour_skills is None else detour_skills
+    # Long enough to finish the reference plan by repetition and still make
+    # ``max_detours`` off-objective requests after it.
+    max_requests = len(chain.reference_skills) + max_detours
     environment = chain_environment(
         chain,
         distractor_count=trajectory.distractor_count,
@@ -276,46 +500,44 @@ def collect_search_trajectory(
     for points in trajectory.boundaries:
         found: list[PrefixBoundary] = []
         for point in points:
-            state, context = point.state, point.context
-            for detour in range(max_detours + 1):
-                accepted = chain.valid_next_skills(state)
-                if is_search_boundary(state, accepted, reachability):
-                    found.append(
-                        PrefixBoundary(
-                            episode=point.episode,
-                            boundary=point.boundary,
-                            reference_skill=point.reference_skill,
-                            state=state,
-                            context=context,
-                            accepted_skills=accepted,
-                        )
+            for skill_id in skills:
+                state, context = point.state, point.context
+                detours = 0
+                for _ in range(max_requests):
+                    accepted = chain.valid_next_skills(state)
+                    if not accepted:
+                        break
+                    rollout_key, execution_key = jax.random.split(rollout_key)
+                    detoured = _run_detour(
+                        executor,
+                        environment,
+                        state,
+                        context,
+                        skill_id,
+                        execution_key,
+                        trajectory.skill_horizon,
                     )
-                    break
-                if detour == max_detours or chain.is_complete(state):
-                    break
-                rollout_key, execution_key = jax.random.split(rollout_key)
-                result = executor.execute(
-                    environment,
-                    state,
-                    detour_skill,
-                    execution_key,
-                    horizon=trajectory.skill_horizon,
-                )
-                if result.outcome is not SkillOutcome.SUCCESS:
-                    break
-                state = result.state
-                context = PlannerContext(
-                    objective=context.objective,
-                    history=(
-                        *context.history,
-                        SkillAttempt(
-                            skill_id=detour_skill,
-                            outcome=result.outcome,
-                            steps=result.steps,
-                            native_return=result.native_return,
-                        ),
-                    ),
-                )
+                    if detoured is None:
+                        break
+                    state, context = detoured
+                    if skill_id in accepted:
+                        continue
+                    detours += 1
+                    following = chain.valid_next_skills(state)
+                    if following:
+                        found.append(
+                            PrefixBoundary(
+                                episode=point.episode,
+                                boundary=point.boundary,
+                                reference_skill=point.reference_skill,
+                                state=state,
+                                context=context,
+                                accepted_skills=following,
+                                label=f"{skill_id.value}x{detours}",
+                            )
+                        )
+                    if detours == max_detours:
+                        break
         boundaries.append(tuple(found))
     return dataclasses.replace(
         trajectory,
@@ -442,6 +664,7 @@ def evaluate_planner_prefixes(
                     utility_top_feasible=utility_top_feasible,
                     selected_feasible=selected_skill in feasible_skills,
                     utility_repaired=selection.utility_repaired,
+                    label=point.label,
                 )
             )
 
@@ -496,6 +719,9 @@ def evaluate_planner_prefixes(
         ],
         dtype=np.bool_,
     )
+    label_matches: dict[str, list[bool]] = {}
+    for trace in traces:
+        label_matches.setdefault(trace.label, []).append(trace.matched)
     mean_feasible_skills = float(
         np.mean([len(trace.feasible_skills) for trace in traces])
     ) if traces else 0.0
@@ -532,5 +758,9 @@ def evaluate_planner_prefixes(
         if len(rescued)
         else 0.0,
         "oracle_progress_failures": trajectory.oracle_progress_failures,
+        "accuracy_by_label": {
+            label: float(np.mean(matched))
+            for label, matched in sorted(label_matches.items())
+        },
         "traces": tuple(traces),
     }

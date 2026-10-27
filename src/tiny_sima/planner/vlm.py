@@ -24,6 +24,7 @@ from tiny_sima.goals import (
     SkillGoal,
     SkillId,
     block_mask,
+    get_skill_spec,
     interaction_distance,
     planner_skill_catalog,
     skill_interaction_distance,
@@ -32,7 +33,11 @@ from tiny_sima.goals import (
     travel_distance_map,
     walkable_mask,
 )
-from tiny_sima.planner.saycan import PlannerContext, UtilityScoreBatch
+from tiny_sima.planner.saycan import (
+    PlannerContext,
+    UtilityScoreBatch,
+    redundant_craft,
+)
 
 
 class PlannerPromptStyle(str, Enum):
@@ -60,11 +65,24 @@ class PlannerPromptStyle(str, Enum):
     objective only, says that surplus resources and held tools are not
     progress, and keeps the baseline's schema and assessment limit, so the
     instructions are the only change.
+
+    ``RECIPE_AWARE`` is ``OBJECTIVE_FIRST`` with the counting done for the
+    model. Under that style it ignored the catalog's recipes -- it wrote
+    "Stone: 0 (5/5 needed)" for a stone pickaxe that takes one, and ranked
+    collect_wood last just after collecting one -- so it collected surplus
+    stone, or drank water, while wood was the next step. Here each candidate
+    arrives with its inventory shortfall against its own declared
+    requirements, whether it only makes a tool already held, and which other
+    candidates' shortfall it fills, and the instruction to demote repetitions
+    is conditioned on that shortfall. All three read the skill registry and
+    the inventory, never the chain, as :class:`SkipHeldCraftFeasibility`
+    does.
     """
 
     BASELINE = "baseline"
     AVAILABLE_FIRST = "available_first"
     OBJECTIVE_FIRST = "objective_first"
+    RECIPE_AWARE = "recipe_aware"
 
 
 DEFAULT_PROMPT_STYLE = PlannerPromptStyle.AVAILABLE_FIRST
@@ -72,11 +90,13 @@ DEFAULT_PROMPT_STYLE = PlannerPromptStyle.AVAILABLE_FIRST
 # The baseline keeps the limit it was measured with. At 96 characters the
 # available-first assessments were cut off mid-sentence and drifted out of
 # English near the cutoff, so that style gets more room. The objective-first
-# style keeps the baseline's, so that its instructions are the only change.
+# style keeps the baseline's, so that its instructions are the only change,
+# and the recipe-aware style keeps it in turn.
 _PROGRESS_ASSESSMENT_LIMITS = {
     PlannerPromptStyle.BASELINE: 96,
     PlannerPromptStyle.AVAILABLE_FIRST: 160,
     PlannerPromptStyle.OBJECTIVE_FIRST: 96,
+    PlannerPromptStyle.RECIPE_AWARE: 96,
 }
 
 
@@ -570,10 +590,47 @@ _OBJECTIVE_FIRST_INSTRUCTIONS = (
 )
 
 
+_RECIPE_AWARE_INSTRUCTIONS = (
+    "You are the high-level planner for a Craftax survival agent.",
+    "You may rely on the supplied game-mechanics catalog as authoritative "
+    "knowledge of skill requirements, resource costs, and successful "
+    "effects.",
+    "At each option boundary, rank only the supplied skills by how much "
+    "each advances the objective as the next requested skill from the "
+    "current state.",
+    "The ranking is recomputed after every completed or failed skill.",
+    "Prioritize unmet prerequisites in execution order.",
+    # Under the objective-first prompt the model's own counts were wrong: it
+    # wrote "Stone: 0 (5/5 needed)" for a recipe that takes one.
+    "Each candidate arrives with its quantities already computed from the "
+    "catalog. inventory_shortfall is how much more of each item its "
+    "requirements ask for than the inventory holds, result_held is true for "
+    "a craft whose tool is already in the inventory, and fills_shortfall_of "
+    "lists the other candidates whose shortfall the skill reduces. Treat them "
+    "as ground truth and do not recount them.",
+    # Replaces the blanket "demote redundant repetitions", which demoted the
+    # second wood as readily as the fifth stone.
+    "A craft whose result_held is true is a completed step. Repeat a "
+    "collection skill while a remaining objective step is still short of "
+    "its resource, however many times it has just been done. Once no "
+    "remaining objective step is short of a resource, collecting more of it "
+    "does not advance the objective.",
+    "Judge usefulness only. A separate affordance model weighs how far each "
+    "skill's target is and discounts a distant one, so do not demote a skill "
+    "because its target is out of view. Requesting such a skill makes the "
+    "player walk off and search for its target, which is the right request "
+    "when that skill is the next unmet objective step.",
+    "First assess current objective progress, then choose the most useful "
+    "next skill, then rank the complete catalog consistently with that "
+    "choice.",
+)
+
+
 _INSTRUCTIONS = {
     PlannerPromptStyle.BASELINE: _BASELINE_INSTRUCTIONS,
     PlannerPromptStyle.AVAILABLE_FIRST: _AVAILABLE_FIRST_INSTRUCTIONS,
     PlannerPromptStyle.OBJECTIVE_FIRST: _OBJECTIVE_FIRST_INSTRUCTIONS,
+    PlannerPromptStyle.RECIPE_AWARE: _RECIPE_AWARE_INSTRUCTIONS,
 }
 
 
@@ -596,16 +653,83 @@ AVAILABLE_FIRST_SYSTEM_PROMPT = build_planner_system_prompt(
 )
 
 
+def inventory_shortfall(state: Any, skill_id: SkillId) -> dict[str, int]:
+    """Return how far the inventory falls short of a skill's requirements.
+
+    Only the declared ``at_least`` requirements on inventory fields count;
+    reach is the Can term's. A met requirement is left out, so an empty
+    result means the inventory is enough.
+    """
+
+    inventory = state.inventory
+    shortfall: dict[str, int] = {}
+    for requirement in get_skill_spec(skill_id).mechanics.requires:
+        if (
+            requirement.comparison != "at_least"
+            or not requirement.field.startswith("inventory.")
+        ):
+            continue
+        held = int(
+            np.asarray(
+                getattr(inventory, requirement.field.removeprefix("inventory."))
+            )
+        )
+        if held < int(requirement.value):
+            shortfall[requirement.field] = int(requirement.value) - held
+    return shortfall
+
+
+def recipe_entries(
+    state: Any,
+    candidate_skills: tuple[SkillId, ...],
+) -> dict[SkillId, dict[str, Any]]:
+    """Return the recipe-aware prompt's derived fields for each candidate.
+
+    ``fills_shortfall_of`` lists the candidates short of an inventory field
+    the skill increases, leaving out crafts whose tool is already held, so
+    that a second wood pickaxe never makes wood look needed.
+    """
+
+    shortfalls = {
+        skill_id: inventory_shortfall(state, skill_id)
+        for skill_id in candidate_skills
+    }
+    held = {
+        skill_id: redundant_craft(state, skill_id) for skill_id in candidate_skills
+    }
+    entries: dict[SkillId, dict[str, Any]] = {}
+    for skill_id in candidate_skills:
+        increased = {
+            effect.field
+            for effect in get_skill_spec(skill_id).mechanics.effects
+            if effect.operation == "increase"
+        }
+        entries[skill_id] = {
+            "inventory_shortfall": shortfalls[skill_id],
+            "result_held": held[skill_id],
+            "fills_shortfall_of": [
+                other.value
+                for other in candidate_skills
+                if other is not skill_id
+                and not held[other]
+                and increased & shortfalls[other].keys()
+            ],
+        }
+    return entries
+
+
 def _candidate_entries(
     state: Any,
     candidate_skills: tuple[SkillId, ...],
     reachability: ReachabilityConfig,
     *,
     include_availability: bool,
+    include_recipes: bool = False,
 ) -> list[dict[str, Any]]:
     """Describe each candidate from the shared reachability search."""
 
     distances = travel_distance_map(state, reachability)
+    recipes = recipe_entries(state, candidate_skills) if include_recipes else {}
     entries: list[dict[str, Any]] = []
     for skill_id in candidate_skills:
         goal = SkillGoal(skill_id)
@@ -637,6 +761,7 @@ def _candidate_entries(
                 blocked_reason = None
             entry["available_now"] = blocked_reason is None
             entry["blocked_reason"] = blocked_reason
+        entry.update(recipes.get(skill_id, {}))
         entries.append(entry)
     return entries
 
@@ -680,6 +805,7 @@ def build_planner_prompt(
         candidate_skills,
         reachability,
         include_availability=style is PlannerPromptStyle.AVAILABLE_FIRST,
+        include_recipes=style is PlannerPromptStyle.RECIPE_AWARE,
     )
     header = (
         f"Objective: {context.objective}",
@@ -727,6 +853,30 @@ def build_planner_prompt(
                 "Rank completed steps, tools already held and resources beyond "
                 "what the remaining recipes consume below the next unmet "
                 "objective step.",
+                "First give a progress assessment of at most 96 characters. "
+                "Then select the best next skill and rank it first in the full "
+                "ordering.",
+            )
+        )
+    if style is PlannerPromptStyle.RECIPE_AWARE:
+        return "\n".join(
+            (
+                *header,
+                f"Candidate skills: {json.dumps(catalog)}",
+                "Inspect the screenshot and structured state. Rank every "
+                "candidate exactly once from most to least useful for the "
+                "objective as the next skill.",
+                "A candidate whose steps_to_target is null has no target in "
+                "view, so requesting it means walking off to search. That "
+                "changes how far the player walks, not how useful the skill "
+                "is: rank it by its place in the objective like any other.",
+                "The first skill must be the next unmet objective step given "
+                "progress already made, not merely the skill most associated "
+                "with the overall goal.",
+                "Read quantities from inventory_shortfall and "
+                "fills_shortfall_of. Rank a craft whose result_held is true, "
+                "and a collection skill that fills no remaining objective "
+                "step's shortfall, below the next unmet objective step.",
                 "First give a progress assessment of at most 96 characters. "
                 "Then select the best next skill and rank it first in the full "
                 "ordering.",

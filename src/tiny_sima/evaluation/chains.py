@@ -51,6 +51,7 @@ from tiny_sima.goals import (
     SKILL_IDS,
     SkillGoal,
     SkillId,
+    StateRequirement,
     executor_skill_ids,
     get_skill_spec,
     skill_index,
@@ -68,6 +69,7 @@ from tiny_sima.planner.saycan import (
     SkillOutcome,
     SkillScore,
 )
+from tiny_sima.planner.symbolic import GoalCondition
 
 ObjectivePredicate = Callable[[Any], bool]
 JaxObjectivePredicate = Callable[[Any], jax.Array]
@@ -78,7 +80,9 @@ class SkillChainSpec(NamedTuple):
     """A state-based objective with an optional scripted reference plan.
 
     ``skills`` is the catalog the planner chooses from, and ``tree_count``
-    the wood the world holds, since every mined tree is gone.
+    the wood the world holds, since every mined tree is gone. ``goal`` states
+    ``is_complete`` over the registry's fields, for a planner that searches
+    the registry's mechanics rather than reading the reference plan.
     """
 
     name: str
@@ -89,6 +93,7 @@ class SkillChainSpec(NamedTuple):
     valid_next_skills: ValidNextSkills | None = None
     skills: tuple[SkillId, ...] = SKILL_IDS
     tree_count: int = 3
+    goal: GoalCondition | None = None
 
 
 def chain_decision_limit(chain: SkillChainSpec) -> int:
@@ -164,6 +169,10 @@ WOOD_TO_STONE_CHAIN = SkillChainSpec(
     is_complete=_wood_to_stone_complete,
     is_complete_jax=_wood_to_stone_complete_jax,
     valid_next_skills=_wood_to_stone_valid_next_skills,
+    goal=(
+        StateRequirement("inventory.wood_pickaxe", "at_least", 1),
+        StateRequirement("inventory.stone", "at_least", 1),
+    ),
 )
 
 
@@ -237,6 +246,7 @@ WOOD_TO_STONE_PICKAXE_CHAIN = SkillChainSpec(
     valid_next_skills=_stone_pickaxe_valid_next_skills,
     skills=ALL_SKILL_IDS,
     tree_count=4,
+    goal=(StateRequirement("inventory.stone_pickaxe", "at_least", 1),),
 )
 
 SKILL_CHAINS: dict[str, SkillChainSpec] = {

@@ -346,6 +346,26 @@ def redundant_craft(state: Any, skill_id: SkillId) -> bool:
     )
 
 
+def catalog_feasibility(
+    scorer: FeasibilityScorer | BatchedFeasibilityScorer,
+    state: Any,
+    context: PlannerContext,
+    candidate_skills: tuple[SkillId, ...],
+) -> dict[SkillId, float]:
+    """Score every candidate with either kind of feasibility scorer."""
+
+    if isinstance(scorer, BatchedFeasibilityScorer):
+        scores = scorer.score_all_feasibility(state, context, candidate_skills)
+        return {
+            skill_id: float(scores.get(skill_id, 0.0))
+            for skill_id in candidate_skills
+        }
+    return {
+        skill_id: float(scorer(state, context, skill_id))
+        for skill_id in candidate_skills
+    }
+
+
 @dataclass(frozen=True)
 class SkipHeldCraftFeasibility:
     """Veto crafts whose result is already held, and defer the rest.
@@ -363,15 +383,7 @@ class SkipHeldCraftFeasibility:
         context: PlannerContext,
         candidate_skills: tuple[SkillId, ...],
     ) -> dict[SkillId, float]:
-        if isinstance(self.base, BatchedFeasibilityScorer):
-            scores = dict(
-                self.base.score_all_feasibility(state, context, candidate_skills)
-            )
-        else:
-            scores = {
-                skill_id: float(self.base(state, context, skill_id))
-                for skill_id in candidate_skills
-            }
+        scores = catalog_feasibility(self.base, state, context, candidate_skills)
         return {
             skill_id: 0.0 if redundant_craft(state, skill_id) else value
             for skill_id, value in scores.items()
