@@ -40,6 +40,7 @@ from tiny_sima.executor.model import (
     select_action,
 )
 from tiny_sima.goals import SKILL_IDS, SkillId, skill_index, skill_precondition
+from tiny_sima.memory import EpisodeMemory
 from tiny_sima.planner.saycan import (
     PlannerContext,
     SayCanPlanner,
@@ -79,6 +80,21 @@ def _make_random_learned_executor() -> LearnedSkillExecutor:
     )
 
 
+def _extremes_over(states: Sequence[Any]) -> tuple[tuple[str, int, int], ...]:
+    """Each inventory count's lowest and highest value over ``states``."""
+
+    names = [item.name for item in dataclasses.fields(states[0].inventory)]
+    counts = np.asarray(
+        [[int(getattr(state.inventory, name)) for name in names] for state in states]
+    )
+    return tuple(
+        (f"inventory.{name}", int(low), int(high))
+        for name, low, high in zip(
+            names, counts.min(axis=0), counts.max(axis=0), strict=True
+        )
+    )
+
+
 def _execute_stepwise(
     executor: LearnedSkillExecutor,
     environment: SkillChainEnvironment,
@@ -102,7 +118,9 @@ def _execute_stepwise(
             steps=0,
             skill_return=0.0,
             native_return=0.0,
+            inventory_extremes=_extremes_over([state]),
         )
+    visited = [state]
     hidden = initial_hidden(1, executor.config.hidden_size)
     categorical_skill_id = jnp.asarray(skill_index(skill_id), dtype=jnp.int32)
     skill_return = 0.0
@@ -131,6 +149,7 @@ def _execute_stepwise(
             action,
         )
         current = result.state
+        visited.append(current.env_state)
         skill_return += float(np.asarray(result.reward))
         native_return += float(np.asarray(result.info["native_reward"]))
         outcome = _outcome_from_step(result)
@@ -141,6 +160,7 @@ def _execute_stepwise(
                 steps=step_index + 1,
                 skill_return=skill_return,
                 native_return=native_return,
+                inventory_extremes=_extremes_over(visited),
             )
     return SkillExecutionResult(
         state=current.env_state,
@@ -148,6 +168,7 @@ def _execute_stepwise(
         steps=horizon,
         skill_return=skill_return,
         native_return=native_return,
+        inventory_extremes=_extremes_over(visited),
     )
 
 
@@ -159,6 +180,7 @@ def _assert_same_execution(
     assert actual.steps == expected.steps
     assert actual.skill_return == expected.skill_return
     assert actual.native_return == pytest.approx(expected.native_return, abs=1e-5)
+    assert actual.inventory_extremes == expected.inventory_extremes
     actual_leaves = jax.tree_util.tree_leaves(actual.state)
     expected_leaves = jax.tree_util.tree_leaves(expected.state)
     assert len(actual_leaves) == len(expected_leaves)
@@ -771,3 +793,112 @@ def test_serialized_result_keeps_every_decision_through_json() -> None:
             # The oracle only ever requests a skill the objective accepts from
             # the state it decided in, so the set is the pre-decision one.
             assert step["requested_skill"] in step["accepted_skills"]
+
+
+def _extremes(result: SkillExecutionResult) -> dict[str, tuple[int, int]]:
+    assert result.inventory_extremes is not None
+    return {field: (low, high) for field, low, high in result.inventory_extremes}
+
+
+def _inventory_reading(state: Any) -> dict[str, int]:
+    return {
+        f"inventory.{item.name}": int(getattr(state.inventory, item.name))
+        for item in dataclasses.fields(state.inventory)
+    }
+
+
+def _assert_extremes_bracket(result: SkillExecutionResult, start: Any) -> None:
+    extremes = _extremes(result)
+    before, after = _inventory_reading(start), _inventory_reading(result.state)
+    assert set(extremes) == set(before)
+    for field, (low, high) in extremes.items():
+        assert low <= min(before[field], after[field]), field
+        assert high >= max(before[field], after[field]), field
+
+
+def test_scripted_executor_reports_inventory_extremes() -> None:
+    environment = make_skill_chain_environment()
+    executor = ScriptedSkillExecutor()
+    fresh = environment.reset(jax.random.PRNGKey(3)).state
+    collected = executor.execute(
+        environment, fresh, SkillId.COLLECT_WOOD, jax.random.PRNGKey(0), horizon=64
+    )
+    assert collected.outcome is SkillOutcome.SUCCESS
+    _assert_extremes_bracket(collected, fresh)
+    assert _extremes(collected)["inventory.wood"] == (0, 1)
+    assert _extremes(collected)["inventory.stone"] == (0, 0)
+
+    table = _beside_a_table(environment, seed=1)
+    crafted = executor.execute(
+        environment,
+        table,
+        SkillId.CRAFT_WOOD_PICKAXE,
+        jax.random.PRNGKey(0),
+        horizon=16,
+    )
+    assert crafted.outcome is SkillOutcome.SUCCESS
+    _assert_extremes_bracket(crafted, table)
+    # The wood was held at the start and spent by the end.
+    assert _extremes(crafted)["inventory.wood"] == (0, 1)
+    assert _extremes(crafted)["inventory.wood_pickaxe"] == (0, 1)
+
+    # An attempt that never starts visits only its start state.
+    infeasible = executor.execute(
+        environment, fresh, SkillId.COLLECT_STONE, jax.random.PRNGKey(0), horizon=8
+    )
+    assert infeasible.outcome is SkillOutcome.INFEASIBLE
+    assert _extremes(infeasible) == {
+        field: (value, value) for field, value in _inventory_reading(fresh).items()
+    }
+
+
+class _ContextRecorder:
+    """Pass selections through, keeping every context the planner saw."""
+
+    def __init__(self, planner: SayCanPlanner) -> None:
+        self.planner = planner
+        self.contexts: list[PlannerContext] = []
+
+    def select_many(self, states, contexts):
+        self.contexts.extend(contexts)
+        return self.planner.select_many(states, contexts)
+
+
+def test_traces_and_memory_carry_the_inventory_extremes() -> None:
+    chain = WOOD_TO_STONE_CHAIN
+    planner = _ContextRecorder(
+        SayCanPlanner(
+            utility_scorer=SequentialUtilityScorer(chain.reference_skills),
+            candidate_skills=chain.skills,
+        )
+    )
+    result = evaluate_skill_chain(
+        ScriptedSkillExecutor(),
+        planner=planner,
+        chain=chain,
+        num_episodes=1,
+        seed=3,
+        skill_horizon=32,
+        memory_factory=EpisodeMemory,
+    )
+
+    (episode,) = result["episodes"]
+    assert len(episode.trace) > 1
+    for trace in episode.trace:
+        assert trace.inventory_extremes is not None
+        assert trace.to_dict()["inventory_extremes"] == {
+            field: [low, high] for field, low, high in trace.inventory_extremes
+        }
+    (serialized,) = json_ready_chain_result(result)["episodes"]
+    restored = json.loads(json.dumps(serialized))
+    assert [step["inventory_extremes"] for step in restored["trace"]] == [
+        trace.to_dict()["inventory_extremes"] for trace in episode.trace
+    ]
+    # The memory the last decision was planned with holds every earlier one.
+    memory = planner.contexts[-1].memory
+    assert isinstance(memory, EpisodeMemory)
+    assert len(memory.transitions) == len(episode.trace) - 1
+    for transition, trace in zip(memory.transitions, episode.trace, strict=False):
+        assert transition.inventory_extremes == tuple(
+            sorted(trace.inventory_extremes or ())
+        )

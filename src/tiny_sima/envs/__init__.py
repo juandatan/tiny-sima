@@ -17,6 +17,11 @@ from tiny_sima.envs.craftax import (
     make_vectorized_environment,
     render_state,
 )
+from tiny_sima.envs.open_ended import (
+    DEFAULT_OPEN_ENDED_MAX_STEPS,
+    OpenEndedEnvironment,
+    make_open_ended_environment,
+)
 from tiny_sima.envs.skills import (
     LOCAL_NAVIGATION_SKILLS,
     GoalConditionedSkillReset,
@@ -40,11 +45,13 @@ from tiny_sima.envs.skills import (
 
 __all__ = [
     "CraftaxBundle",
+    "DEFAULT_OPEN_ENDED_MAX_STEPS",
     "EnvironmentReset",
     "EnvironmentSpec",
     "EnvironmentStep",
     "GoalConditionedSkillReset",
     "GoalConditionedSkillStep",
+    "OpenEndedEnvironment",
     "LOCAL_NAVIGATION_SKILLS",
     "SkillEnvironment",
     "SkillEpisodeState",
@@ -61,6 +68,7 @@ __all__ = [
     "make_environment",
     "make_skill_environment",
     "make_skill_chain_environment",
+    "make_open_ended_environment",
     "make_vectorized_skill_environment",
     "make_vectorized_environment",
     "prepare_skill_scenario",

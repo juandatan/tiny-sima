@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
@@ -47,12 +47,44 @@ class SkillAttempt:
         return self.outcome is SkillOutcome.SUCCESS
 
 
+class PlannerMemory(Protocol):
+    """Episode memory the closed loop updates at every option boundary.
+
+    Both methods return the updated memory rather than mutating it, so a
+    context keeps the memory it was planned with.
+    """
+
+    def observe(self, state: Any) -> PlannerMemory:
+        """Return the memory after seeing ``state``, the episode's reset."""
+
+        ...
+
+    def record(
+        self,
+        pre_state: Any,
+        skill_id: SkillId,
+        outcome: SkillOutcome,
+        steps: int,
+        post_state: Any,
+    ) -> PlannerMemory:
+        """Return the memory after one executed skill request."""
+
+        ...
+
+
 @dataclass(frozen=True)
 class PlannerContext:
-    """Objective state supplied to a planner at an option boundary."""
+    """Objective state supplied to a planner at an option boundary.
+
+    ``plan_state`` is opaque per-episode planner state, such as a sub-goal
+    plan: the closed loop hands each selection's ``plan_state`` to the next
+    context. Neither it nor ``memory`` takes part in equality.
+    """
 
     objective: str
     history: tuple[SkillAttempt, ...] = ()
+    memory: PlannerMemory | None = field(default=None, compare=False)
+    plan_state: Any = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -92,6 +124,9 @@ class PlannerSelection:
     utility_ranking: tuple[SkillId, ...] = ()
     utility_raw_response: str | None = None
     utility_repaired: bool = False
+    # The planner's per-episode state after this selection, which the closed
+    # loop passes on as the next context's plan_state.
+    plan_state: Any = None
 
 
 @dataclass(frozen=True)
@@ -433,6 +468,19 @@ def _planner_selection(
         utility_raw_response=utility_batch.raw_response,
         utility_repaired=utility_batch.repaired,
     )
+
+
+class SkillPlanner(Protocol):
+    """A planner the closed loop can drive, SayCan or otherwise."""
+
+    def select_many(
+        self,
+        states: Sequence[Any],
+        contexts: Sequence[PlannerContext],
+    ) -> list[PlannerSelection]:
+        """Return one selection per boundary, in order."""
+
+        ...
 
 
 @dataclass(frozen=True)

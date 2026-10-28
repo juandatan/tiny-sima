@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import time
 from collections import Counter, deque
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -20,9 +21,11 @@ import numpy as np
 from craftax.craftax_classic.constants import (
     DIRECTIONS,
     SOLID_BLOCKS,
+    Achievement,
     Action,
     BlockType,
 )
+from craftax.craftax_classic.envs.craftax_state import Inventory
 
 from tiny_sima.config import SkillPPOConfig
 from tiny_sima.envs.chains import (
@@ -58,22 +61,27 @@ from tiny_sima.goals import (
     skill_metric,
     skill_precondition,
 )
+from tiny_sima.memory import EpisodeMemory
 from tiny_sima.planner.saycan import (
     PlannerContext,
     PlannerDecision,
+    PlannerMemory,
     PlannerSelection,
     PlannerSelectionStatus,
     SayCanPlanner,
     SequentialUtilityScorer,
     SkillAttempt,
     SkillOutcome,
+    SkillPlanner,
     SkillScore,
 )
-from tiny_sima.planner.symbolic import GoalCondition
+from tiny_sima.planner.symbolic import GoalCondition, plan_next_skills
 
 ObjectivePredicate = Callable[[Any], bool]
 JaxObjectivePredicate = Callable[[Any], jax.Array]
 ValidNextSkills = Callable[[Any], tuple[SkillId, ...]]
+# ``(field, min, max)`` per ``inventory.*`` field, in inventory order.
+InventoryExtremes = tuple[tuple[str, int, int], ...]
 
 
 class SkillChainSpec(NamedTuple):
@@ -249,8 +257,77 @@ WOOD_TO_STONE_PICKAXE_CHAIN = SkillChainSpec(
     goal=(StateRequirement("inventory.stone_pickaxe", "at_least", 1),),
 )
 
+# The same chain under a terse objective that leaves the recipe out, so the
+# planner has to supply the intermediate steps itself.
+TERSE_STONE_PICKAXE_CHAIN = WOOD_TO_STONE_PICKAXE_CHAIN._replace(
+    name="stone_pickaxe_terse",
+    objective="Get a stone pickaxe.",
+)
+
+
+def _planned_next_skills(
+    goal: GoalCondition, skills: tuple[SkillId, ...]
+) -> Callable[[Any], tuple[SkillId, ...]]:
+    """Return the first steps of every shortest plan, in catalog order."""
+
+    def valid_next_skills(state: Any) -> tuple[SkillId, ...]:
+        plan = plan_next_skills(state, goal, skills)
+        if plan is None:
+            return ()
+        return tuple(skill_id for skill_id in skills if skill_id in plan)
+
+    return valid_next_skills
+
+
+def _stone_pickaxe_and_sword_complete_jax(state: Any) -> jax.Array:
+    return (jnp.asarray(state.inventory.stone_pickaxe) > 0) & (
+        jnp.asarray(state.inventory.wood_sword) > 0
+    )
+
+
+def _stone_pickaxe_and_sword_complete(state: Any) -> bool:
+    return bool(np.asarray(_stone_pickaxe_and_sword_complete_jax(state)))
+
+
+_STONE_PICKAXE_AND_SWORD_GOAL: GoalCondition = (
+    StateRequirement("inventory.stone_pickaxe", "at_least", 1),
+    StateRequirement("inventory.wood_sword", "at_least", 1),
+)
+
+# Two goals at once: the sword costs a fifth wood at the same table.
+STONE_PICKAXE_AND_SWORD_CHAIN = SkillChainSpec(
+    name="stone_pickaxe_and_sword",
+    objective="Get a stone pickaxe and a wooden sword.",
+    reference_skills=(
+        SkillId.COLLECT_WOOD,
+        SkillId.COLLECT_WOOD,
+        SkillId.PLACE_TABLE,
+        SkillId.COLLECT_WOOD,
+        SkillId.CRAFT_WOOD_PICKAXE,
+        SkillId.COLLECT_WOOD,
+        SkillId.CRAFT_WOOD_SWORD,
+        SkillId.COLLECT_WOOD,
+        SkillId.COLLECT_STONE,
+        SkillId.CRAFT_STONE_PICKAXE,
+    ),
+    is_complete=_stone_pickaxe_and_sword_complete,
+    is_complete_jax=_stone_pickaxe_and_sword_complete_jax,
+    valid_next_skills=_planned_next_skills(
+        _STONE_PICKAXE_AND_SWORD_GOAL, ALL_SKILL_IDS
+    ),
+    skills=ALL_SKILL_IDS,
+    tree_count=5,
+    goal=_STONE_PICKAXE_AND_SWORD_GOAL,
+)
+
 SKILL_CHAINS: dict[str, SkillChainSpec] = {
-    chain.name: chain for chain in (WOOD_TO_STONE_CHAIN, WOOD_TO_STONE_PICKAXE_CHAIN)
+    chain.name: chain
+    for chain in (
+        WOOD_TO_STONE_CHAIN,
+        WOOD_TO_STONE_PICKAXE_CHAIN,
+        TERSE_STONE_PICKAXE_CHAIN,
+        STONE_PICKAXE_AND_SWORD_CHAIN,
+    )
 }
 
 
@@ -262,17 +339,34 @@ class ChainTermination(str, Enum):
     FAILURE_LIMIT = "failure_limit"
     DECISION_LIMIT = "decision_limit"
     INVALID_PLANNER_OUTPUT = "invalid_planner_output"
+    # Only the open-ended task's budgets produce these two.
+    STEP_LIMIT = "step_limit"
+    DIED = "died"
+
+
+# Counted in the chain summaries only when they occur, so the summaries keep
+# the keys they always had.
+_OPEN_ENDED_TERMINATIONS = frozenset(
+    {ChainTermination.STEP_LIMIT, ChainTermination.DIED}
+)
 
 
 @dataclass(frozen=True)
 class SkillExecutionResult:
-    """State and terminal diagnostics returned by one executor call."""
+    """State and terminal diagnostics returned by one executor call.
+
+    ``inventory_extremes`` is each inventory count's lowest and highest value
+    over every state the skill visited, its start and end included. The end
+    state alone hides a skill that gathered something on the way and spent it
+    again; ``None`` means the executor does not report it.
+    """
 
     state: Any
     outcome: SkillOutcome
     steps: int
     skill_return: float
     native_return: float
+    inventory_extremes: InventoryExtremes | None = None
 
 
 @dataclass(frozen=True)
@@ -294,6 +388,76 @@ class ChainStepTrace:
     # made in, read from the chain's valid_next_skills -- the set the prefix
     # ladder calls accepted. Empty when the chain does not define one.
     accepted_skills: tuple[SkillId, ...] = ()
+    # The planner's per-episode state after this decision, such as its
+    # sub-goal plan. None for planners that keep none.
+    plan_state: Any = None
+    # The executor's inventory extremes over this attempt, when it reports
+    # them.
+    inventory_extremes: InventoryExtremes | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return this decision as plain Python values, for JSON."""
+
+        return {
+            "decision_index": int(self.decision_index),
+            "requested_skill": self.requested_skill.value,
+            "outcome": self.outcome.value,
+            "steps": int(self.steps),
+            "native_return": float(self.native_return),
+            "utility": float(self.utility),
+            "feasibility": float(self.feasibility),
+            "combined_score": float(self.combined_score),
+            "accepted_skills": [
+                skill_id.value for skill_id in self.accepted_skills
+            ],
+            "planner_ranking": [
+                skill_id.value for skill_id in self.planner_ranking
+            ],
+            "planner_raw_response": self.planner_raw_response,
+            "candidate_scores": [
+                {
+                    "skill_id": score.skill_id.value,
+                    "utility": float(score.utility),
+                    "feasibility": float(score.feasibility),
+                    "failure_penalty": float(score.failure_penalty),
+                    "combined": float(score.combined),
+                }
+                for score in self.candidate_scores
+            ],
+            **_plan_state_record(self.plan_state),
+            **_inventory_extremes_record(self.inventory_extremes),
+        }
+
+
+@dataclass(frozen=True)
+class AchievementUnlock:
+    """One achievement first unlocked during a chain episode.
+
+    ``environment_step`` is the episode's step count once the skill that
+    unlocked it ended, so it can be late by up to that skill's length.
+    """
+
+    achievement: str
+    decision_index: int
+    environment_step: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "achievement": self.achievement,
+            "decision_index": self.decision_index,
+            "environment_step": self.environment_step,
+        }
+
+
+def _unlocked(state: Any) -> np.ndarray:
+    return np.asarray(state.achievements, dtype=bool)
+
+
+def _died(state: Any) -> bool:
+    # Craftax ends an episode at zero health or on lava; either is a death.
+    position = np.asarray(state.player_position)
+    block = int(np.asarray(state.map)[position[0], position[1]])
+    return int(np.asarray(state.player_health)) <= 0 or block == BlockType.LAVA.value
 
 
 @dataclass(frozen=True)
@@ -309,6 +473,12 @@ class ChainEpisodeResult:
     planner_error: str | None
     planner_raw_response: str | None
     trace: tuple[ChainStepTrace, ...]
+    # The plan_state of the last selection, which may have ended the episode
+    # without a decision.
+    final_plan_state: Any = None
+    # Achievements unlocked during the episode, in unlock order. Not part of
+    # chain_episode_record, so the chain traces are unchanged.
+    achievement_unlocks: tuple[AchievementUnlock, ...] = ()
 
 
 class BatchedChainCarry(NamedTuple):
@@ -522,6 +692,26 @@ def _outcome_from_step(result: Any) -> SkillOutcome | None:
     return SkillOutcome.ENVIRONMENT_TERMINATED
 
 
+_INVENTORY_FIELDS = tuple(item.name for item in dataclasses.fields(Inventory))
+
+
+def _inventory_counts(state: Any) -> tuple[int, ...]:
+    inventory = jax.device_get(state.inventory)
+    return tuple(
+        int(np.asarray(getattr(inventory, name))) for name in _INVENTORY_FIELDS
+    )
+
+
+def _inventory_extremes(
+    minimum: Sequence[int],
+    maximum: Sequence[int],
+) -> InventoryExtremes:
+    return tuple(
+        (f"inventory.{name}", int(low), int(high))
+        for name, low, high in zip(_INVENTORY_FIELDS, minimum, maximum, strict=True)
+    )
+
+
 @dataclass(frozen=True)
 class ScriptedSkillExecutor:
     """Shortest-path oracle used to validate chain construction."""
@@ -541,6 +731,7 @@ class ScriptedSkillExecutor:
             skill_id,
             horizon,
         )
+        start = _inventory_counts(state)
         if not bool(np.asarray(skill_precondition(skill_environment.goal, state))):
             return SkillExecutionResult(
                 state=state,
@@ -548,10 +739,12 @@ class ScriptedSkillExecutor:
                 steps=0,
                 skill_return=0.0,
                 native_return=0.0,
+                inventory_extremes=_inventory_extremes(start, start),
             )
 
         skill_return = 0.0
         native_return = 0.0
+        minimum, maximum = start, start
         current = episode_state
         step_keys = jax.random.split(rng, horizon)
         for step_index in range(horizon):
@@ -564,6 +757,9 @@ class ScriptedSkillExecutor:
             current = result.state
             skill_return += float(np.asarray(result.reward))
             native_return += float(np.asarray(result.info["native_reward"]))
+            counts = _inventory_counts(current.env_state)
+            minimum = tuple(map(min, minimum, counts))
+            maximum = tuple(map(max, maximum, counts))
             outcome = _outcome_from_step(result)
             if outcome is not None:
                 return SkillExecutionResult(
@@ -572,6 +768,7 @@ class ScriptedSkillExecutor:
                     steps=step_index + 1,
                     skill_return=skill_return,
                     native_return=native_return,
+                    inventory_extremes=_inventory_extremes(minimum, maximum),
                 )
         return SkillExecutionResult(
             state=current.env_state,
@@ -579,6 +776,7 @@ class ScriptedSkillExecutor:
             steps=horizon,
             skill_return=skill_return,
             native_return=native_return,
+            inventory_extremes=_inventory_extremes(minimum, maximum),
         )
 
 
@@ -752,9 +950,17 @@ class LearnedSkillExecutor:
                     is SkillOutcome.SUCCESS
                 ),
                 native_return=float(output.native_return[index]),
+                inventory_extremes=_inventory_extremes(
+                    _inventory_counts_at(output.inventory_min, index),
+                    _inventory_counts_at(output.inventory_max, index),
+                ),
             )
             for index in range(count)
         ]
+
+
+def _inventory_counts_at(inventory: Any, index: int) -> tuple[int, ...]:
+    return tuple(int(getattr(inventory, name)[index]) for name in _INVENTORY_FIELDS)
 
 
 def make_learned_skill_executor(
@@ -1344,6 +1550,7 @@ def evaluate_learned_skill_chain_batched(
             )
         )
         for termination in ChainTermination
+        if termination not in _OPEN_ENDED_TERMINATIONS
     }
     final_failed_skill_counts = {
         skill_id.value: int(
@@ -1739,15 +1946,24 @@ class BatchedExecutionCarry(NamedTuple):
     finished: jax.Array
     outcome: jax.Array
     native_return: jax.Array
+    # Running elementwise extremes of the batch's inventories.
+    inventory_min: Any
+    inventory_max: Any
 
 
 class BatchedExecutionOutput(NamedTuple):
-    """Per-entry world state and diagnostics after one option."""
+    """Per-entry world state and diagnostics after one option.
+
+    ``inventory_min`` and ``inventory_max`` are batched inventories holding
+    each count's extremes over the option, its start and end included.
+    """
 
     state: Any
     outcome: jax.Array
     steps: jax.Array
     native_return: jax.Array
+    inventory_min: Any
+    inventory_max: Any
 
 
 BatchedExecution = Callable[
@@ -1846,6 +2062,8 @@ def _batched_skill_execution(
             finished=~runnable,
             outcome=jnp.where(runnable, timeout_code, infeasible_code),
             native_return=jnp.zeros((batch_size,), dtype=jnp.float32),
+            inventory_min=states.inventory,
+            inventory_max=states.inventory,
         )
 
         def continue_executing(
@@ -1910,6 +2128,13 @@ def _batched_skill_execution(
                 outcome=jnp.where(ended, outcome, carry.outcome),
                 native_return=carry.native_return
                 + jnp.where(running, native_reward, 0.0),
+                # A finished entry keeps its state, so its extremes stay put.
+                inventory_min=jax.tree_util.tree_map(
+                    jnp.minimum, carry.inventory_min, state.inventory
+                ),
+                inventory_max=jax.tree_util.tree_map(
+                    jnp.maximum, carry.inventory_max, state.inventory
+                ),
             )
             return iteration + 1, next_carry
 
@@ -1923,6 +2148,8 @@ def _batched_skill_execution(
             outcome=final_carry.outcome,
             steps=final_carry.steps,
             native_return=final_carry.native_return,
+            inventory_min=final_carry.inventory_min,
+            inventory_max=final_carry.inventory_max,
         )
 
     compiled = jax.jit(execute)
@@ -1943,11 +2170,14 @@ class _ChainCursor:
     termination: ChainTermination = ChainTermination.DECISION_LIMIT
     planner_error: str | None = None
     planner_raw_response: str | None = None
+    plan_state: Any = None
     finished: bool = False
+    unlocked: np.ndarray | None = None
+    unlocks: list[AchievementUnlock] = field(default_factory=list)
 
 
 def evaluate_chain_episodes(
-    planner: SayCanPlanner,
+    planner: SkillPlanner,
     executor: SkillExecutor,
     environment: SkillChainEnvironment,
     rngs: Sequence[jax.Array],
@@ -1956,6 +2186,9 @@ def evaluate_chain_episodes(
     skill_horizon: int = 64,
     max_decisions: int | None = None,
     max_failures_per_skill: int = 2,
+    memory_factory: Callable[[], PlannerMemory] | None = None,
+    max_environment_steps: int | None = None,
+    stop_on_death: bool = False,
 ) -> list[ChainEpisodeResult]:
     """Run independent planner/executor episodes in lockstep by decision.
 
@@ -1966,10 +2199,23 @@ def evaluate_chain_episodes(
     :meth:`LearnedSkillExecutor.execute_many` call. Each episode keeps its
     own key, so the results are those of running the episodes one by one.
     ``max_decisions`` defaults to :func:`chain_decision_limit`.
+
+    With ``memory_factory``, each episode gets its own memory, which observes
+    the reset state and records every executed skill; the planner reads it
+    from the context. Each selection's ``plan_state`` becomes the next
+    context's.
+
+    ``max_environment_steps`` ends an episode with ``STEP_LIMIT`` once its
+    skills have taken that many steps. It is checked after each skill, so an
+    episode can overrun it by less than one skill horizon. ``stop_on_death``
+    ends one with ``DIED`` when a skill leaves the player dead. Every episode
+    records the achievements it unlocks and when.
     """
 
     if max_decisions is None:
         max_decisions = chain_decision_limit(chain)
+    if max_environment_steps is not None and max_environment_steps < 1:
+        raise ValueError("max_environment_steps must be positive.")
     if environment.tree_count != chain.tree_count:
         raise ValueError(
             f"Chain {chain.name} needs {chain.tree_count} trees; the "
@@ -1978,12 +2224,21 @@ def evaluate_chain_episodes(
     cursors: list[_ChainCursor] = []
     for rng in rngs:
         reset_rng, episode_rng = jax.random.split(rng)
+        state = environment.reset(reset_rng).state
         cursors.append(
             _ChainCursor(
-                state=environment.reset(reset_rng).state,
-                context=PlannerContext(objective=chain.objective),
+                state=state,
+                context=PlannerContext(
+                    objective=chain.objective,
+                    memory=(
+                        memory_factory().observe(state)
+                        if memory_factory is not None
+                        else None
+                    ),
+                ),
                 rng=episode_rng,
                 trace=[],
+                unlocked=_unlocked(state),
             )
         )
 
@@ -2004,6 +2259,7 @@ def evaluate_chain_episodes(
             tuple[_ChainCursor, PlannerSelection, PlannerDecision, jax.Array]
         ] = []
         for cursor, selection in zip(deciding, selections, strict=True):
+            cursor.plan_state = selection.plan_state
             decision = selection.decision
             if decision is None:
                 cursor.planner_error = selection.utility_error
@@ -2060,8 +2316,30 @@ def evaluate_chain_episodes(
                         if chain.valid_next_skills is not None
                         else ()
                     ),
+                    plan_state=selection.plan_state,
+                    inventory_extremes=result.inventory_extremes,
                 )
             )
+            memory = cursor.context.memory
+            if isinstance(memory, EpisodeMemory):
+                # The PlannerMemory protocol does not take extremes; the
+                # episode memory stores them per transition.
+                memory = memory.record(
+                    cursor.state,
+                    decision.skill_id,
+                    result.outcome,
+                    result.steps,
+                    result.state,
+                    inventory_extremes=result.inventory_extremes,
+                )
+            elif memory is not None:
+                memory = memory.record(
+                    cursor.state,
+                    decision.skill_id,
+                    result.outcome,
+                    result.steps,
+                    result.state,
+                )
             cursor.state = result.state
             cursor.environment_steps += result.steps
             cursor.native_return += result.native_return
@@ -2076,12 +2354,34 @@ def evaluate_chain_episodes(
                         native_return=result.native_return,
                     ),
                 ),
+                memory=memory,
+                plan_state=selection.plan_state,
             )
+            unlocked = _unlocked(cursor.state)
+            if cursor.unlocked is not None:
+                cursor.unlocks.extend(
+                    AchievementUnlock(
+                        achievement=Achievement(int(index)).name.lower(),
+                        decision_index=decision_index,
+                        environment_step=cursor.environment_steps,
+                    )
+                    for index in np.flatnonzero(unlocked & ~cursor.unlocked)
+                )
+            cursor.unlocked = unlocked
             failures = sum(
                 item.skill_id is decision.skill_id and not item.succeeded
                 for item in cursor.context.history
             )
-            if failures >= max_failures_per_skill:
+            if stop_on_death and _died(cursor.state):
+                cursor.termination = ChainTermination.DIED
+                cursor.finished = True
+            elif (
+                max_environment_steps is not None
+                and cursor.environment_steps >= max_environment_steps
+            ):
+                cursor.termination = ChainTermination.STEP_LIMIT
+                cursor.finished = True
+            elif failures >= max_failures_per_skill:
                 cursor.termination = ChainTermination.FAILURE_LIMIT
                 cursor.finished = True
 
@@ -2103,13 +2403,15 @@ def evaluate_chain_episodes(
                 planner_error=cursor.planner_error,
                 planner_raw_response=cursor.planner_raw_response,
                 trace=tuple(cursor.trace),
+                final_plan_state=cursor.plan_state,
+                achievement_unlocks=tuple(cursor.unlocks),
             )
         )
     return episodes
 
 
 def evaluate_chain_episode(
-    planner: SayCanPlanner,
+    planner: SkillPlanner,
     executor: SkillExecutor,
     environment: SkillChainEnvironment,
     rng: jax.Array,
@@ -2118,6 +2420,7 @@ def evaluate_chain_episode(
     skill_horizon: int = 64,
     max_decisions: int | None = None,
     max_failures_per_skill: int = 2,
+    memory_factory: Callable[[], PlannerMemory] | None = None,
 ) -> ChainEpisodeResult:
     """Run one event-driven planner/executor episode without state resets."""
 
@@ -2130,13 +2433,14 @@ def evaluate_chain_episode(
         skill_horizon=skill_horizon,
         max_decisions=max_decisions,
         max_failures_per_skill=max_failures_per_skill,
+        memory_factory=memory_factory,
     )[0]
 
 
 def evaluate_skill_chain(
     executor: SkillExecutor,
     *,
-    planner: SayCanPlanner | None = None,
+    planner: SkillPlanner | None = None,
     chain: SkillChainSpec = WOOD_TO_STONE_CHAIN,
     num_episodes: int = 16,
     seed: int = 0,
@@ -2144,6 +2448,7 @@ def evaluate_skill_chain(
     max_decisions: int | None = None,
     max_failures_per_skill: int = 2,
     distractor_count: int = 3,
+    memory_factory: Callable[[], PlannerMemory] | None = None,
 ) -> dict[str, Any]:
     """Evaluate a planner/executor pair over randomized persistent worlds.
 
@@ -2158,7 +2463,9 @@ def evaluate_skill_chain(
         candidate_skills=chain.skills,
     )
     if isinstance(executor, LearnedSkillExecutor):
-        executor.require_skills(active_planner.candidate_skills)
+        executor.require_skills(
+            getattr(active_planner, "candidate_skills", chain.skills)
+        )
     environment = chain_environment(chain, distractor_count=distractor_count)
     episode_keys = jax.random.split(jax.random.PRNGKey(seed), num_episodes)
     episodes = evaluate_chain_episodes(
@@ -2170,6 +2477,7 @@ def evaluate_skill_chain(
         skill_horizon=skill_horizon,
         max_decisions=max_decisions,
         max_failures_per_skill=max_failures_per_skill,
+        memory_factory=memory_factory,
     )
     successes = np.asarray([episode.succeeded for episode in episodes])
     termination_counts = {
@@ -2177,6 +2485,7 @@ def evaluate_skill_chain(
             episode.termination is termination for episode in episodes
         )
         for termination in ChainTermination
+        if termination not in _OPEN_ENDED_TERMINATIONS
     }
     planner_error_counts = dict(
         Counter(
@@ -2309,10 +2618,11 @@ def chain_episode_record(episode: ChainEpisodeResult) -> dict[str, Any]:
     Every field is a plain Python value, so the record survives
     ``json.dumps`` without a ``default`` hook and reads back unchanged. The
     planner's raw response is kept per decision because it is the only
-    record of what the utility model saw as progress.
+    record of what the utility model saw as progress. A ``plan_state`` with
+    a ``to_dict`` method is kept as well; any other is left out.
     """
 
-    return {
+    record: dict[str, Any] = {
         "succeeded": bool(episode.succeeded),
         "completed_skills": int(episode.completed_skills),
         "decisions": int(episode.decisions),
@@ -2321,37 +2631,27 @@ def chain_episode_record(episode: ChainEpisodeResult) -> dict[str, Any]:
         "termination": episode.termination.value,
         "planner_error": episode.planner_error,
         "planner_raw_response": episode.planner_raw_response,
-        "trace": [
-            {
-                "decision_index": int(trace.decision_index),
-                "requested_skill": trace.requested_skill.value,
-                "outcome": trace.outcome.value,
-                "steps": int(trace.steps),
-                "native_return": float(trace.native_return),
-                "utility": float(trace.utility),
-                "feasibility": float(trace.feasibility),
-                "combined_score": float(trace.combined_score),
-                "accepted_skills": [
-                    skill_id.value for skill_id in trace.accepted_skills
-                ],
-                "planner_ranking": [
-                    skill_id.value for skill_id in trace.planner_ranking
-                ],
-                "planner_raw_response": trace.planner_raw_response,
-                "candidate_scores": [
-                    {
-                        "skill_id": score.skill_id.value,
-                        "utility": float(score.utility),
-                        "feasibility": float(score.feasibility),
-                        "failure_penalty": float(score.failure_penalty),
-                        "combined": float(score.combined),
-                    }
-                    for score in trace.candidate_scores
-                ],
-            }
-            for trace in episode.trace
-        ],
+        "trace": [trace.to_dict() for trace in episode.trace],
     }
+    record.update(_plan_state_record(episode.final_plan_state, "final_plan_state"))
+    return record
+
+
+def _inventory_extremes_record(
+    extremes: InventoryExtremes | None,
+) -> dict[str, Any]:
+    if extremes is None:
+        return {}
+    return {
+        "inventory_extremes": {
+            field: [int(low), int(high)] for field, low, high in extremes
+        }
+    }
+
+
+def _plan_state_record(plan_state: Any, key: str = "plan_state") -> dict[str, Any]:
+    to_dict = getattr(plan_state, "to_dict", None)
+    return {key: to_dict()} if callable(to_dict) else {}
 
 
 def json_ready_chain_result(result: dict[str, Any]) -> dict[str, Any]:

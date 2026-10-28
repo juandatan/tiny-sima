@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
-from craftax.craftax_classic.constants import Action, BlockType
+from craftax.craftax_classic.constants import Achievement, Action, BlockType
 
 
 class SkillId(str, Enum):
@@ -287,6 +287,32 @@ SKILL_IDS: tuple[SkillId, ...] = ALL_SKILL_IDS[:6]
 SKILL_TO_INDEX: dict[SkillId, int] = {
     skill_id: index for index, skill_id in enumerate(ALL_SKILL_IDS)
 }
+
+# The achievement each skill's success unlocks, read off Craftax-Classic's
+# game logic: the action that changes the skill's metric is the one that sets
+# the achievement. It is kept apart from the mechanics, which are rendered
+# verbatim into the planner prompts; a new skill adds its entry here.
+SKILL_ACHIEVEMENTS: dict[SkillId, Achievement] = {
+    SkillId.COLLECT_WOOD: Achievement.COLLECT_WOOD,
+    SkillId.COLLECT_STONE: Achievement.COLLECT_STONE,
+    SkillId.DRINK_WATER: Achievement.COLLECT_DRINK,
+    SkillId.PLACE_TABLE: Achievement.PLACE_TABLE,
+    SkillId.CRAFT_WOOD_PICKAXE: Achievement.MAKE_WOOD_PICKAXE,
+    SkillId.CRAFT_WOOD_SWORD: Achievement.MAKE_WOOD_SWORD,
+    SkillId.CRAFT_STONE_PICKAXE: Achievement.MAKE_STONE_PICKAXE,
+}
+
+
+def achievement_field(achievement: Achievement) -> str:
+    """Return the planner field that reads whether ``achievement`` is unlocked."""
+
+    return f"achievement.{achievement.name.lower()}"
+
+
+# One planner field per Craftax-Classic achievement, in achievement order.
+ACHIEVEMENT_FIELDS: tuple[str, ...] = tuple(
+    achievement_field(achievement) for achievement in Achievement
+)
 
 
 def executor_skill_ids(num_skills: int) -> tuple[SkillId, ...]:

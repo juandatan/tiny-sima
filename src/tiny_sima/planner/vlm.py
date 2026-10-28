@@ -33,6 +33,11 @@ from tiny_sima.goals import (
     travel_distance_map,
     walkable_mask,
 )
+from tiny_sima.planner.observation import (
+    ObservationConfig,
+    observation_block,
+    observation_system_text,
+)
 from tiny_sima.planner.saycan import (
     PlannerContext,
     UtilityScoreBatch,
@@ -109,14 +114,22 @@ def progress_assessment_limit(
 
 
 class VLMRequest(NamedTuple):
-    """One image-text generation request at an option boundary."""
+    """One image-text generation request at an option boundary.
 
-    image: np.ndarray
+    ``image`` is ``None`` for a text-only request, which the backend sends as
+    a chat without an image.
+    """
+
+    image: np.ndarray | None
     system_prompt: str
     user_prompt: str
     candidate_skills: tuple[SkillId, ...]
     require_available: bool = False
     assessment_max_length: int = 96
+    # A Pydantic model that replaces the ranking schema, for requests that ask
+    # for something other than a skill ranking, such as sub-goals. The
+    # catalog and ranking options above are then ignored by the backend.
+    output_type: Any = None
 
     @property
     def prompt(self) -> str:
@@ -774,6 +787,7 @@ def build_planner_prompt(
     style: PlannerPromptStyle = DEFAULT_PROMPT_STYLE,
     *,
     available_shuffle_seed: int | None = None,
+    observation: ObservationConfig | None = None,
 ) -> str:
     """Build a reference-plan-free prompt for one skill boundary.
 
@@ -783,6 +797,10 @@ def build_planner_prompt(
     over an available, claimed collect_stone at six of eight final boundaries.
     The order is a pure function of the seed and the boundary, so the response
     cache still hits on a repeated boundary.
+
+    ``observation`` adds the enabled text fields of :func:`observation_block`
+    as one JSON line after the structured state. ``None``, or a configuration
+    with no text field, leaves the prompt unchanged byte for byte.
     """
 
     if (
@@ -812,10 +830,19 @@ def build_planner_prompt(
         "Current structured state: " + summarize_state(state, reachability),
         f"Recent skill outcomes: {json.dumps(history)}",
     )
+    # The shuffle key stays the header alone, so turning the text observation
+    # on does not also reorder the available list.
+    context_lines = header
+    if observation is not None and observation.has_text:
+        context_lines = (
+            *header,
+            "Text observation: "
+            + json.dumps(observation_block(state, observation)),
+        )
     if style is PlannerPromptStyle.BASELINE:
         return "\n".join(
             (
-                *header,
+                *context_lines,
                 f"Candidate skills: {json.dumps(catalog)}",
                 "Inspect the screenshot and structured state. Rank every "
                 "candidate exactly once from most useful to least useful as "
@@ -838,7 +865,7 @@ def build_planner_prompt(
     if style is PlannerPromptStyle.OBJECTIVE_FIRST:
         return "\n".join(
             (
-                *header,
+                *context_lines,
                 f"Candidate skills: {json.dumps(catalog)}",
                 "Inspect the screenshot and structured state. Rank every "
                 "candidate exactly once from most to least useful for the "
@@ -861,7 +888,7 @@ def build_planner_prompt(
     if style is PlannerPromptStyle.RECIPE_AWARE:
         return "\n".join(
             (
-                *header,
+                *context_lines,
                 f"Candidate skills: {json.dumps(catalog)}",
                 "Inspect the screenshot and structured state. Rank every "
                 "candidate exactly once from most to least useful for the "
@@ -903,7 +930,7 @@ def build_planner_prompt(
     assessment_limit = progress_assessment_limit(style)
     return "\n".join(
         (
-            *header,
+            *context_lines,
             f"Candidate skills: {json.dumps(ordered)}",
             "A candidate is available_now only when its requirements are met "
             "and its target is close enough to reach and use from where the "
@@ -925,6 +952,16 @@ def build_planner_prompt(
             "with the overall goal if it is not available now.",
         )
     )
+
+
+def _without_screenshot(prompt: str) -> str:
+    """Point a prompt written for the screenshot at the text map instead.
+
+    The planner prompts were written with an image in view; a text-only
+    request must not tell the model to inspect a screenshot it never receives.
+    """
+
+    return prompt.replace("the screenshot", "the local map")
 
 
 class _PreparedRequest(NamedTuple):
@@ -958,6 +995,10 @@ class VLMUtilityScorer:
     # Seeded order for the available-skill list, the position-bias control;
     # see :func:`build_planner_prompt`.
     available_shuffle_seed: int | None = None
+    # Which observation parts the prompt carries; see
+    # :mod:`tiny_sima.planner.observation`. None sends the screenshot and the
+    # prompts exactly as before the option existed.
+    observation: ObservationConfig | None = None
     last_response: ParsedVLMResponse | None = None
     # Every response from the most recent call, in request order, so a batched
     # evaluation can still attribute a parse failure to its own boundary.
@@ -978,10 +1019,16 @@ class VLMUtilityScorer:
     ) -> _PreparedRequest:
         """Render one boundary into a request and its response cache key."""
 
-        image = render_state(
-            state,
-            self.config.environment_name,
-            block_pixel_size=self.config.block_pixel_size,
+        observation = self.observation
+        send_image = observation is None or observation.image
+        image = (
+            render_state(
+                state,
+                self.config.environment_name,
+                block_pixel_size=self.config.block_pixel_size,
+            )
+            if send_image
+            else None
         )
         system_prompt = build_planner_system_prompt(
             self.prompt_style,
@@ -994,11 +1041,19 @@ class VLMUtilityScorer:
             self.reachability,
             self.prompt_style,
             available_shuffle_seed=self.available_shuffle_seed,
+            observation=observation,
         )
+        if observation is not None:
+            observation_text = observation_system_text(observation)
+            if observation_text:
+                system_prompt = f"{system_prompt}\n{observation_text}"
+            if not send_image:
+                system_prompt = _without_screenshot(system_prompt)
+                user_prompt = _without_screenshot(user_prompt)
         cache_key = sha256(
             system_prompt.encode("utf-8")
             + user_prompt.encode("utf-8")
-            + image.tobytes()
+            + (image.tobytes() if image is not None else b"")
         ).hexdigest()
         return _PreparedRequest(
             cache_key=cache_key,
@@ -1157,7 +1212,13 @@ def _ranking_output_type(
 
 
 def _planner_chat(request: VLMRequest) -> Any:
-    """Build the one-turn multimodal chat for a planner request."""
+    """Build the one-turn multimodal chat for a planner request.
+
+    A request without an image keeps the user content as a list, holding the
+    prompt alone. Outlines then renders it through the same text entry of the
+    chat template as an image request, minus the vision tokens, and passes
+    the processor text only.
+    """
 
     try:
         from outlines.inputs import (  # pyright: ignore[reportMissingImports]
@@ -1172,8 +1233,11 @@ def _planner_chat(request: VLMRequest) -> Any:
             'Install the VLM dependencies with pip install -e ".[vlm]".'
         ) from error
 
-    image = Image.fromarray(request.image)
-    image.format = "PNG"
+    user_content: list[Any] = [request.user_prompt]
+    if request.image is not None:
+        image = Image.fromarray(request.image)
+        image.format = "PNG"
+        user_content.append(OutlinesImage(image))
     return Chat(
         [
             {
@@ -1182,10 +1246,7 @@ def _planner_chat(request: VLMRequest) -> Any:
             },
             {
                 "role": "user",
-                "content": [
-                    request.user_prompt,
-                    OutlinesImage(image),
-                ],
+                "content": user_content,
             },
         ]
     )
@@ -1208,7 +1269,9 @@ class TransformersVLMBackend:
         self._processor: Any | None = None
         self._outlines_model: Any | None = None
         self._generator_factory: Any | None = None
-        self._generators: dict[tuple[tuple[SkillId, ...], bool, int], Any] = {}
+        self._generators: dict[
+            tuple[tuple[SkillId, ...], bool, int, Any], Any
+        ] = {}
 
     def _load(self) -> tuple[Any, Any, Any]:
         if (
@@ -1281,15 +1344,27 @@ class TransformersVLMBackend:
         *,
         require_available: bool = False,
         assessment_max_length: int = 96,
+        output_type: Any = None,
     ) -> Any:
         """Return one cached constrained generator per catalog and schema."""
 
-        key = (candidate_skills, require_available, assessment_max_length)
+        key = (
+            candidate_skills,
+            require_available,
+            assessment_max_length,
+            output_type,
+        )
         generator = self._generators.get(key)
         if generator is None:
             generator = generator_factory(
                 outlines_model,
-                _ranking_output_type(*key),
+                output_type
+                if output_type is not None
+                else _ranking_output_type(
+                    candidate_skills,
+                    require_available,
+                    assessment_max_length,
+                ),
             )
             self._generators[key] = generator
         return generator
@@ -1304,6 +1379,7 @@ class TransformersVLMBackend:
             generator_factory,
             require_available=request.require_available,
             assessment_max_length=request.assessment_max_length,
+            output_type=request.output_type,
         )
         output = generator(
             _planner_chat(request),
@@ -1318,31 +1394,44 @@ class TransformersVLMBackend:
         A constrained generator owns one logits processor, which allocates a
         guide per sequence once the batch arrives, so requests are grouped by
         catalog and schema and each group decodes in chunks of
-        ``config.max_batch_size``. Responses keep the request order.
+        ``config.max_batch_size``. Text-only requests form groups of their
+        own, so the processor never receives a batch that mixes prompts with
+        and without images. Responses keep the request order.
         """
 
         if not requests:
             return []
         _, outlines_model, generator_factory = self._load()
-        groups: dict[tuple[tuple[SkillId, ...], bool, int], list[int]] = {}
+        groups: dict[
+            tuple[tuple[SkillId, ...], bool, int, Any, bool], list[int]
+        ] = {}
         for index, request in enumerate(requests):
             key = (
                 request.candidate_skills,
                 request.require_available,
                 request.assessment_max_length,
+                request.output_type,
+                request.image is None,
             )
             groups.setdefault(key, []).append(index)
 
         # The groups partition the request indices, so every slot is written.
         responses = [""] * len(requests)
         for key, indices in groups.items():
-            candidate_skills, require_available, assessment_max_length = key
+            (
+                candidate_skills,
+                require_available,
+                assessment_max_length,
+                output_type,
+                _text_only,
+            ) = key
             generator = self._generator_for(
                 candidate_skills,
                 outlines_model,
                 generator_factory,
                 require_available=require_available,
                 assessment_max_length=assessment_max_length,
+                output_type=output_type,
             )
             for start in range(0, len(indices), self.config.max_batch_size):
                 chunk = indices[start : start + self.config.max_batch_size]

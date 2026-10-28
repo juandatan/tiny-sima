@@ -31,6 +31,8 @@ from craftax.craftax_classic.constants import DIRECTIONS, Action, BlockType
 
 from tiny_sima.envs.skills import _scenario_inventory
 from tiny_sima.evaluation.chains import (
+    STONE_PICKAXE_AND_SWORD_CHAIN,
+    TERSE_STONE_PICKAXE_CHAIN,
     WOOD_TO_STONE_CHAIN,
     WOOD_TO_STONE_PICKAXE_CHAIN,
     LearnedSkillExecutor,
@@ -77,9 +79,26 @@ STONE_PICKAXE_COLLECT_FIRST_PLAN: tuple[SkillId, ...] = (
     SkillId.CRAFT_STONE_PICKAXE,
 )
 
+# And for the pickaxe-and-sword chain: all five wood, then both crafts at the
+# one table.
+STONE_PICKAXE_AND_SWORD_COLLECT_FIRST_PLAN: tuple[SkillId, ...] = (
+    SkillId.COLLECT_WOOD,
+    SkillId.COLLECT_WOOD,
+    SkillId.COLLECT_WOOD,
+    SkillId.COLLECT_WOOD,
+    SkillId.COLLECT_WOOD,
+    SkillId.PLACE_TABLE,
+    SkillId.CRAFT_WOOD_PICKAXE,
+    SkillId.CRAFT_WOOD_SWORD,
+    SkillId.COLLECT_STONE,
+    SkillId.CRAFT_STONE_PICKAXE,
+)
+
 COLLECT_FIRST_PLANS: dict[str, tuple[SkillId, ...]] = {
     WOOD_TO_STONE_CHAIN.name: COLLECT_FIRST_PLAN,
     WOOD_TO_STONE_PICKAXE_CHAIN.name: STONE_PICKAXE_COLLECT_FIRST_PLAN,
+    TERSE_STONE_PICKAXE_CHAIN.name: STONE_PICKAXE_COLLECT_FIRST_PLAN,
+    STONE_PICKAXE_AND_SWORD_CHAIN.name: STONE_PICKAXE_AND_SWORD_COLLECT_FIRST_PLAN,
 }
 
 # Held out from the planner calibration seeds (7, 23, 51), so that executor

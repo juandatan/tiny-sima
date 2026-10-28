@@ -67,13 +67,14 @@ def prepare_chain_scenario(
 
     Mining a tree turns it to grass, so ``tree_count`` bounds the wood the
     world holds: three pay for the table and a wood pickaxe, a fourth for a
-    stone pickaxe as well. The default keeps the original worlds unchanged.
+    stone pickaxe as well, and a fifth for a wood sword. The default keeps the
+    original worlds unchanged.
     """
 
     if not 0 <= distractor_count <= 4:
         raise ValueError("distractor_count must be between zero and four.")
-    if not 1 <= tree_count <= 4:
-        raise ValueError("tree_count must be between one and four.")
+    if not 1 <= tree_count <= 5:
+        raise ValueError("tree_count must be between one and five.")
 
     position_rng, direction_rng = jax.random.split(rng)
     center_row = state.map.shape[0] // 2

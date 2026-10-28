@@ -1,11 +1,13 @@
 import jax
 import numpy as np
 import pytest
-from craftax.craftax_classic.constants import BlockType
+from craftax.craftax_classic.constants import Achievement, BlockType
 
 from tiny_sima.evaluation.chains import (
+    STONE_PICKAXE_AND_SWORD_CHAIN,
     WOOD_TO_STONE_CHAIN,
     WOOD_TO_STONE_PICKAXE_CHAIN,
+    ScriptedSkillExecutor,
     SkillChainSpec,
     chain_environment,
 )
@@ -17,18 +19,34 @@ from tiny_sima.evaluation.planner import (
     collect_surplus_trajectory,
     evaluate_planner_prefixes,
 )
-from tiny_sima.goals import ALL_SKILL_IDS, SkillId, StateRequirement
+from tiny_sima.goals import (
+    ACHIEVEMENT_FIELDS,
+    ALL_SKILL_IDS,
+    SKILL_ACHIEVEMENTS,
+    SkillId,
+    SkillMechanics,
+    StateEffect,
+    StateRequirement,
+    achievement_field,
+    get_skill_spec,
+)
 from tiny_sima.planner.saycan import (
     PlannerContext,
     SayCanPlanner,
+    SkillOutcome,
     constant_feasibility,
     constant_utility,
     reachability_feasibility,
 )
 from tiny_sima.planner.symbolic import (
+    PLANNER_FIELDS,
+    REGISTRY_MODEL,
     PlanProgressFeasibility,
+    SkillModel,
+    check_subgoal,
     plan_next_skills,
     read_field,
+    registry_model,
     shortest_plan,
 )
 
@@ -47,6 +65,14 @@ def _without_trees(state):
     world_map = np.asarray(state.map)
     cleared = np.where(
         world_map == BlockType.TREE.value, BlockType.GRASS.value, world_map
+    )
+    return state.replace(map=state.map.at[:].set(cleared))
+
+
+def _without_tables(state):
+    world_map = np.asarray(state.map)
+    cleared = np.where(
+        world_map == BlockType.CRAFTING_TABLE.value, BlockType.GRASS.value, world_map
     )
     return state.replace(map=state.map.at[:].set(cleared))
 
@@ -234,3 +260,309 @@ def test_detour_states_follow_an_off_objective_request() -> None:
     assert {point.label for point in _points(restricted)} == {"drink_waterx1"}
     with pytest.raises(ValueError, match="wood_to_stone"):
         collect_detour_trajectory(trajectory, chain=WOOD_TO_STONE_CHAIN)
+
+
+class _Belief:
+    def __init__(self, **facts: int) -> None:
+        self.facts = {f"world.{name}": value for name, value in facts.items()}
+
+    def world_fact(self, field: str) -> int | None:
+        return self.facts.get(field)
+
+
+def _cheap_table_model(model: SkillModel) -> SkillModel:
+    cheap = SkillMechanics(
+        requires=(
+            StateRequirement("inventory.wood", "at_least", 1),
+            StateRequirement("world.placement_space_reachable", "equals", True),
+        ),
+        effects=(
+            StateEffect("inventory.wood", "decrease", 1),
+            StateEffect("world.crafting_table_reachable", "set", True),
+        ),
+    )
+    return tuple(
+        (skill_id, cheap if skill_id is SkillId.PLACE_TABLE else mechanics)
+        for skill_id, mechanics in model
+    )
+
+
+def test_registry_model_is_the_default() -> None:
+    chain = WOOD_TO_STONE_PICKAXE_CHAIN
+    assert registry_model() == REGISTRY_MODEL
+    assert [skill_id for skill_id, _ in REGISTRY_MODEL] == list(ALL_SKILL_IDS)
+    for point in _points(collect_prefix_trajectory(chain=chain, num_episodes=2)):
+        assert shortest_plan(
+            point.state, _goal(chain), chain.skills, model=REGISTRY_MODEL
+        ) == shortest_plan(point.state, _goal(chain), chain.skills)
+
+
+def test_a_different_model_changes_the_plan() -> None:
+    chain = WOOD_TO_STONE_PICKAXE_CHAIN
+    state = _with_inventory(_state(chain), wood=1)
+    goal = (StateRequirement("world.crafting_table_reachable", "equals", True),)
+    state = _without_tables(state)
+
+    assert plan_next_skills(state, goal, chain.skills) == frozenset(
+        (SkillId.COLLECT_WOOD,)
+    )
+    cheap = _cheap_table_model(REGISTRY_MODEL)
+    assert shortest_plan(state, goal, chain.skills, model=cheap) == (
+        frozenset((SkillId.PLACE_TABLE,)),
+        1,
+    )
+    # The full chain is one wood shorter when the table costs one.
+    start = _state(chain)
+    full = shortest_plan(start, _goal(chain), chain.skills)
+    shorter = shortest_plan(start, _goal(chain), chain.skills, model=cheap)
+    assert full is not None and shorter is not None
+    assert shorter[1] == full[1] - 1
+
+
+def test_candidate_skills_restrict_a_model() -> None:
+    goal = _goal(WOOD_TO_STONE_PICKAXE_CHAIN)
+    state = _state()
+    without_wood = tuple(
+        skill_id for skill_id in ALL_SKILL_IDS if skill_id is not SkillId.COLLECT_WOOD
+    )
+    assert plan_next_skills(state, goal, without_wood, model=REGISTRY_MODEL) is None
+    assert plan_next_skills(state, goal, model=REGISTRY_MODEL) == frozenset(
+        (SkillId.COLLECT_WOOD,)
+    )
+
+
+def test_belief_overrides_world_facts_and_falls_back_to_the_map() -> None:
+    chain = WOOD_TO_STONE_PICKAXE_CHAIN
+    goal = _goal(chain)
+    state = _state(chain)
+
+    no_trees = _Belief(tree_reachable=0)
+    assert read_field(state, "world.tree_reachable") == 1
+    assert read_field(state, "world.tree_reachable", no_trees) == 0
+    assert plan_next_skills(state, goal, chain.skills, belief=no_trees) is None
+    stocked = _with_inventory(state, wood=4)
+    plan = plan_next_skills(stocked, goal, chain.skills, belief=no_trees)
+    assert plan is not None and SkillId.COLLECT_WOOD not in plan
+
+    # A belief without an opinion reads the map, and never touches inventory.
+    silent = _Belief()
+    assert plan_next_skills(state, goal, chain.skills, belief=silent) == (
+        plan_next_skills(state, goal, chain.skills)
+    )
+    assert read_field(stocked, "inventory.wood", _Belief(wood=0)) == 4
+    # A tree the map has lost can still be believed in.
+    cleared = _without_trees(state)
+    assert read_field(cleared, "world.tree_reachable", _Belief(tree_reachable=1)) == 1
+
+
+def test_planner_fields_are_all_readable() -> None:
+    state = _state()
+    assert "inventory.stone_pickaxe" in PLANNER_FIELDS
+    assert "inventory.iron" in PLANNER_FIELDS
+    assert "survival.drink" in PLANNER_FIELDS
+    for _, mechanics in REGISTRY_MODEL:
+        for item in (*mechanics.requires, *mechanics.effects):
+            assert item.field in PLANNER_FIELDS
+    for field in PLANNER_FIELDS:
+        assert isinstance(read_field(state, field), int), field
+
+
+def test_check_subgoal_accepts_reachable_and_held_subgoals() -> None:
+    chain = WOOD_TO_STONE_PICKAXE_CHAIN
+    state = _state(chain)
+
+    pickaxe = (StateRequirement("inventory.wood_pickaxe", "at_least", 1),)
+    check = check_subgoal(state, pickaxe, chain.skills)
+    assert check.reachable and not check.already_holds
+    assert check.first_steps == frozenset((SkillId.COLLECT_WOOD,))
+    assert check.plan_length == 5
+    assert check.reason == ""
+
+    held = check_subgoal(_with_inventory(state, wood_pickaxe=1), pickaxe)
+    assert held.reachable and held.already_holds
+    assert held.plan_length == 0 and held.first_steps == frozenset()
+    # The registry's own ``True`` values and integral floats both parse.
+    table = (
+        StateRequirement("world.crafting_table_reachable", "equals", 1.0),  # pyright: ignore[reportArgumentType]
+    )
+    assert check_subgoal(state, table, chain.skills).reachable
+
+
+def test_check_subgoal_rejects_malformed_subgoals_without_raising() -> None:
+    state = _state()
+    cases = {
+        (): "empty sub-goal",
+        (StateRequirement("inventory.gold", "at_least", 1),): "unknown field",
+        (StateRequirement("world.lava_reachable", "equals", 1),): "unknown field",
+        (StateRequirement("inventory.wood", "most", 1),): "unknown comparison",  # pyright: ignore[reportArgumentType]
+        (StateRequirement("inventory.wood", "at_least", 1.5),): "not an integer",  # pyright: ignore[reportArgumentType]
+        (StateRequirement("inventory.wood", "at_least", "two"),): "not an integer",  # pyright: ignore[reportArgumentType]
+    }
+    for subgoal, reason in cases.items():
+        check = check_subgoal(state, subgoal)
+        assert not check.reachable, subgoal
+        assert check.plan_length is None and check.first_steps == frozenset()
+        assert reason in check.reason, check.reason
+
+
+def test_check_subgoal_explains_an_unreachable_subgoal() -> None:
+    chain = WOOD_TO_STONE_PICKAXE_CHAIN
+    state = _state(chain)
+
+    iron = check_subgoal(
+        state,
+        (StateRequirement("inventory.iron_pickaxe", "at_least", 1),),
+        chain.skills,
+    )
+    assert not iron.reachable
+    assert iron.reason == (
+        "inventory.iron_pickaxe needs 1 more: no available skill produces it"
+    )
+
+    wood = (StateRequirement("inventory.wood", "at_least", 2),)
+    blocked = check_subgoal(state, wood, chain.skills, belief=_Belief(tree_reachable=0))
+    assert not blocked.reachable
+    assert blocked.reason == (
+        "inventory.wood needs 2 more but world.tree_reachable is false for collect_wood"
+    )
+
+    # A producer blocked further down: stone needs the pickaxe the trees make.
+    stone = (StateRequirement("inventory.stone", "at_least", 1),)
+    deep = check_subgoal(state, stone, chain.skills, belief=_Belief(tree_reachable=0))
+    assert not deep.reachable
+    assert deep.reason == (
+        "inventory.stone needs 1 more; collect_stone needs inventory.wood_pickaxe >= 1"
+    )
+
+
+def _with_achievements(state, *achievements: Achievement):
+    unlocked = np.asarray(state.achievements).copy()
+    for achievement in achievements:
+        unlocked[achievement.value] = True
+    return state.replace(achievements=state.achievements.at[:].set(unlocked))
+
+
+def _unlocked(state) -> set[str]:
+    return {field for field in ACHIEVEMENT_FIELDS if read_field(state, field)}
+
+
+def test_achievements_are_planner_fields() -> None:
+    assert len(ACHIEVEMENT_FIELDS) == len(Achievement) == 22
+    assert set(ACHIEVEMENT_FIELDS) <= set(PLANNER_FIELDS)
+    assert "achievement.make_wood_pickaxe" in PLANNER_FIELDS
+    assert "achievement.collect_diamond" in PLANNER_FIELDS
+    state = _state()
+    assert _unlocked(state) == set()
+    unlocked = _with_achievements(state, Achievement.MAKE_WOOD_PICKAXE)
+    assert _unlocked(unlocked) == {"achievement.make_wood_pickaxe"}
+    assert read_field(unlocked, "achievement.make_wood_pickaxe") == 1
+
+
+def test_every_skill_unlocks_one_achievement_in_the_model_only() -> None:
+    assert set(SKILL_ACHIEVEMENTS) == set(ALL_SKILL_IDS)
+    for skill_id, mechanics in REGISTRY_MODEL:
+        unlock = StateEffect(achievement_field(SKILL_ACHIEVEMENTS[skill_id]), "set", 1)
+        registry = get_skill_spec(skill_id).mechanics
+        # The prompts render the registry's mechanics, which stay as written.
+        assert mechanics == SkillMechanics(
+            requires=registry.requires,
+            effects=(*registry.effects, unlock),
+            repeatable=registry.repeatable,
+        )
+        assert not any(
+            effect.field.startswith("achievement.") for effect in registry.effects
+        )
+
+
+def _run_reference(chain: SkillChainSpec, seed: int = 0):
+    environment = chain_environment(chain)
+    state = environment.reset(jax.random.PRNGKey(seed)).state
+    executor = ScriptedSkillExecutor()
+    for index, skill_id in enumerate(chain.reference_skills):
+        result = executor.execute(
+            environment, state, skill_id, jax.random.PRNGKey(index), horizon=96
+        )
+        assert result.outcome is SkillOutcome.SUCCESS, skill_id
+        yield skill_id, state, result.state
+        state = result.state
+
+
+def test_skill_achievements_match_the_game() -> None:
+    # Each scripted success unlocks the achievement the table names for it,
+    # and nothing else.
+    executed = set()
+    for chain in (WOOD_TO_STONE_PICKAXE_CHAIN, STONE_PICKAXE_AND_SWORD_CHAIN):
+        for skill_id, before, after in _run_reference(chain):
+            field = achievement_field(SKILL_ACHIEVEMENTS[skill_id])
+            assert read_field(after, field) == 1, skill_id
+            assert _unlocked(after) - _unlocked(before) <= {field}, skill_id
+            executed.add(skill_id)
+    environment = chain_environment(WOOD_TO_STONE_CHAIN)
+    thirsty = environment.reset(jax.random.PRNGKey(0)).state.replace(player_drink=5)
+    drank = ScriptedSkillExecutor().execute(
+        environment, thirsty, SkillId.DRINK_WATER, jax.random.PRNGKey(0), horizon=96
+    )
+    assert drank.outcome is SkillOutcome.SUCCESS
+    assert _unlocked(drank.state) - _unlocked(thirsty) == {"achievement.collect_drink"}
+    executed.add(SkillId.DRINK_WATER)
+    assert executed == set(ALL_SKILL_IDS)
+
+
+def test_achievement_subgoals_plan_end_to_end() -> None:
+    chain = WOOD_TO_STONE_PICKAXE_CHAIN
+    state = _state(chain)
+    unlock = (StateRequirement("achievement.make_wood_pickaxe", "at_least", 1),)
+
+    check = check_subgoal(state, unlock, chain.skills)
+    assert check.reachable and not check.already_holds
+    assert check.first_steps == frozenset((SkillId.COLLECT_WOOD,))
+    # The same plan as holding the pickaxe: three wood, a table, the craft.
+    assert check.plan_length == 5
+    stone = (StateRequirement("achievement.make_stone_pickaxe", "at_least", 1),)
+    assert shortest_plan(state, stone, chain.skills) == shortest_plan(
+        state, _goal(chain), chain.skills
+    )
+
+    # An achievement stays unlocked once the tool it took is gone.
+    unlocked = _with_achievements(state, Achievement.MAKE_WOOD_PICKAXE)
+    held = check_subgoal(unlocked, unlock, chain.skills)
+    assert held.reachable and held.already_holds
+    assert held.plan_length == 0 and held.first_steps == frozenset()
+
+    table = (StateRequirement("achievement.place_table", "at_least", 1),)
+    assert plan_next_skills(_with_inventory(state, wood=2), table) == frozenset(
+        (SkillId.PLACE_TABLE,)
+    )
+
+    diamond = check_subgoal(
+        state,
+        (StateRequirement("achievement.collect_diamond", "at_least", 1),),
+        chain.skills,
+    )
+    assert not diamond.reachable
+    assert diamond.reason == (
+        "achievement.collect_diamond needs 1 more: no available skill produces it"
+    )
+
+
+def _without_achievements(model: SkillModel) -> SkillModel:
+    return tuple(
+        (skill_id, get_skill_spec(skill_id).mechanics) for skill_id, _ in model
+    )
+
+
+@pytest.mark.parametrize("chain", CHAINS, ids=lambda chain: chain.name)
+def test_achievement_effects_leave_other_plans_unchanged(chain) -> None:
+    # A goal that reads no achievement is planned exactly as over the
+    # registry's own mechanics.
+    bare = _without_achievements(REGISTRY_MODEL)
+    goals = (
+        _goal(chain),
+        (StateRequirement("inventory.wood", "at_least", 3),),
+        (StateRequirement("world.crafting_table_reachable", "equals", True),),
+    )
+    for point in _points(collect_prefix_trajectory(chain=chain, num_episodes=2)):
+        for goal in goals:
+            assert shortest_plan(point.state, goal, chain.skills) == shortest_plan(
+                point.state, goal, chain.skills, model=bare
+            ), point.label
