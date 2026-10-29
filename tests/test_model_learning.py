@@ -312,6 +312,29 @@ def test_failure_analysis_adds_the_missing_requirement():
     )
 
 
+def test_failure_analysis_replaces_a_requirement_it_contradicts():
+    # Induction inverted the pickaxe requirement; runs show stone needs one.
+    payload = model_to_dict(REGISTRY_MODEL)
+    payload["collect_stone"]["requires"][0]["comparison"] = "equals"
+    payload["collect_stone"]["requires"][0]["value"] = 0
+    model = model_from_dict(payload)
+    pickaxe = ("inventory.wood_pickaxe", 1)
+    records = [
+        _record(SkillId.COLLECT_STONE, "infeasible", cause="infeasible"),
+        _record(
+            SkillId.COLLECT_STONE,
+            before=(pickaxe,),
+            after=(pickaxe, ("inventory.stone", 1)),
+        ),
+    ]
+    backend = FakeBackend(_failure_answer("inventory.wood_pickaxe"))
+    learned, (analysis,) = analyse_failures(backend, model, records)
+    assert analysis.applied
+    assert set(_mechanics(learned, SkillId.COLLECT_STONE).requires) == set(
+        _mechanics(REGISTRY_MODEL, SkillId.COLLECT_STONE).requires
+    )
+
+
 def test_rounds_correct_a_cheap_table_back_to_the_registry():
     planners = subgoal_planner_factory(FormalGoalBackend(GOAL), CHAIN)
     result = run_model_learning_rounds(
@@ -380,3 +403,50 @@ def test_focused_questions_repair_what_a_whole_repair_repeats():
     assert induced.report.valid and induced.dropped == ()
     assert induced.model == REGISTRY_MODEL
     json.dumps(induced.to_dict())
+
+
+def test_absence_question_finds_the_deadlock_an_inverted_requirement_hides():
+    # The GPU run's model: stone needs no pickaxe, the pickaxe needs stone.
+    # It validates, so only the absence question exposes the deadlock.
+    payload = model_to_dict(REGISTRY_MODEL)
+    payload["collect_stone"]["requires"][0] = {
+        "field": "inventory.wood_pickaxe",
+        "comparison": "equals",
+        "value": 0,
+    }
+    payload["craft_wood_pickaxe"]["requires"].append(
+        {"field": "inventory.stone", "comparison": "at_least", "value": 1}
+    )
+    backend = FakeBackend(
+        json.dumps(payload),
+        json.dumps({"answer": "yes"}),
+        json.dumps({"answer": "no"}),
+    )
+    induced = induce_model(backend, manual="A manual.", repair=True, drop_invalid=True)
+
+    # The needless question about the pickaxe repeats the absence question,
+    # so it is not asked again.
+    assert [request.user_prompt for request in backend.requests[1:]] == [
+        "Collect stone with a wood pickaxe: must the player hold a wood "
+        "pickaxe first?",
+        "Craft a wood pickaxe at a crafting table: must the player hold "
+        "stone first?",
+    ]
+    assert [(question.kind, question.change) for question in induced.questions] == [
+        (
+            "absence",
+            "collect_stone now needs inventory.wood_pickaxe >= 1, "
+            "not inventory.wood_pickaxe == 0",
+        ),
+        ("needless", "dropped: craft_wood_pickaxe needs inventory.stone >= 1"),
+    ]
+    assert induced.report.valid and induced.dropped == ()
+    assert induced.model == REGISTRY_MODEL
+
+    # Answered no, the absence requirement is dropped instead.
+    backend = FakeBackend(json.dumps(payload), json.dumps({"answer": "no"}))
+    dropped = induce_model(backend, manual="A manual.", repair=True)
+    assert _mechanics(dropped.model, SkillId.COLLECT_STONE).requires == (
+        StateRequirement("world.stone_reachable", "equals", True),
+    )
+    assert dropped.report.valid

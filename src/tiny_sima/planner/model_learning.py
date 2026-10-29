@@ -15,7 +15,9 @@ registry:
    every skill must change something, and no two skills may change the same
    things. A violating model goes back to the VLM once whole, then as
    narrow questions with fixed answers, and skills still violating are
-   dropped.
+   dropped. Any model is asked whether a requirement that an item be
+   absent should be that it is held, since an inversion can hide a
+   deadlock.
 3. **Correction.** SCALAR's pivotal trajectory analysis, made deterministic:
    successful transitions fix each skill's inventory effects and
    requirements. The VLM's amounts are the part SCALAR found most wrong.
@@ -873,7 +875,8 @@ _TOOLS = ("pickaxe", "sword")
 class RepairQuestion:
     """One focused repair: the question, the VLM's answer and the change made.
 
-    ``kind`` is ``producer`` (which skill brings about a requirement no skill
+    ``kind`` is ``absence`` (whether a skill needing an item absent needs it
+    held), ``producer`` (which skill brings about a requirement no skill
     produces) or ``needless`` (whether a skill needs a requirement that keeps
     others blocked). ``change`` is empty when nothing was applied.
     """
@@ -961,6 +964,17 @@ def _with_producer(
     )
 
 
+def _behaviour(skill_id: SkillId, descriptions: Mapping[SkillId, str] | None) -> str:
+    return (
+        (descriptions or {}).get(skill_id) or get_skill_spec(skill_id).instruction
+    ).rstrip(".")
+
+
+def _absent(requirement: StateRequirement) -> bool:
+    value = int(requirement.value)
+    return (requirement.comparison, value) in {("equals", 0), ("less_than", 1)}
+
+
 def _without_requirement(
     mechanics: SkillMechanics,
     requirement: StateRequirement,
@@ -982,6 +996,63 @@ def _replaced(
 
 # kind, question, options, and the model and change each applying answer gives.
 _Question = tuple[str, str, tuple[str, ...], dict[str, tuple[SkillModel, str]]]
+
+
+def _absence_questions(
+    model: SkillModel,
+    values: Mapping[str, int],
+    descriptions: Mapping[SkillId, str] | None,
+) -> Iterable[_Question]:
+    """Yield a question per requirement that an item be absent at the start.
+
+    Such a requirement holds at the start, so validation passes it, yet an
+    inverted one hides a deadlock: on seed 202 the GPU 2B model had stone
+    need no wood pickaxe while that pickaxe needed stone, and every stone
+    request failed in the game. Asked whether a skill needs no item held, the
+    2B model answered no for every skill, so this asks whether it needs one:
+    yes requires one held, no drops the requirement.
+    """
+
+    for skill_id, mechanics in model:
+        for requirement in mechanics.requires:
+            field = requirement.field
+            if (
+                field not in INVENTORY_FIELDS
+                or not _absent(requirement)
+                or not _holds(requirement, {field: values.get(field, 0)})
+            ):
+                continue
+            held = StateRequirement(field, "at_least", 1)
+            needs_held = dataclasses.replace(
+                mechanics,
+                requires=tuple(
+                    held if item == requirement else item
+                    for item in mechanics.requires
+                    if item != held
+                ),
+            )
+            yield (
+                "absence",
+                f"{_behaviour(skill_id, descriptions)}: must the player "
+                f"{_requirement_phrase(held)} first?",
+                ("yes", "no"),
+                {
+                    "yes": (
+                        _replaced(model, skill_id, needs_held),
+                        f"{skill_id.value} now needs {_requirement_text(held)}, "
+                        f"not {_requirement_text(requirement)}",
+                    ),
+                    "no": (
+                        _replaced(
+                            model,
+                            skill_id,
+                            _without_requirement(mechanics, requirement),
+                        ),
+                        f"dropped: {skill_id.value} needs "
+                        f"{_requirement_text(requirement)}",
+                    ),
+                },
+            )
 
 
 def _producer_questions(
@@ -1074,17 +1145,13 @@ def _needless_questions(
             )
             if cleared <= 0:
                 continue
-            behaviour = (
-                (descriptions or {}).get(skill_id)
-                or get_skill_spec(skill_id).instruction
-            ).rstrip(".")
             change = f"dropped: {skill_id.value} needs {_requirement_text(requirement)}"
             found.append(
                 (
                     cleared,
                     (
                         "needless",
-                        f"{behaviour}: must the player "
+                        f"{_behaviour(skill_id, descriptions)}: must the player "
                         f"{_requirement_phrase(requirement)} first?",
                         ("yes", "no"),
                         {"no": (relaxed, change)},
@@ -1105,11 +1172,15 @@ def repair_model(
     max_questions: int = DEFAULT_REPAIR_QUESTIONS,
     exempt_prefixes: tuple[str, ...] = ("survival.",),
 ) -> tuple[SkillModel, tuple[RepairQuestion, ...]]:
-    """Repair unreachable requirements with narrow, fixed-answer questions.
+    """Repair a model with narrow, fixed-answer questions.
 
     The 2B model asked for the whole model again repeats it. Each question
     here names one problem, and its answer is applied directly:
 
+    - **Absence:** first, valid or not, whether a skill that needs an item
+      absent at the start needs it held instead. Yes replaces the
+      requirement with holding one, no drops it. An inverted requirement
+      holds at the start, so only this question finds the deadlock it hides.
     - **Producer:** a requirement unmet at the start that no skill moves
       toward, such as a crafting table every craft needs and none places.
       The chosen skill gains the effect and loses its own requirement on
@@ -1119,33 +1190,34 @@ def repair_model(
       needs that pickaxe. One answered no is dropped; correction can add an
       inventory requirement back from runs.
 
-    A question answered none or yes is not asked again. At most
-    ``max_questions`` go out, one at a time, each against the model the
-    last one left.
+    No question is asked twice. Absence questions are at most one per
+    requirement; at most ``max_questions`` others go out. They go one at a
+    time, each against the model the last one left.
     """
 
     values = dict(EPISODE_START)
     values.update(start or {})
     manual_text = manual if manual is not None else load_manual()
     system_prompt = f"{_QUESTION_INSTRUCTIONS}\n\nGame manual:\n{manual_text.strip()}"
-    declined: set[str] = set()
     asked: list[RepairQuestion] = []
-    while len(asked) < max_questions:
+    texts: set[str] = set()
+    while True:
+        candidates = list(_absence_questions(model, values, descriptions))
         report = validate_model(model, start=start, exempt_prefixes=exempt_prefixes)
-        if report.valid:
-            break
-        candidates = [
-            *_producer_questions(model, values, exempt_prefixes),
-            *_needless_questions(
-                model,
-                report,
-                start=start,
-                exempt_prefixes=exempt_prefixes,
-                descriptions=descriptions,
-            ),
-        ]
+        others = sum(question.kind != "absence" for question in asked)
+        if not report.valid and others < max_questions:
+            candidates += [
+                *_producer_questions(model, values, exempt_prefixes),
+                *_needless_questions(
+                    model,
+                    report,
+                    start=start,
+                    exempt_prefixes=exempt_prefixes,
+                    descriptions=descriptions,
+                ),
+            ]
         question = next(
-            (candidate for candidate in candidates if candidate[1] not in declined),
+            (candidate for candidate in candidates if candidate[1] not in texts),
             None,
         )
         if question is None:
@@ -1169,8 +1241,7 @@ def repair_model(
         change = ""
         if answer in outcomes:
             model, change = outcomes[answer]
-        else:
-            declined.add(text)
+        texts.add(text)
         asked.append(RepairQuestion(kind, text, options, answer, change, raw))
     return model, tuple(asked)
 
@@ -1192,8 +1263,9 @@ def induce_model(
     Of ``repeats`` answers, the valid one with the fewest violations and then
     the fewest parse problems is kept, the earliest on a tie. With ``repair``,
     a model that fails validation goes back to the VLM once with its
-    violations, and the answer replaces it if it ranks no worse; whatever
-    still fails then goes through :func:`repair_model`'s questions. With
+    violations, and the answer replaces it if it ranks no worse; then the
+    model goes through :func:`repair_model`'s questions, which also catch
+    requirements that hold at the start but are inverted. With
     ``drop_invalid``, skills still failing are removed, see
     :func:`drop_invalid_skills`.
     """
@@ -1233,14 +1305,15 @@ def induce_model(
         )
         if _rank(repaired) <= _rank(best):
             best = repaired
-        if not best.report.valid:
-            model, questions = repair_model(
-                backend,
-                best.model,
-                manual=manual_text,
-                descriptions=descriptions,
-                start=start,
-            )
+    if repair and best.valid:
+        model, questions = repair_model(
+            backend,
+            best.model,
+            manual=manual_text,
+            descriptions=descriptions,
+            start=start,
+        )
+        if questions:
             best = dataclasses.replace(
                 best,
                 model=model,
@@ -1695,15 +1768,31 @@ class FailureAnalysis:
         }
 
 
+def _compatible(first: StateRequirement, second: StateRequirement) -> bool:
+    """Whether some count meets both requirements on one field."""
+
+    top = max(int(first.value), int(second.value)) + 1
+    return any(
+        _holds(first, {first.field: value}) and _holds(second, {first.field: value})
+        for value in range(top + 1)
+    )
+
+
 def _with_requirement(
     mechanics: SkillMechanics,
     requirement: StateRequirement,
 ) -> SkillMechanics:
+    """Add ``requirement``, replacing the skill's own on its field that it
+    supersedes: the same comparison, or one no count meets with it."""
+
     kept = tuple(
         existing
         for existing in mechanics.requires
-        if (existing.field, existing.comparison)
-        != (requirement.field, requirement.comparison)
+        if existing.field != requirement.field
+        or (
+            existing.comparison != requirement.comparison
+            and _compatible(existing, requirement)
+        )
     )
     return dataclasses.replace(mechanics, requires=(*kept, requirement))
 
@@ -1747,7 +1836,8 @@ def analyse_failures(
     the skill unusable. A proposal is applied unless a successful pre-state
     breaks it or every failed pre-state already met it; a world requirement
     is not in the readings and is applied unchecked. An applied requirement
-    replaces the skill's own on the same field and comparison. Every skill's
+    replaces the skill's own on the same field with the same comparison or
+    that it contradicts, such as ``at_least 1`` for ``equals 0``. Every skill's
     request goes out in one batch.
     """
 

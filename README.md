@@ -222,13 +222,20 @@ model the way SCALAR does (Zabounidis et al., arXiv 2603.09036):
    fails becomes narrow questions with fixed answers, for example "which
    skill makes the crafting table reachable?" or "must the player hold
    stone to craft a wood pickaxe?". Skills that still fail are dropped.
+
+   A requirement that an item be absent, such as "collect stone without a
+   wood pickaxe", holds at the start and can hide a deadlock from
+   validation. So even a model that passes is asked "must the player hold
+   a wood pickaxe first?". Yes makes the skill need the item, no drops the
+   requirement, and validation then sees what the inversion hid.
 3. **Correction.** Successful executor transitions fix each skill's
    inventory effects and requirements deterministically, using the
    inventory extremes recorded during the skill.
 4. **Failure analysis.** A failure the model predicted to succeed, for a
    reason other than a missing target, goes back to the VLM. The VLM sees
    successful pre-states beside it and names at most one missing
-   requirement.
+   requirement. The requirement replaces any the skill has on that field
+   that it contradicts.
 
 `run_model_learning_rounds` alternates closed-loop episodes and correction.
 It starts from the VLM's induced model, or from a registry with one wrong
