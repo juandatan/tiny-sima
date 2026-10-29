@@ -141,6 +141,44 @@ def test_every_answer_rejected_stops_with_the_reason() -> None:
     assert selection.plan_state.rejections == 3
 
 
+def test_subgoals_that_already_hold_go_back_with_the_current_value() -> None:
+    backend = ScriptedBackend(
+        _answer(("inventory.wood_pickaxe", 1)),
+        _answer(("inventory.stone_pickaxe", 1)),
+    )
+    planner = SubgoalPlanner(backend)
+    state = _with_inventory(_state(), wood_pickaxe=1)
+
+    selection = _select(planner, state, PlannerContext(OBJECTIVE))
+
+    assert selection.status is PlannerSelectionStatus.SELECTED
+    retry = backend.requests[1].user_prompt
+    assert (
+        "inventory.wood_pickaxe >= 1 already holds "
+        "(inventory.wood_pickaxe is 1)." in retry
+    )
+    assert "Give sub-goals that are not yet true." in retry
+    plan = selection.plan_state
+    assert plan.rejections == 1
+    held = plan.events[0]
+    assert held.status == "already_held"
+    assert held.reason == "inventory.wood_pickaxe is 1"
+
+
+def test_only_subgoals_that_already_hold_stop_with_the_value() -> None:
+    backend = ScriptedBackend(_answer(("inventory.wood_pickaxe", 1)))
+    planner = SubgoalPlanner(backend, max_rejections=1)
+    state = _with_inventory(_state(), wood_pickaxe=1)
+
+    selection = _select(planner, state, PlannerContext(OBJECTIVE))
+
+    assert selection.status is PlannerSelectionStatus.NO_VIABLE_SKILL
+    assert selection.utility_error == (
+        "no reachable sub-goal: inventory.wood_pickaxe >= 1: "
+        "inventory.wood_pickaxe is 1"
+    )
+
+
 def test_malformed_answers_are_retried() -> None:
     backend = ScriptedBackend("not json", _answer(("inventory.stone_pickaxe", 1)))
     selection = _select(SubgoalPlanner(backend), _state(), PlannerContext(OBJECTIVE))
