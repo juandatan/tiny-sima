@@ -586,6 +586,17 @@ class SubgoalPlanner:
             max_plan_length=self.max_plan_length,
         )
 
+    def _values(
+        self, state: Any, context: PlannerContext, subgoal: GoalCondition
+    ) -> str:
+        """The current value of each field a sub-goal names, for feedback."""
+
+        belief = self._belief(context)
+        fields = dict.fromkeys(requirement.field for requirement in subgoal)
+        return ", ".join(
+            f"{field} is {read_field(state, field, belief)}" for field in fields
+        )
+
     def _alerts(self, state: Any) -> dict[str, str]:
         """Return the alert conditions that hold now, with their details.
 
@@ -757,11 +768,21 @@ class SubgoalPlanner:
             return None
         accepted: list[GoalCondition] = []
         reasons: list[str] = []
+        held: list[str] = []
         for subgoal in parsed.subgoals:
             text = render_subgoal(subgoal)
+            # The schema asks for at_least >= 1, but decoding does not always
+            # enforce it, and the 2B model writes the current count of 0.
+            if any(requirement.value < 1 for requirement in subgoal):
+                reason = "always true; at_least is the count to reach, at least 1"
+                reasons.append(f"{text}: {reason}")
+                plan = plan.with_event(text, "rejected", reason)
+                continue
             check = self._check(pending.state, pending.context, subgoal)
             if check.already_holds:
-                plan = plan.with_event(text, "already_held")
+                values = self._values(pending.state, pending.context, subgoal)
+                plan = plan.with_event(text, "already_held", values)
+                held.append(f"{text} already holds ({values}).")
             elif check.reachable:
                 accepted.append(subgoal)
             else:
@@ -769,10 +790,12 @@ class SubgoalPlanner:
                 plan = plan.with_event(text, "rejected", check.reason)
         if reasons or not accepted:
             pending.plan = replace(plan, rejections=plan.rejections + 1)
-            pending.feedback = tuple(reasons) or (
-                "Every sub-goal you gave already holds, but the objective is "
-                "not complete.",
-            )
+            pending.feedback = (*reasons, *held)
+            if not reasons:
+                pending.feedback += (
+                    "The objective is not complete. Give sub-goals that are "
+                    "not yet true.",
+                )
             return None
         for subgoal in accepted:
             plan = plan.with_event(render_subgoal(subgoal), "proposed")
