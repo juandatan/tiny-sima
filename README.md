@@ -565,10 +565,29 @@ Use `jax_memory.peak_bytes_in_use_mib` for the policy's real memory use.
 
 Notebooks 06 and 07 have presets:
 
-- Notebook 06: `smoke` and `full`.
+- Notebook 06: `smoke`, `full`, and `incremental`.
 - Notebook 07: `smoke`, `full`, and `stone_pickaxe`.
 
 Both reuse completed work rather than repeating it.
+
+Notebook 06's `incremental` preset is for checking a change to the VLM
+sub-goal planner:
+
+- It runs the sub-goal arms on the full run's episodes.
+- It reloads the competence prior instead of probing.
+- It skips the feasibility study and model learning.
+- It reloads each baseline arm from the seed's saved results.
+
+Notebook 08 does the same for the designs listed in `REUSE_DESIGNS`.
+
+Every saved result records its provenance: the seed, the episode count, the
+executor, the VLM configuration, the competence prior, and for notebook 08 the
+observation and limits. A baseline is reused only when its provenance matches
+the current run's, field for field; otherwise it is rerun. Results saved before
+provenance was recorded are always rerun.
+
+Provenance cannot see code. Each result also records the commit it ran at, so
+rerun a baseline whose own code changed, such as the per-turn VLM prompt.
 
 ### JupyterHub
 

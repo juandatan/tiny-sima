@@ -99,6 +99,13 @@ from tiny_sima.evaluation.planner import (
     is_surplus_boundary,
 )
 from tiny_sima.evaluation.policy import evaluate_checkpoint, evaluate_policy
+from tiny_sima.evaluation.reuse import (
+    fingerprint,
+    git_commit,
+    provenance_mismatch,
+    run_provenance,
+    with_provenance,
+)
 from tiny_sima.evaluation.sequencing import (
     SKILL_ABBREVIATIONS,
     DecisionKind,
@@ -224,6 +231,11 @@ __all__ = [
     "probe_skills_batched",
     "rollout_features",
     "run_vlm_smoke_test",
+    "fingerprint",
+    "git_commit",
+    "provenance_mismatch",
+    "run_provenance",
+    "with_provenance",
     "say_top_skill",
     "scripted_skill_action",
     "sequencing_summary",
