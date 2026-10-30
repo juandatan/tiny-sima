@@ -165,6 +165,27 @@ def test_subgoals_that_already_hold_go_back_with_the_current_value() -> None:
     assert held.reason == "inventory.wood_pickaxe is 1"
 
 
+def test_a_zero_count_subgoal_is_rejected_as_always_true() -> None:
+    backend = ScriptedBackend(
+        _answer(("inventory.stone_pickaxe", 0)),
+        _answer(("inventory.stone_pickaxe", 1)),
+    )
+    planner = SubgoalPlanner(backend)
+
+    selection = _select(planner, _state(), PlannerContext(OBJECTIVE))
+
+    assert selection.status is PlannerSelectionStatus.SELECTED
+    retry = backend.requests[1].user_prompt
+    assert (
+        "inventory.stone_pickaxe >= 0: always true; at_least is the count to "
+        "reach, at least 1" in retry
+    )
+    assert "already holds" not in retry
+    plan = selection.plan_state
+    assert plan.rejections == 1
+    assert [event.status for event in plan.events] == ["rejected", "proposed"]
+
+
 def test_only_subgoals_that_already_hold_stop_with_the_value() -> None:
     backend = ScriptedBackend(_answer(("inventory.wood_pickaxe", 1)))
     planner = SubgoalPlanner(backend, max_rejections=1)

@@ -771,6 +771,13 @@ class SubgoalPlanner:
         held: list[str] = []
         for subgoal in parsed.subgoals:
             text = render_subgoal(subgoal)
+            # The schema asks for at_least >= 1, but decoding does not always
+            # enforce it, and the 2B model writes the current count of 0.
+            if any(requirement.value < 1 for requirement in subgoal):
+                reason = "always true; at_least is the count to reach, at least 1"
+                reasons.append(f"{text}: {reason}")
+                plan = plan.with_event(text, "rejected", reason)
+                continue
             check = self._check(pending.state, pending.context, subgoal)
             if check.already_holds:
                 values = self._values(pending.state, pending.context, subgoal)
