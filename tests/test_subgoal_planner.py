@@ -157,12 +157,35 @@ def test_subgoals_that_already_hold_go_back_with_the_current_value() -> None:
         "inventory.wood_pickaxe >= 1 already holds "
         "(inventory.wood_pickaxe is 1)." in retry
     )
-    assert "Give sub-goals that are not yet true." in retry
+    assert "Give sub-goals that are not yet true" in retry
+    assert "do not propose it again" not in retry
     plan = selection.plan_state
     assert plan.rejections == 1
     held = plan.events[0]
     assert held.status == "already_held"
     assert held.reason == "inventory.wood_pickaxe is 1"
+
+
+def test_a_held_subgoal_proposed_again_is_called_a_repeat() -> None:
+    backend = ScriptedBackend(
+        _answer(("survival.drink", 4)),
+        _answer(("survival.drink", 4)),
+        _answer(("inventory.stone_pickaxe", 1)),
+    )
+    planner = SubgoalPlanner(backend)
+    state = _state()
+    state = state.replace(player_drink=4)
+
+    selection = _select(planner, state, PlannerContext(OBJECTIVE))
+
+    assert selection.status is PlannerSelectionStatus.SELECTED
+    first, second = (request.user_prompt for request in backend.requests[1:])
+    assert "survival.drink >= 4 already holds (survival.drink is 4)." in first
+    assert (
+        "survival.drink >= 4 already holds (survival.drink is 4) and was "
+        "reported before; do not propose it again." in second
+    )
+    assert selection.plan_state.rejections == 2
 
 
 def test_a_zero_count_subgoal_is_rejected_as_always_true() -> None:

@@ -769,6 +769,14 @@ class SubgoalPlanner:
         accepted: list[GoalCondition] = []
         reasons: list[str] = []
         held: list[str] = []
+        # Sub-goals an earlier round of this decision already reported as
+        # held; the 2B model repeats them until its rounds run out.
+        reported = {
+            event.subgoal
+            for event in plan.events
+            if event.decision_index == plan.decision_index
+            and event.status == "already_held"
+        }
         for subgoal in parsed.subgoals:
             text = render_subgoal(subgoal)
             # The schema asks for at_least >= 1, but decoding does not always
@@ -782,7 +790,13 @@ class SubgoalPlanner:
             if check.already_holds:
                 values = self._values(pending.state, pending.context, subgoal)
                 plan = plan.with_event(text, "already_held", values)
-                held.append(f"{text} already holds ({values}).")
+                if text in reported:
+                    held.append(
+                        f"{text} already holds ({values}) and was reported "
+                        "before; do not propose it again."
+                    )
+                else:
+                    held.append(f"{text} already holds ({values}).")
             elif check.reachable:
                 accepted.append(subgoal)
             else:
@@ -794,7 +808,8 @@ class SubgoalPlanner:
             if not reasons:
                 pending.feedback += (
                     "The objective is not complete. Give sub-goals that are "
-                    "not yet true.",
+                    "not yet true: what the objective still needs, not what "
+                    "the player already has.",
                 )
             return None
         for subgoal in accepted:
