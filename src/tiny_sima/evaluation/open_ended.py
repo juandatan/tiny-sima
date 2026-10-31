@@ -5,8 +5,8 @@ in an unmodified Craftax-Classic world, with creatures or without:
 
 * ``saycan_recipe_aware`` ranks skills with the recipe-aware VLM prompt and
   multiplies by the competence prior.
-* ``subgoal_vlm`` asks the VLM for formal sub-goals over every achievement,
-  re-asking on low vitals, nearby threats and nightfall.
+* ``subgoal_vlm`` asks the VLM for formal sub-goals over the achievements
+  its skills unlock, re-asking on low vitals, nearby threats and nightfall.
 * ``subgoal_scripted`` is the same sub-goal planner with a fixed curriculum,
   :class:`~tiny_sima.planner.goal_selector.ScriptedGoalSelector`, in place
   of the VLM.
@@ -50,9 +50,9 @@ from tiny_sima.planner.saycan import (
 )
 from tiny_sima.planner.subgoals import (
     ALL_VITAL_THRESHOLDS,
-    OPEN_ENDED_SUBGOAL_FIELDS,
     SubgoalPlan,
     SubgoalPlanner,
+    open_ended_subgoal_fields,
 )
 from tiny_sima.planner.symbolic import SkillModel
 from tiny_sima.planner.vlm import (
@@ -334,7 +334,7 @@ def open_ended_planners(
             config=config,
             model=model,
             tie_break=feasibility,
-            fields=OPEN_ENDED_SUBGOAL_FIELDS,
+            fields=open_ended_subgoal_fields(candidate_skills),
             observation=observation,
             vital_thresholds=ALL_VITAL_THRESHOLDS,
             threat_radius=threat_radius,

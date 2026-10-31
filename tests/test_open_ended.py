@@ -23,6 +23,7 @@ from tiny_sima.evaluation import (
     open_ended_planners,
     summarize_open_ended,
 )
+from tiny_sima.goals import ALL_SKILL_IDS
 from tiny_sima.memory import EpisodeMemory
 from tiny_sima.planner import (
     NOTHING_TO_DO,
@@ -37,10 +38,12 @@ from tiny_sima.planner import (
 from tiny_sima.planner.subgoals import (
     ALL_VITAL_THRESHOLDS,
     OPEN_ENDED_SUBGOAL_FIELDS,
+    SUBGOAL_FIELDS,
     SubgoalEvent,
     SubgoalPlan,
     SubgoalRequest,
     SubgoalSource,
+    open_ended_subgoal_fields,
     render_subgoal,
 )
 
@@ -243,10 +246,24 @@ def test_selector_reads_world_facts_from_memory() -> None:
     assert _proposed(blind, _request(state, memory=NoWater())) == "survival.drink >= 7"
 
 
+def test_open_ended_fields_offer_only_the_achievements_skills_unlock() -> None:
+    fields = open_ended_subgoal_fields(ALL_SKILL_IDS)
+
+    assert "achievement.make_stone_pickaxe" in fields
+    assert "achievement.collect_drink" in fields
+    assert "achievement.place_stone" not in fields
+    assert "achievement.eat_cow" not in fields
+    assert set(fields) < set(OPEN_ENDED_SUBGOAL_FIELDS)
+    assert open_ended_subgoal_fields(ALL_SKILL_IDS[:1]) == (
+        *SUBGOAL_FIELDS,
+        "achievement.collect_wood",
+    )
+
+
 def _scripted_design() -> SubgoalPlanner:
     return SubgoalPlanner(
         ScriptedGoalSelector(),
-        fields=OPEN_ENDED_SUBGOAL_FIELDS,
+        fields=open_ended_subgoal_fields(),
         vital_thresholds=ALL_VITAL_THRESHOLDS,
         threat_radius=3,
         replan_at_night=True,
@@ -423,7 +440,6 @@ def test_summary_aggregates_records() -> None:
 
 def test_design_factory_builds_the_three_designs() -> None:
     from tiny_sima.config import VLMPlannerConfig
-    from tiny_sima.goals import ALL_SKILL_IDS
 
     class Backend:
         def generate(self, request):
@@ -442,7 +458,7 @@ def test_design_factory_builds_the_three_designs() -> None:
     assert isinstance(vlm, SubgoalPlanner) and isinstance(scripted, SubgoalPlanner)
     assert isinstance(scripted.backend, ScriptedGoalSelector)
     for planner in (vlm, scripted):
-        assert planner.fields == OPEN_ENDED_SUBGOAL_FIELDS
+        assert planner.fields == open_ended_subgoal_fields(ALL_SKILL_IDS)
         assert planner.vital_thresholds == ALL_VITAL_THRESHOLDS
         assert planner.threat_radius is not None
         assert planner.replan_at_night

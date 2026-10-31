@@ -41,8 +41,10 @@ from tiny_sima.envs.craftax import render_state
 from tiny_sima.goals import (
     ACHIEVEMENT_FIELDS,
     ALL_SKILL_IDS,
+    SKILL_ACHIEVEMENTS,
     SkillId,
     StateRequirement,
+    achievement_field,
 )
 from tiny_sima.planner.observation import (
     ObservationConfig,
@@ -92,8 +94,8 @@ SUBGOAL_FIELDS: tuple[str, ...] = (
     "inventory.iron_sword",
     "survival.drink",
 )
-# For the open-ended task: every achievement can be a sub-goal, including
-# ones no current skill unlocks, for the same reason.
+# Every achievement as a sub-goal field, including ones no current skill
+# unlocks. The open-ended designs use :func:`open_ended_subgoal_fields`.
 OPEN_ENDED_SUBGOAL_FIELDS: tuple[str, ...] = SUBGOAL_FIELDS + ACHIEVEMENT_FIELDS
 DEFAULT_MAX_SUBGOALS = 4
 DEFAULT_MAX_REJECTIONS = 2
@@ -141,6 +143,27 @@ _TRIGGER_TEXT = {
     ReplanTrigger.NIGHT: "Night has fallen.",
     ReplanTrigger.UNREACHABLE: "The current sub-goal can no longer be reached.",
 }
+
+
+def open_ended_subgoal_fields(
+    candidate_skills: Sequence[SkillId] = ALL_SKILL_IDS,
+) -> tuple[str, ...]:
+    """Return the sub-goal fields plus the achievements the skills unlock.
+
+    Offered every achievement, the 2B model spent its rejection rounds on
+    ones no skill produces, such as place_stone and the iron tools, and
+    stopped short of ones it could reach. The agent knows its own skills, so
+    leaving the rest out reads nothing it does not have.
+    """
+
+    unlocked = {
+        achievement_field(SKILL_ACHIEVEMENTS[skill])
+        for skill in candidate_skills
+        if skill in SKILL_ACHIEVEMENTS
+    }
+    return SUBGOAL_FIELDS + tuple(
+        name for name in ACHIEVEMENT_FIELDS if name in unlocked
+    )
 
 
 def _trigger_text(trigger: ReplanTrigger, detail: str = "") -> str:

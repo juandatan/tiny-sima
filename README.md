@@ -104,8 +104,9 @@ and a sound external checker verifies and gives feedback.
 
 - **The VLM sets sub-goals and never names a skill.** Outlines constrains its
   answer to up to four `{field, at_least}` pairs. The fields are the
-  inventory and drink by default. The open-ended task adds every achievement
-  as a field (`OPEN_ENDED_SUBGOAL_FIELDS`).
+  inventory and drink by default. The open-ended task adds the achievements
+  the agent's skills unlock (`open_ended_subgoal_fields`). Offered all 22,
+  the 2B model spent its retries on ones no skill produces.
 - **The prompt.** The system prompt carries the game mechanics from the
   registry. Each request adds:
   - the objective;
@@ -307,8 +308,8 @@ achievements as you can."
 - **The three designs**, on matched worlds with creatures off and on:
   1. `saycan_recipe_aware`: the per-turn VLM, with the recipe-aware prompt
      and the competence prior.
-  2. `subgoal_vlm`: VLM sub-goals over every achievement. It uses all four
-     vitals, a threat radius of 3 and nightfall triggers.
+  2. `subgoal_vlm`: VLM sub-goals over the achievements its skills unlock.
+     It uses all four vitals, a threat radius of 3 and nightfall triggers.
   3. `subgoal_scripted`: the same sub-goal planner with
      `ScriptedGoalSelector` in place of the VLM. The selector gives survival
      first, then a fixed tech-tree order, and skips a goal after two
