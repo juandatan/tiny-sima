@@ -1,0 +1,15 @@
+model_id: Qwen/Qwen3-VL-8B-Instruct
+environment_name: Craftax-Classic-Symbolic-v1
+# The 2B configuration's settings, so the two sizes differ only in the model
+# and the batch size below.
+max_new_tokens: 320
+dtype: bfloat16
+device_map: auto
+block_pixel_size: 16
+# The 8B weights take about 17 GB in bfloat16, beside JAX's share of the GPU,
+# so half the 2B batch; raise it if memory allows, as larger batches only cut
+# latency.
+max_batch_size: 4
+# Greedy, so a boundary's response is a function of its prompt and conditions
+# differ by what they change rather than by sampling noise.
+do_sample: false
