@@ -14,6 +14,7 @@ from craftax.craftax_classic.constants import Action
 
 from tiny_sima.config import SkillPPOConfig, load_skill_config
 from tiny_sima.envs.skills import (
+    RESOURCE_SKILLS,
     ScenarioRandomization,
     SkillEpisodeState,
     SkillScenario,
@@ -45,12 +46,6 @@ from tiny_sima.goals import (
     get_skill_spec,
     skill_index,
 )
-
-_TURN_THEN_INTERACT_SKILLS = {
-    SkillId.COLLECT_WOOD,
-    SkillId.COLLECT_STONE,
-    SkillId.DRINK_WATER,
-}
 
 
 class GoalEvaluationCarry(NamedTuple):
@@ -174,7 +169,7 @@ def diagnose_goal_conditioned_skill(
         dtype=jnp.int32,
     )
 
-    if normalized_skill_id in _TURN_THEN_INTERACT_SKILLS:
+    if normalized_skill_id in RESOURCE_SKILLS:
 
         def probe_interaction(rng: jax.Array) -> InteractionSkillProbe:
             reset_rng, step_rng = jax.random.split(rng)

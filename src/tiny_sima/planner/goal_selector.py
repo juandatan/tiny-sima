@@ -23,7 +23,7 @@ from typing import cast
 
 from craftax.craftax_classic.constants import Achievement
 
-from tiny_sima.goals import ALL_SKILL_IDS, SkillId, StateRequirement
+from tiny_sima.goals import STONE_PICKAXE_SKILL_IDS, SkillId, StateRequirement
 from tiny_sima.planner.observation import vitals
 from tiny_sima.planner.subgoals import SubgoalRequest, render_subgoal
 from tiny_sima.planner.symbolic import (
@@ -63,16 +63,23 @@ TECH_TREE_ORDER: tuple[Achievement, ...] = (
 )
 
 # The planner field that restores each vital, or None while no skill does.
-# Food and energy are hooks: an eating or a sleeping skill fills one in, and
-# a matching rule in ``vital_rules`` turns it on.
+# A rule in ``vital_rules`` turns one on; a plan for it needs the matching
+# skill among the candidates.
 VITAL_SUBGOAL_FIELDS: dict[str, str | None] = {
     "drink": "survival.drink",
-    "food": None,
-    "energy": None,
+    "food": "survival.food",
+    "energy": "survival.energy",
     "health": None,
 }
 # (vital, threshold, target): at or below the threshold, ask for the target.
 DEFAULT_VITAL_RULES: tuple[tuple[str, int, int], ...] = (("drink", 3, 7),)
+# For a catalog with the eating and sleeping skills. Sleep only ends rested,
+# so its target is full energy.
+SURVIVAL_VITAL_RULES: tuple[tuple[str, int, int], ...] = (
+    ("drink", 3, 7),
+    ("food", 3, 7),
+    ("energy", 3, 9),
+)
 # Plan events that count against a sub-goal.
 DEFAULT_FAILURE_STATUSES: tuple[str, ...] = ("timed_out", "abandoned", "rejected")
 DEFAULT_MAX_FAILURES = 2
@@ -114,7 +121,7 @@ class ScriptedGoalSelector:
     with nothing left to do stops.
     """
 
-    candidate_skills: tuple[SkillId, ...] = ALL_SKILL_IDS
+    candidate_skills: tuple[SkillId, ...] = STONE_PICKAXE_SKILL_IDS
     model: SkillModel | None = None
     use_memory_belief: bool = True
     max_plan_length: int = DEFAULT_MAX_PLAN_LENGTH

@@ -23,6 +23,7 @@ from tiny_sima.executor.model import make_goal_conditioned_actor_critic
 from tiny_sima.goals import (
     ALL_SKILL_IDS,
     SKILL_IDS,
+    STONE_PICKAXE_SKILL_IDS,
     SkillGoal,
     SkillId,
     executor_skill_ids,
@@ -53,12 +54,13 @@ def _chain_state(chain=WOOD_TO_STONE_PICKAXE_CHAIN, seed: int = 0):
 
 
 def test_the_six_skill_catalog_is_unchanged() -> None:
-    assert ALL_SKILL_IDS[: len(SKILL_IDS)] == SKILL_IDS
-    assert ALL_SKILL_IDS[-1] is SkillId.CRAFT_STONE_PICKAXE
+    assert STONE_PICKAXE_SKILL_IDS[: len(SKILL_IDS)] == SKILL_IDS
+    assert STONE_PICKAXE_SKILL_IDS[-1] is SkillId.CRAFT_STONE_PICKAXE
     assert executor_skill_ids(6) == SKILL_IDS
-    assert executor_skill_ids(7) == ALL_SKILL_IDS
+    assert executor_skill_ids(7) == STONE_PICKAXE_SKILL_IDS
+    assert executor_skill_ids(16) == ALL_SKILL_IDS
     with pytest.raises(ValueError):
-        executor_skill_ids(8)
+        executor_skill_ids(17)
     assert chain_decision_limit(WOOD_TO_STONE_CHAIN) == 12
     assert chain_decision_limit(WOOD_TO_STONE_PICKAXE_CHAIN) == 16
 
@@ -105,7 +107,7 @@ def test_stone_pickaxe_chain_accepts_a_reordered_plan() -> None:
         ScriptedSkillExecutor(),
         planner=SayCanPlanner(
             utility_scorer=SequentialUtilityScorer(reordered),
-            candidate_skills=ALL_SKILL_IDS,
+            candidate_skills=STONE_PICKAXE_SKILL_IDS,
         ),
         chain=WOOD_TO_STONE_PICKAXE_CHAIN,
         num_episodes=2,
@@ -162,10 +164,10 @@ def test_skip_held_craft_zeroes_only_redundant_crafts() -> None:
     context = PlannerContext(objective=WOOD_TO_STONE_PICKAXE_CHAIN.objective)
     scorer = SkipHeldCraftFeasibility()
 
-    scores = scorer.score_all_feasibility(state, context, ALL_SKILL_IDS)
+    scores = scorer.score_all_feasibility(state, context, STONE_PICKAXE_SKILL_IDS)
 
     assert scores[SkillId.CRAFT_WOOD_PICKAXE] == 0.0
-    for skill_id in ALL_SKILL_IDS:
+    for skill_id in STONE_PICKAXE_SKILL_IDS:
         if skill_id is not SkillId.CRAFT_WOOD_PICKAXE:
             assert scores[skill_id] == reachability_feasibility(
                 state, context, skill_id
@@ -181,7 +183,7 @@ def test_skip_held_craft_still_completes_the_stone_pickaxe_chain() -> None:
                 WOOD_TO_STONE_PICKAXE_CHAIN.reference_skills
             ),
             feasibility_scorer=SkipHeldCraftFeasibility(),
-            candidate_skills=ALL_SKILL_IDS,
+            candidate_skills=STONE_PICKAXE_SKILL_IDS,
         ),
         chain=WOOD_TO_STONE_PICKAXE_CHAIN,
         num_episodes=2,
@@ -195,7 +197,7 @@ def test_the_prompt_lists_only_the_offered_skills() -> None:
     baseline = PlannerPromptStyle.BASELINE
     assert build_planner_system_prompt(baseline, SKILL_IDS) == PLANNER_SYSTEM_PROMPT
     assert "craft_stone_pickaxe" not in PLANNER_SYSTEM_PROMPT
-    extended = build_planner_system_prompt(baseline, ALL_SKILL_IDS)
+    extended = build_planner_system_prompt(baseline, STONE_PICKAXE_SKILL_IDS)
     assert "craft_stone_pickaxe" in extended
     # Only the catalog line differs; the instructions are the measured ones.
     assert extended.splitlines()[:-1] == PLANNER_SYSTEM_PROMPT.splitlines()[:-1]
@@ -212,7 +214,8 @@ def test_config_bounds_the_executor_catalog() -> None:
     )
     assert SkillPPOConfig(**base).num_skills == 6
     assert SkillPPOConfig(**base, num_skills=7).validate().num_skills == 7
-    for num_skills in (0, 8):
+    assert SkillPPOConfig(**base, num_skills=16).validate().num_skills == 16
+    for num_skills in (0, 17):
         with pytest.raises(ValueError, match="num_skills"):
             SkillPPOConfig(**base, num_skills=num_skills).validate()
 
@@ -225,7 +228,7 @@ def test_vectorized_environment_trains_the_seventh_skill() -> None:
     ]
 
     assert environment.num_skills == 7
-    assert set(skills) == set(ALL_SKILL_IDS)
+    assert set(skills) == set(STONE_PICKAXE_SKILL_IDS)
     with pytest.raises(ValueError, match="divisible"):
         make_vectorized_skill_environment(num_envs=12, num_skills=7)
 
@@ -263,10 +266,10 @@ def test_competence_prior_keeps_its_own_catalog() -> None:
 
     with pytest.raises(ValueError, match="outside the catalog"):
         fit_competence_prior(skills, steps, labels)
-    prior = fit_competence_prior(skills, steps, labels, skills=ALL_SKILL_IDS)
+    prior = fit_competence_prior(skills, steps, labels, skills=STONE_PICKAXE_SKILL_IDS)
     restored = CompetencePrior.from_dict(json.loads(json.dumps(prior.to_dict())))
 
-    assert restored.skills == ALL_SKILL_IDS
+    assert restored.skills == STONE_PICKAXE_SKILL_IDS
     assert restored.rates == prior.rates
     # The held-out report reads the same catalog, so the seventh skill's
     # cells are printed rather than silently dropped.

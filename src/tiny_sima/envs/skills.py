@@ -24,19 +24,25 @@ from tiny_sima.envs.craftax import (
 )
 from tiny_sima.goals.reachability import (
     DEFAULT_REACHABILITY,
+    SLEEP_STEPS_PER_ENERGY,
     interaction_distance,
     walkable_mask,
 )
 from tiny_sima.goals.skills import (
+    ALL_SKILL_IDS,
+    MAX_VITAL,
     SKILL_IDS,
     SkillGoal,
     SkillId,
     executor_skill_ids,
+    interacts_by_doing,
+    is_crafting_skill,
     skill_index,
     skill_metric,
     skill_precondition,
     skill_progress_from_metric,
     skill_success_from_metric,
+    skill_target_block,
 )
 
 if TYPE_CHECKING:
@@ -301,13 +307,22 @@ def _clear_mobs(state: Any) -> Any:
     )
 
 
-LOCAL_NAVIGATION_SKILLS: tuple[SkillId, ...] = (
-    SkillId.COLLECT_WOOD,
-    SkillId.COLLECT_STONE,
-    SkillId.DRINK_WATER,
-    SkillId.CRAFT_WOOD_PICKAXE,
-    SkillId.CRAFT_WOOD_SWORD,
-    SkillId.CRAFT_STONE_PICKAXE,
+def _target_block(skill_id: SkillId) -> BlockType | None:
+    """Return the block a scenario places in front of the skill's target."""
+
+    if skill_id is SkillId.EAT_COW:
+        # The cow stands on this grass; see :func:`_add_cow`.
+        return BlockType.GRASS
+    return skill_target_block(skill_id)
+
+
+# The skills with one target to walk to. Grass is everywhere, so the sapling
+# and planting skills have none.
+LOCAL_NAVIGATION_SKILLS: tuple[SkillId, ...] = tuple(
+    skill_id
+    for skill_id in ALL_SKILL_IDS
+    if skill_id is SkillId.EAT_COW
+    or skill_target_block(skill_id) not in {None, BlockType.GRASS}
 )
 
 
@@ -327,24 +342,6 @@ def skills_for_scenario(
     return skill_ids
 
 
-def _target_block(skill_id: SkillId) -> BlockType | None:
-    if skill_id is SkillId.COLLECT_WOOD:
-        return BlockType.TREE
-    if skill_id is SkillId.COLLECT_STONE:
-        return BlockType.STONE
-    if skill_id is SkillId.DRINK_WATER:
-        return BlockType.WATER
-    if skill_id in {
-        SkillId.CRAFT_WOOD_PICKAXE,
-        SkillId.CRAFT_WOOD_SWORD,
-        SkillId.CRAFT_STONE_PICKAXE,
-    }:
-        return BlockType.CRAFTING_TABLE
-    if skill_id is SkillId.PLACE_TABLE:
-        return None
-    raise AssertionError(f"Unhandled skill: {skill_id}")
-
-
 def _scenario_inventory(skill_id: SkillId) -> Inventory:
     inventory = Inventory()
     if skill_id is SkillId.COLLECT_STONE:
@@ -360,6 +357,14 @@ def _scenario_inventory(skill_id: SkillId) -> Inventory:
         # The stone could only have been mined with a wood pickaxe, so a
         # chain always reaches this craft holding one.
         return replace(inventory, wood=1, stone=1, wood_pickaxe=1)
+    if skill_id is SkillId.CRAFT_STONE_SWORD:
+        return replace(inventory, wood=1, stone=1, wood_pickaxe=1)
+    if skill_id is SkillId.COLLECT_COAL:
+        return replace(inventory, wood_pickaxe=1)
+    if skill_id in {SkillId.PLACE_STONE, SkillId.PLACE_FURNACE}:
+        return replace(inventory, stone=1, wood_pickaxe=1)
+    if skill_id is SkillId.PLACE_PLANT:
+        return replace(inventory, sapling=1)
     return inventory
 
 
@@ -444,11 +449,8 @@ def _prepare_nearby_scenario(
         )
 
     player_direction = target_direction
-    if goal.skill_id in {
-        SkillId.COLLECT_WOOD,
-        SkillId.COLLECT_STONE,
-        SkillId.DRINK_WATER,
-    }:
+    # Start facing away from a single target, so the skill must turn to it.
+    if interacts_by_doing(goal.skill_id) and target is not BlockType.GRASS:
         player_direction = target_direction % 4 + 1
 
     return PreparedSkillScenario(
@@ -561,16 +563,14 @@ def _prepare_local_navigation_scenario(
     )
 
 
-_RESOURCE_SKILLS = frozenset(
-    {SkillId.COLLECT_WOOD, SkillId.COLLECT_STONE, SkillId.DRINK_WATER}
+# The skills that take from a natural block, which may appear more than once.
+RESOURCE_SKILLS = frozenset(
+    skill_id
+    for skill_id in ALL_SKILL_IDS
+    if interacts_by_doing(skill_id)
+    and skill_target_block(skill_id) not in {None, BlockType.GRASS}
 )
-_TABLE_SKILLS = frozenset(
-    {
-        SkillId.CRAFT_WOOD_PICKAXE,
-        SkillId.CRAFT_WOOD_SWORD,
-        SkillId.CRAFT_STONE_PICKAXE,
-    }
-)
+_EAT_SKILLS = frozenset({SkillId.EAT_COW, SkillId.EAT_PLANT})
 _DEFAULT_PARAMS = EnvParams()
 
 
@@ -631,7 +631,7 @@ def _random_inventory(skill_id: SkillId, rng: jax.Array) -> Inventory:
     return replace(
         base,
         wood=base.wood + wood,
-        sapling=sapling,
+        sapling=base.sapling + sapling,
         stone=base.stone + stone,
         wood_pickaxe=jnp.maximum(base.wood_pickaxe, pickaxe),
         wood_sword=sword,
@@ -725,7 +725,7 @@ def _prepare_randomized_scenario(
         )
 
     target = _target_block(goal.skill_id)
-    if target is not None and goal.skill_id in _RESOURCE_SKILLS:
+    if target is not None and goal.skill_id in RESOURCE_SKILLS:
         # Copies no closer than the sampled target, so the distance band
         # still names the nearest target rather than a lucky extra one.
         far = jnp.sum(jnp.abs(view_offsets), axis=-1) >= jnp.sum(
@@ -733,7 +733,7 @@ def _prepare_randomized_scenario(
         )
         for _ in range(randomization.extra_target_count):
             world_map, used = place(world_map, used, target.value, eligible=far)
-    if goal.skill_id not in _TABLE_SKILLS and randomization.table_probability > 0:
+    if not is_crafting_skill(goal.skill_id) and randomization.table_probability > 0:
         world_map, used = place(
             world_map,
             used,
@@ -802,6 +802,43 @@ def _prepare_randomized_scenario(
     )
 
 
+def scenario_vitals(skill_id: SkillId) -> tuple[int, int, int]:
+    """Return the food, drink and energy a controlled scenario starts with.
+
+    The vital a skill restores starts below full so the skill can succeed;
+    every other vital starts full.
+    """
+
+    return (
+        5 if skill_id in _EAT_SKILLS else MAX_VITAL,
+        5 if skill_id is SkillId.DRINK_WATER else MAX_VITAL,
+        MAX_VITAL - 1 if skill_id is SkillId.SLEEP else MAX_VITAL,
+    )
+
+
+def _lowest_sleep_energy(goal: SkillGoal) -> int:
+    """Return the lowest energy from which sleep ends inside the horizon."""
+
+    # The scenario starts with no fatigue, so waking takes no extra step.
+    affordable = (goal.effective_horizon - 1) // SLEEP_STEPS_PER_ENERGY
+    return min(max(MAX_VITAL - affordable, 3), MAX_VITAL - 1)
+
+
+def _add_cow(state: Any, position: jax.Array) -> Any:
+    """Put one full-health cow on ``position``."""
+
+    cows = state.cows
+    return state.replace(
+        cows=cows.replace(
+            position=cows.position.at[0].set(position),
+            health=cows.health.at[0].set(_DEFAULT_PARAMS.cow_health),
+            mask=cows.mask.at[0].set(True),
+            attack_cooldown=cows.attack_cooldown.at[0].set(0),
+        ),
+        mob_map=state.mob_map.at[position[0], position[1]].set(True),
+    )
+
+
 def _randomize_vitals_and_clock(
     state: Any,
     goal: SkillGoal,
@@ -812,7 +849,11 @@ def _randomize_vitals_and_clock(
     if randomization.random_vitals:
         health, food, drink, energy = jax.random.randint(vitals_rng, (4,), 3, 10)
         if goal.skill_id is SkillId.DRINK_WATER:
-            drink = jnp.minimum(drink, 8)
+            drink = jnp.minimum(drink, MAX_VITAL - 1)
+        if goal.skill_id in _EAT_SKILLS:
+            food = jnp.minimum(food, MAX_VITAL - 1)
+        if goal.skill_id is SkillId.SLEEP:
+            energy = jnp.clip(energy, _lowest_sleep_energy(goal), MAX_VITAL - 1)
         state = state.replace(
             player_health=health,
             player_food=food,
@@ -875,13 +916,15 @@ def prepare_skill_scenario(
             scenario_config,
         )
 
-    player_drink = 5 if goal.skill_id is SkillId.DRINK_WATER else 9
+    player_food, player_drink, player_energy = scenario_vitals(goal.skill_id)
     prepared_state = _clear_mobs(scenario.state)
+    if goal.skill_id is SkillId.EAT_COW:
+        prepared_state = _add_cow(prepared_state, scenario.target_position)
     prepared_state = prepared_state.replace(
         player_health=9,
-        player_food=9,
+        player_food=player_food,
         player_drink=player_drink,
-        player_energy=9,
+        player_energy=player_energy,
         is_sleeping=False,
         player_recover=0.0,
         player_hunger=0.0,

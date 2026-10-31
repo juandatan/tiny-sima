@@ -40,11 +40,12 @@ from tiny_sima.config import VLMPlannerConfig
 from tiny_sima.envs.craftax import render_state
 from tiny_sima.goals import (
     ACHIEVEMENT_FIELDS,
-    ALL_SKILL_IDS,
     SKILL_ACHIEVEMENTS,
+    STONE_PICKAXE_SKILL_IDS,
     SkillId,
     StateRequirement,
     achievement_field,
+    get_skill_spec,
 )
 from tiny_sima.planner.observation import (
     ObservationConfig,
@@ -146,7 +147,7 @@ _TRIGGER_TEXT = {
 
 
 def open_ended_subgoal_fields(
-    candidate_skills: Sequence[SkillId] = ALL_SKILL_IDS,
+    candidate_skills: Sequence[SkillId] = STONE_PICKAXE_SKILL_IDS,
 ) -> tuple[str, ...]:
     """Return the sub-goal fields plus the achievements the skills unlock.
 
@@ -161,8 +162,21 @@ def open_ended_subgoal_fields(
         for skill in candidate_skills
         if skill in SKILL_ACHIEVEMENTS
     }
-    return SUBGOAL_FIELDS + tuple(
-        name for name in ACHIEVEMENT_FIELDS if name in unlocked
+    # Counts and vitals the skills change beyond the fixed list, such as
+    # saplings, food and energy; the stone-pickaxe catalog adds none.
+    changed = tuple(
+        dict.fromkeys(
+            effect.field
+            for skill in candidate_skills
+            for effect in get_skill_spec(skill).mechanics.effects
+            if not effect.field.startswith("world.")
+            and effect.field not in SUBGOAL_FIELDS
+        )
+    )
+    return (
+        SUBGOAL_FIELDS
+        + changed
+        + tuple(name for name in ACHIEVEMENT_FIELDS if name in unlocked)
     )
 
 
@@ -409,7 +423,7 @@ _SUBGOAL_INSTRUCTIONS = (
 
 
 def build_subgoal_system_prompt(
-    candidate_skills: Sequence[SkillId] = ALL_SKILL_IDS,
+    candidate_skills: Sequence[SkillId] = STONE_PICKAXE_SKILL_IDS,
     fields: Sequence[str] = SUBGOAL_FIELDS,
     max_subgoals: int = DEFAULT_MAX_SUBGOALS,
     observation: ObservationConfig | None = None,
@@ -436,13 +450,16 @@ def build_subgoal_system_prompt(
 
 
 def _visible_state(state: Any, fields: Sequence[str]) -> dict[str, int]:
-    """The fields the agent can read off its own status bar, when nonzero."""
+    """The fields the agent can read off its own status bar, when nonzero.
+
+    Vitals are shown even at zero, since an empty one is what matters.
+    """
 
     values = {name: read_field(state, name) for name in fields}
     return {
         name: value
         for name, value in values.items()
-        if value or name == "survival.drink"
+        if value or name.startswith("survival.")
     }
 
 
@@ -573,7 +590,7 @@ class SubgoalPlanner:
     """
 
     backend: VisionLanguageBackend | SubgoalSource
-    candidate_skills: tuple[SkillId, ...] = ALL_SKILL_IDS
+    candidate_skills: tuple[SkillId, ...] = STONE_PICKAXE_SKILL_IDS
     config: VLMPlannerConfig = VLMPlannerConfig()
     model: SkillModel | None = None
     use_memory_belief: bool = True

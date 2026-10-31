@@ -24,6 +24,17 @@ class SkillId(str, Enum):
     # Appended last so the six indices above keep their meaning in existing
     # checkpoints, priors and recorded results.
     CRAFT_STONE_PICKAXE = "craft_stone_pickaxe"
+    # Stages A and B of the full achievement set, appended in turn so every
+    # earlier index keeps its meaning.
+    CRAFT_STONE_SWORD = "craft_stone_sword"
+    COLLECT_COAL = "collect_coal"
+    PLACE_STONE = "place_stone"
+    PLACE_FURNACE = "place_furnace"
+    COLLECT_SAPLING = "collect_sapling"
+    PLACE_PLANT = "place_plant"
+    EAT_COW = "eat_cow"
+    SLEEP = "sleep"
+    EAT_PLANT = "eat_plant"
 
 
 RequirementComparison = Literal["at_least", "less_than", "equals"]
@@ -125,6 +136,10 @@ class SkillGoal:
     @property
     def effective_horizon(self) -> int:
         return self.horizon or get_skill_spec(self.skill_id).default_horizon
+
+
+# Health, food, drink and energy all top out here.
+MAX_VITAL = 9
 
 
 SKILL_REGISTRY: dict[SkillId, SkillSpec] = {
@@ -276,6 +291,175 @@ SKILL_REGISTRY: dict[SkillId, SkillSpec] = {
         default_horizon=64,
         interaction_action=Action.MAKE_STONE_PICKAXE,
     ),
+    SkillId.CRAFT_STONE_SWORD: SkillSpec(
+        skill_id=SkillId.CRAFT_STONE_SWORD,
+        instruction="Craft a stone sword at a crafting table.",
+        description=(
+            "Spend one wood and one stone at a crafting table to make a "
+            "stone sword."
+        ),
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("inventory.wood", "at_least", 1),
+                StateRequirement("inventory.stone", "at_least", 1),
+                StateRequirement(
+                    "world.crafting_table_reachable",
+                    "equals",
+                    True,
+                ),
+            ),
+            effects=(
+                StateEffect("inventory.wood", "decrease", 1),
+                StateEffect("inventory.stone", "decrease", 1),
+                StateEffect("inventory.stone_sword", "increase", 1),
+            ),
+        ),
+        default_horizon=64,
+        interaction_action=Action.MAKE_STONE_SWORD,
+    ),
+    SkillId.COLLECT_COAL: SkillSpec(
+        skill_id=SkillId.COLLECT_COAL,
+        instruction="Collect coal with a wood pickaxe.",
+        description="Mine coal using a wooden pickaxe.",
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("inventory.wood_pickaxe", "at_least", 1),
+                StateRequirement("world.coal_reachable", "equals", True),
+            ),
+            effects=(
+                StateEffect("inventory.coal", "increase", 1),
+            ),
+        ),
+        default_horizon=96,
+        interaction_action=Action.DO,
+    ),
+    SkillId.PLACE_STONE: SkillSpec(
+        skill_id=SkillId.PLACE_STONE,
+        instruction="Place a stone.",
+        description="Spend one stone to place a stone block.",
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("inventory.stone", "at_least", 1),
+                StateRequirement(
+                    "world.placement_space_reachable",
+                    "equals",
+                    True,
+                ),
+            ),
+            effects=(
+                StateEffect("inventory.stone", "decrease", 1),
+            ),
+        ),
+        default_horizon=48,
+        interaction_action=Action.PLACE_STONE,
+    ),
+    SkillId.PLACE_FURNACE: SkillSpec(
+        skill_id=SkillId.PLACE_FURNACE,
+        instruction="Place a furnace.",
+        description="Spend one stone to place a furnace.",
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("inventory.stone", "at_least", 1),
+                StateRequirement(
+                    "world.placement_space_reachable",
+                    "equals",
+                    True,
+                ),
+            ),
+            effects=(
+                StateEffect("inventory.stone", "decrease", 1),
+                StateEffect("world.furnace_reachable", "set", True),
+            ),
+        ),
+        default_horizon=48,
+        interaction_action=Action.PLACE_FURNACE,
+    ),
+    SkillId.COLLECT_SAPLING: SkillSpec(
+        skill_id=SkillId.COLLECT_SAPLING,
+        instruction="Collect a sapling from grass.",
+        description=(
+            "Interact with grass until it yields a sapling, which it does "
+            "one time in ten."
+        ),
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("world.grass_reachable", "equals", True),
+            ),
+            effects=(
+                StateEffect("inventory.sapling", "increase", 1),
+            ),
+        ),
+        default_horizon=64,
+        interaction_action=Action.DO,
+    ),
+    SkillId.PLACE_PLANT: SkillSpec(
+        skill_id=SkillId.PLACE_PLANT,
+        instruction="Plant a sapling on grass.",
+        description="Spend one sapling to plant it on a grass tile.",
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("inventory.sapling", "at_least", 1),
+                StateRequirement("world.grass_reachable", "equals", True),
+            ),
+            effects=(
+                StateEffect("inventory.sapling", "decrease", 1),
+            ),
+        ),
+        default_horizon=48,
+        interaction_action=Action.PLACE_PLANT,
+    ),
+    SkillId.EAT_COW: SkillSpec(
+        skill_id=SkillId.EAT_COW,
+        instruction="Hunt and eat a cow.",
+        description="Hit a cow until it dies, which restores food.",
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("world.cow_reachable", "equals", True),
+                StateRequirement("survival.food", "less_than", MAX_VITAL),
+            ),
+            # Craftax adds six food, capped at the maximum.
+            effects=(
+                StateEffect("survival.food", "increase", 6),
+            ),
+        ),
+        default_horizon=96,
+        interaction_action=Action.DO,
+    ),
+    SkillId.SLEEP: SkillSpec(
+        skill_id=SkillId.SLEEP,
+        instruction="Sleep until rested.",
+        description=(
+            "Sleep until energy is full and wake up; each missing energy "
+            "point takes about eleven steps."
+        ),
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("survival.energy", "less_than", MAX_VITAL),
+            ),
+            effects=(
+                StateEffect("survival.energy", "set", MAX_VITAL),
+            ),
+        ),
+        default_horizon=128,
+        interaction_action=Action.SLEEP,
+    ),
+    SkillId.EAT_PLANT: SkillSpec(
+        skill_id=SkillId.EAT_PLANT,
+        instruction="Eat a ripe plant.",
+        description="Eat a ripe plant, which restores food.",
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("world.ripe_plant_reachable", "equals", True),
+                StateRequirement("survival.food", "less_than", MAX_VITAL),
+            ),
+            # Craftax adds four food, capped at the maximum.
+            effects=(
+                StateEffect("survival.food", "increase", 4),
+            ),
+        ),
+        default_horizon=64,
+        interaction_action=Action.DO,
+    ),
 }
 
 # Every skill the registry defines, in categorical index order.
@@ -284,6 +468,10 @@ ALL_SKILL_IDS: tuple[SkillId, ...] = tuple(SKILL_REGISTRY)
 # trained on, and the default candidate set of the planner. Keeping it the
 # default leaves those checkpoints, priors and planner prompts unchanged.
 SKILL_IDS: tuple[SkillId, ...] = ALL_SKILL_IDS[:6]
+# The seven-skill catalog of the stone-pickaxe stage. The chain and
+# open-ended evaluations offer it, so the executors trained on it, their
+# priors and the recorded results stay valid as the registry grows.
+STONE_PICKAXE_SKILL_IDS: tuple[SkillId, ...] = ALL_SKILL_IDS[:7]
 SKILL_TO_INDEX: dict[SkillId, int] = {
     skill_id: index for index, skill_id in enumerate(ALL_SKILL_IDS)
 }
@@ -300,6 +488,15 @@ SKILL_ACHIEVEMENTS: dict[SkillId, Achievement] = {
     SkillId.CRAFT_WOOD_PICKAXE: Achievement.MAKE_WOOD_PICKAXE,
     SkillId.CRAFT_WOOD_SWORD: Achievement.MAKE_WOOD_SWORD,
     SkillId.CRAFT_STONE_PICKAXE: Achievement.MAKE_STONE_PICKAXE,
+    SkillId.CRAFT_STONE_SWORD: Achievement.MAKE_STONE_SWORD,
+    SkillId.COLLECT_COAL: Achievement.COLLECT_COAL,
+    SkillId.PLACE_STONE: Achievement.PLACE_STONE,
+    SkillId.PLACE_FURNACE: Achievement.PLACE_FURNACE,
+    SkillId.COLLECT_SAPLING: Achievement.COLLECT_SAPLING,
+    SkillId.PLACE_PLANT: Achievement.PLACE_PLANT,
+    SkillId.EAT_COW: Achievement.EAT_COW,
+    SkillId.SLEEP: Achievement.WAKE_UP,
+    SkillId.EAT_PLANT: Achievement.EAT_PLANT,
 }
 
 
@@ -378,8 +575,42 @@ def planner_skill_catalog(
     ]
 
 
+def skill_target_block(skill_id: SkillId | str) -> BlockType | None:
+    """Return the block a skill faces to act on, from its registry entry.
+
+    It is the block named by the skill's ``world.<block>_reachable``
+    requirement, so the crafting skills target the crafting table. ``None``
+    for a skill without one: the placements, which need only free ground,
+    sleep, and eating a cow, whose target is a mob.
+    """
+
+    for requirement in get_skill_spec(skill_id).mechanics.requires:
+        field = requirement.field
+        if field.startswith("world.") and field.endswith("_reachable"):
+            name = field[len("world.") : -len("_reachable")].upper()
+            if name in BlockType.__members__:
+                return BlockType[name]
+    return None
+
+
+def is_crafting_skill(skill_id: SkillId | str) -> bool:
+    """Return whether a skill crafts at a table, which works diagonally too."""
+
+    return skill_target_block(skill_id) is BlockType.CRAFTING_TABLE
+
+
+def interacts_by_doing(skill_id: SkillId | str) -> bool:
+    """Return whether a skill acts by facing its target and pressing DO."""
+
+    return get_skill_spec(skill_id).interaction_action is Action.DO
+
+
 def _block_count(state: Any, block_type: BlockType) -> jax.Array:
     return jnp.count_nonzero(state.map == block_type.value)
+
+
+def _has_block(state: Any, block_type: BlockType) -> jax.Array:
+    return jnp.any(state.map == block_type.value)
 
 
 def skill_metric(skill_id: SkillId | str, state: Any) -> jax.Array:
@@ -400,6 +631,33 @@ def skill_metric(skill_id: SkillId | str, state: Any) -> jax.Array:
         return jnp.asarray(state.inventory.wood_sword)
     if skill_id is SkillId.CRAFT_STONE_PICKAXE:
         return jnp.asarray(state.inventory.stone_pickaxe)
+    if skill_id is SkillId.CRAFT_STONE_SWORD:
+        return jnp.asarray(state.inventory.stone_sword)
+    if skill_id is SkillId.COLLECT_COAL:
+        return jnp.asarray(state.inventory.coal)
+    if skill_id is SkillId.PLACE_STONE:
+        return _block_count(state, BlockType.STONE)
+    if skill_id is SkillId.PLACE_FURNACE:
+        return _block_count(state, BlockType.FURNACE)
+    if skill_id is SkillId.COLLECT_SAPLING:
+        return jnp.asarray(state.inventory.sapling)
+    if skill_id is SkillId.PLACE_PLANT:
+        # A placed sapling may ripen within the skill.
+        return jnp.count_nonzero(
+            (state.map == BlockType.PLANT.value)
+            | (state.map == BlockType.RIPE_PLANT.value)
+        )
+    if skill_id in {SkillId.EAT_COW, SkillId.EAT_PLANT}:
+        # Either meal counts for both. The scenarios offer only the one food
+        # source, and the planner re-reads the achievements at each boundary.
+        return jnp.asarray(state.player_food)
+    if skill_id is SkillId.SLEEP:
+        # Energy only rises asleep, and the player wakes once it is full,
+        # so this turns from zero to one exactly on waking rested.
+        return (
+            (jnp.asarray(state.player_energy) >= MAX_VITAL)
+            & ~jnp.asarray(state.is_sleeping)
+        ).astype(jnp.int32)
     raise AssertionError(f"Unhandled skill: {skill_id}")
 
 
@@ -433,12 +691,42 @@ def skill_precondition(goal: SkillGoal, state: Any) -> jax.Array:
             & (jnp.asarray(state.inventory.wood) >= goal.quantity)
             & jnp.any(state.map == BlockType.CRAFTING_TABLE.value)
         )
-    if skill_id is SkillId.CRAFT_STONE_PICKAXE:
+    if skill_id in {SkillId.CRAFT_STONE_PICKAXE, SkillId.CRAFT_STONE_SWORD}:
         return (
             alive
             & (jnp.asarray(state.inventory.wood) >= goal.quantity)
             & (jnp.asarray(state.inventory.stone) >= goal.quantity)
             & jnp.any(state.map == BlockType.CRAFTING_TABLE.value)
+        )
+    if skill_id is SkillId.COLLECT_COAL:
+        return (
+            alive
+            & (jnp.asarray(state.inventory.wood_pickaxe) > 0)
+            & _has_block(state, BlockType.COAL)
+        )
+    if skill_id in {SkillId.PLACE_STONE, SkillId.PLACE_FURNACE}:
+        return alive & (jnp.asarray(state.inventory.stone) >= goal.quantity)
+    if skill_id is SkillId.COLLECT_SAPLING:
+        return alive & _has_block(state, BlockType.GRASS)
+    if skill_id is SkillId.PLACE_PLANT:
+        return (
+            alive
+            & (jnp.asarray(state.inventory.sapling) >= goal.quantity)
+            & _has_block(state, BlockType.GRASS)
+        )
+    if skill_id is SkillId.EAT_COW:
+        return (
+            alive
+            & (jnp.asarray(state.player_food) + goal.quantity <= MAX_VITAL)
+            & jnp.any(state.cows.mask)
+        )
+    if skill_id is SkillId.SLEEP:
+        return alive & (jnp.asarray(state.player_energy) < MAX_VITAL)
+    if skill_id is SkillId.EAT_PLANT:
+        return (
+            alive
+            & (jnp.asarray(state.player_food) + goal.quantity <= MAX_VITAL)
+            & _has_block(state, BlockType.RIPE_PLANT)
         )
     raise AssertionError(f"Unhandled skill: {skill_id}")
 

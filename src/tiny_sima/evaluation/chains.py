@@ -11,7 +11,7 @@ from collections import Counter, deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 
@@ -52,14 +52,17 @@ from tiny_sima.executor.model import (
 from tiny_sima.goals import (
     ALL_SKILL_IDS,
     SKILL_IDS,
+    STONE_PICKAXE_SKILL_IDS,
     SkillGoal,
     SkillId,
     StateRequirement,
     executor_skill_ids,
     get_skill_spec,
+    is_crafting_skill,
     skill_index,
     skill_metric,
     skill_precondition,
+    skill_target_block,
 )
 from tiny_sima.memory import EpisodeMemory
 from tiny_sima.planner.saycan import (
@@ -252,7 +255,7 @@ WOOD_TO_STONE_PICKAXE_CHAIN = SkillChainSpec(
     is_complete=_stone_pickaxe_complete,
     is_complete_jax=_stone_pickaxe_complete_jax,
     valid_next_skills=_stone_pickaxe_valid_next_skills,
-    skills=ALL_SKILL_IDS,
+    skills=STONE_PICKAXE_SKILL_IDS,
     tree_count=4,
     goal=(StateRequirement("inventory.stone_pickaxe", "at_least", 1),),
 )
@@ -313,9 +316,9 @@ STONE_PICKAXE_AND_SWORD_CHAIN = SkillChainSpec(
     is_complete=_stone_pickaxe_and_sword_complete,
     is_complete_jax=_stone_pickaxe_and_sword_complete_jax,
     valid_next_skills=_planned_next_skills(
-        _STONE_PICKAXE_AND_SWORD_GOAL, ALL_SKILL_IDS
+        _STONE_PICKAXE_AND_SWORD_GOAL, STONE_PICKAXE_SKILL_IDS
     ),
-    skills=ALL_SKILL_IDS,
+    skills=STONE_PICKAXE_SKILL_IDS,
     tree_count=5,
     goal=_STONE_PICKAXE_AND_SWORD_GOAL,
 )
@@ -550,15 +553,6 @@ class NavigationTarget(NamedTuple):
     target_direction: int
 
 
-_INTERACTION_BLOCKS = {
-    SkillId.COLLECT_WOOD: BlockType.TREE,
-    SkillId.COLLECT_STONE: BlockType.STONE,
-    SkillId.DRINK_WATER: BlockType.WATER,
-    SkillId.CRAFT_WOOD_PICKAXE: BlockType.CRAFTING_TABLE,
-    SkillId.CRAFT_WOOD_SWORD: BlockType.CRAFTING_TABLE,
-    SkillId.CRAFT_STONE_PICKAXE: BlockType.CRAFTING_TABLE,
-}
-
 _CARDINAL_ACTIONS = (
     Action.LEFT,
     Action.RIGHT,
@@ -575,17 +569,23 @@ def _is_walkable(map_array: np.ndarray, position: tuple[int, int]) -> bool:
     return int(map_array[row, column]) not in blocked
 
 
+def _skill_target_positions(state: Any, skill_id: SkillId) -> set[tuple[int, int]]:
+    if skill_id is SkillId.EAT_COW:
+        positions = np.asarray(state.cows.position)[np.asarray(state.cows.mask)]
+    else:
+        block = skill_target_block(skill_id)
+        assert block is not None, skill_id
+        positions = np.argwhere(np.asarray(state.map) == block.value)
+    return {(int(row), int(column)) for row, column in positions}
+
+
 def _nearest_navigation_target(
     state: Any,
-    block: BlockType,
+    targets: set[tuple[int, int]],
 ) -> NavigationTarget | None:
     map_array = np.asarray(state.map)
     player_position = np.asarray(state.player_position)
     start = (int(player_position[0]), int(player_position[1]))
-    targets = {
-        tuple(int(value) for value in position)
-        for position in np.argwhere(map_array == block.value)
-    }
     if not targets:
         return None
 
@@ -624,12 +624,16 @@ def _nearest_navigation_target(
 
 
 def _scripted_action(state: Any, skill_id: SkillId) -> int:
-    if skill_id is SkillId.PLACE_TABLE:
+    interaction = get_skill_spec(skill_id).interaction_action
+    if skill_id is SkillId.SLEEP:
+        return interaction.value
+    if skill_target_block(skill_id) is None and skill_id is not SkillId.EAT_COW:
+        # A placement: face any free tile and place.
         front = np.asarray(state.player_position) + np.asarray(
             DIRECTIONS[int(state.player_direction)]
         )
         if _is_walkable(np.asarray(state.map), (int(front[0]), int(front[1]))):
-            return Action.PLACE_TABLE.value
+            return interaction.value
         for action in _CARDINAL_ACTIONS:
             candidate = np.asarray(state.player_position) + np.asarray(
                 DIRECTIONS[action.value]
@@ -641,20 +645,23 @@ def _scripted_action(state: Any, skill_id: SkillId) -> int:
                 return action.value
         return Action.NOOP.value
 
-    target = _nearest_navigation_target(state, _INTERACTION_BLOCKS[skill_id])
+    targets = _skill_target_positions(state, skill_id)
+    front = np.asarray(state.player_position) + np.asarray(
+        DIRECTIONS[int(state.player_direction)]
+    )
+    if not is_crafting_skill(skill_id) and (int(front[0]), int(front[1])) in targets:
+        # Turning toward a walkable target such as grass would step onto it.
+        return interaction.value
+    target = _nearest_navigation_target(state, targets)
     if target is None:
         return Action.NOOP.value
     if target.movement_action is not None:
         return target.movement_action
-    if skill_id in {
-        SkillId.CRAFT_WOOD_PICKAXE,
-        SkillId.CRAFT_WOOD_SWORD,
-        SkillId.CRAFT_STONE_PICKAXE,
-    }:
-        return get_skill_spec(skill_id).interaction_action.value
+    if is_crafting_skill(skill_id):
+        return interaction.value
     if int(state.player_direction) != target.target_direction:
         return target.target_direction
-    return Action.DO.value
+    return interaction.value
 
 
 def _start_skill(
@@ -1001,16 +1008,8 @@ def learned_skill_executor_from_checkpoint(
 def _dynamic_skill_metric(skill_id: jax.Array, state: Any) -> jax.Array:
     """Evaluate a categorical skill metric inside compiled control flow."""
 
-    branches = (
-        lambda value: jnp.asarray(value.inventory.wood),
-        lambda value: jnp.asarray(value.inventory.stone),
-        lambda value: jnp.asarray(value.player_drink),
-        lambda value: jnp.count_nonzero(
-            value.map == BlockType.CRAFTING_TABLE.value
-        ),
-        lambda value: jnp.asarray(value.inventory.wood_pickaxe),
-        lambda value: jnp.asarray(value.inventory.wood_sword),
-        lambda value: jnp.asarray(value.inventory.stone_pickaxe),
+    branches = tuple(
+        partial(skill_metric, known_skill) for known_skill in ALL_SKILL_IDS
     )
     return jax.lax.switch(skill_id, branches, state)
 
@@ -1019,50 +1018,11 @@ def _dynamic_skill_precondition(
     skill_id: jax.Array,
     state: Any,
 ) -> jax.Array:
-    """Evaluate fixed skill preconditions for a traced categorical ID."""
+    """Evaluate the one-unit skill preconditions for a traced categorical ID."""
 
-    def collect_wood(value: Any) -> jax.Array:
-        return (jnp.asarray(value.player_health) > 0) & jnp.any(
-            value.map == BlockType.TREE.value
-        )
-
-    def collect_stone(value: Any) -> jax.Array:
-        return (
-            (jnp.asarray(value.player_health) > 0)
-            & (jnp.asarray(value.inventory.wood_pickaxe) > 0)
-            & jnp.any(value.map == BlockType.STONE.value)
-        )
-
-    def drink_water(value: Any) -> jax.Array:
-        return (
-            (jnp.asarray(value.player_health) > 0)
-            & (jnp.asarray(value.player_drink) < 9)
-            & jnp.any(value.map == BlockType.WATER.value)
-        )
-
-    def place_table(value: Any) -> jax.Array:
-        return (jnp.asarray(value.player_health) > 0) & (
-            jnp.asarray(value.inventory.wood) >= 2
-        )
-
-    def craft_wood_tool(value: Any) -> jax.Array:
-        return (
-            (jnp.asarray(value.player_health) > 0)
-            & (jnp.asarray(value.inventory.wood) >= 1)
-            & jnp.any(value.map == BlockType.CRAFTING_TABLE.value)
-        )
-
-    def craft_stone_tool(value: Any) -> jax.Array:
-        return craft_wood_tool(value) & (jnp.asarray(value.inventory.stone) >= 1)
-
-    branches = (
-        collect_wood,
-        collect_stone,
-        drink_water,
-        place_table,
-        craft_wood_tool,
-        craft_wood_tool,
-        craft_stone_tool,
+    branches = tuple(
+        partial(skill_precondition, SkillGoal(known_skill))
+        for known_skill in ALL_SKILL_IDS
     )
     return jax.lax.switch(skill_id, branches, state)
 

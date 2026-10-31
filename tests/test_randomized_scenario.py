@@ -43,6 +43,11 @@ _TARGETS = {
     SkillId.CRAFT_WOOD_PICKAXE: BlockType.CRAFTING_TABLE,
     SkillId.CRAFT_WOOD_SWORD: BlockType.CRAFTING_TABLE,
     SkillId.CRAFT_STONE_PICKAXE: BlockType.CRAFTING_TABLE,
+    SkillId.CRAFT_STONE_SWORD: BlockType.CRAFTING_TABLE,
+    SkillId.COLLECT_COAL: BlockType.COAL,
+    # The cow stands on grass.
+    SkillId.EAT_COW: BlockType.GRASS,
+    SkillId.EAT_PLANT: BlockType.RIPE_PLANT,
 }
 
 

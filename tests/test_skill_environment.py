@@ -26,8 +26,15 @@ from tiny_sima.goals.skills import (
     skill_precondition,
 )
 
+# A sapling drops one time in ten, a cow wanders between hits and sleep
+# takes eleven steps per energy point; test_survival_skills covers them.
+_STOCHASTIC_SKILLS = {SkillId.COLLECT_SAPLING, SkillId.EAT_COW, SkillId.SLEEP}
 
-@pytest.mark.parametrize("skill_id", list(SKILL_REGISTRY))
+
+@pytest.mark.parametrize(
+    "skill_id",
+    [skill_id for skill_id in SKILL_REGISTRY if skill_id not in _STOCHASTIC_SKILLS],
+)
 def test_skill_scenarios_are_feasible_and_scripted_policy_succeeds(
     skill_id: SkillId,
 ) -> None:
@@ -181,7 +188,14 @@ def test_vectorized_local_training_keeps_place_table_nearby() -> None:
     assert scenarios[SkillId.PLACE_TABLE].kind is SkillScenario.NEARBY
 
 
-@pytest.mark.parametrize("skill_id", LOCAL_NAVIGATION_SKILLS)
+@pytest.mark.parametrize(
+    "skill_id",
+    [
+        skill_id
+        for skill_id in LOCAL_NAVIGATION_SKILLS
+        if skill_id not in _STOCHASTIC_SKILLS
+    ],
+)
 def test_local_navigation_scripted_policy_succeeds(
     skill_id: SkillId,
 ) -> None:

@@ -17,7 +17,7 @@ from tiny_sima.evaluation.planner import (
     evaluate_planner_prefixes,
     is_surplus_boundary,
 )
-from tiny_sima.goals import ALL_SKILL_IDS, SkillId
+from tiny_sima.goals import STONE_PICKAXE_SKILL_IDS, SkillId
 from tiny_sima.planner.saycan import (
     PlannerContext,
     SayCanPlanner,
@@ -82,7 +82,8 @@ def _shortfall_first(state, context, skill_id: SkillId) -> float:
     # A Say term that reads nothing but the derived fields: a collection skill
     # that fills some candidate's shortfall.
     del context
-    filled = recipe_entries(state, ALL_SKILL_IDS)[skill_id]["fills_shortfall_of"]
+    entries = recipe_entries(state, STONE_PICKAXE_SKILL_IDS)
+    filled = entries[skill_id]["fills_shortfall_of"]
     return float(skill_id in COLLECTION_SKILLS and bool(filled))
 
 
@@ -107,7 +108,7 @@ def test_shortfall_reads_the_declared_inventory_requirements() -> None:
 
 
 def test_recipe_entries_say_which_resource_is_still_short() -> None:
-    entries = recipe_entries(_surplus_state(), ALL_SKILL_IDS)
+    entries = recipe_entries(_surplus_state(), STONE_PICKAXE_SKILL_IDS)
 
     assert entries[SkillId.CRAFT_STONE_PICKAXE]["inventory_shortfall"] == {
         "inventory.wood": 1
@@ -122,7 +123,7 @@ def test_recipe_entries_say_which_resource_is_still_short() -> None:
     assert entries[SkillId.CRAFT_STONE_PICKAXE]["result_held"] is False
 
     # At reset, wood fills every craft and the wood pickaxe fills stone.
-    reset = recipe_entries(_state(), ALL_SKILL_IDS)
+    reset = recipe_entries(_state(), STONE_PICKAXE_SKILL_IDS)
     assert reset[SkillId.COLLECT_WOOD]["fills_shortfall_of"] == [
         "place_table",
         "craft_wood_pickaxe",

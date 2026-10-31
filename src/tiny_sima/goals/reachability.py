@@ -36,10 +36,13 @@ import jax.numpy as jnp
 from craftax.craftax_classic.constants import OBS_DIM, BlockType
 
 from tiny_sima.goals.skills import (
+    MAX_VITAL,
     SKILL_IDS,
     SkillGoal,
     SkillId,
+    is_crafting_skill,
     skill_precondition,
+    skill_target_block,
 )
 
 # Blocks the player can occupy. ``SOLID_BLOCKS`` covers everything that blocks
@@ -300,21 +303,42 @@ def _skill_target(
 ) -> tuple[jax.Array, bool]:
     """Return the interaction target mask and adjacency rule for a skill."""
 
-    if skill_id is SkillId.COLLECT_WOOD:
-        return block_mask(state, BlockType.TREE), False
-    if skill_id is SkillId.COLLECT_STONE:
-        return block_mask(state, BlockType.STONE), False
-    if skill_id is SkillId.DRINK_WATER:
-        return block_mask(state, BlockType.WATER), False
-    if skill_id is SkillId.PLACE_TABLE:
+    if skill_id is SkillId.EAT_COW:
+        return _cow_mask(state), False
+    block = skill_target_block(skill_id)
+    if block is None:
+        # The placements need only a free tile to face.
         return _placement_mask(state), False
-    if skill_id in {
-        SkillId.CRAFT_WOOD_PICKAXE,
-        SkillId.CRAFT_WOOD_SWORD,
-        SkillId.CRAFT_STONE_PICKAXE,
-    }:
-        return block_mask(state, BlockType.CRAFTING_TABLE), True
-    raise AssertionError(f"Unhandled skill: {skill_id}")
+    # Crafting needs a table nearby, diagonals included.
+    return block_mask(state, block), is_crafting_skill(skill_id)
+
+
+def _cow_mask(state: Any) -> jax.Array:
+    """Return the tiles a live cow stands on."""
+
+    positions = jnp.asarray(state.cows.position)
+    return (
+        jnp.zeros(jnp.asarray(state.map).shape, dtype=jnp.bool_)
+        .at[positions[:, 0], positions[:, 1]]
+        .max(jnp.asarray(state.cows.mask))
+    )
+
+
+# Asleep, energy rises one point per eleven steps, and the player wakes once
+# it is full.
+SLEEP_STEPS_PER_ENERGY = 11
+
+
+def sleep_steps(state: Any) -> jax.Array:
+    """Return the steps from pressing sleep to waking rested.
+
+    Asleep, fatigue first drops to zero and then counts down; from one or
+    more that first drop takes a step of its own.
+    """
+
+    missing = jnp.maximum(MAX_VITAL - jnp.asarray(state.player_energy), 0)
+    fatigued = jnp.asarray(state.player_fatigue) >= 1
+    return (SLEEP_STEPS_PER_ENERGY * missing + 1 + fatigued).astype(jnp.int32)
 
 
 def skill_interaction_distance(
@@ -324,8 +348,13 @@ def skill_interaction_distance(
     *,
     distances: jax.Array | None = None,
 ) -> jax.Array:
-    """Return a lower bound on the steps one skill needs from this state."""
+    """Return a lower bound on the steps one skill needs from this state.
 
+    Sleeping needs no target, only the time to recover the missing energy.
+    """
+
+    if goal.skill_id is SkillId.SLEEP:
+        return sleep_steps(state)
     target_mask, diagonal = _skill_target(goal.skill_id, state)
     return interaction_distance(
         state,

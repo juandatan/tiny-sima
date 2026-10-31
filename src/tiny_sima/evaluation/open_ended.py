@@ -38,7 +38,7 @@ from tiny_sima.evaluation.chains import (
     chain_episode_record,
     evaluate_chain_episodes,
 )
-from tiny_sima.goals import ALL_SKILL_IDS, SkillId
+from tiny_sima.goals import STONE_PICKAXE_SKILL_IDS, SkillId
 from tiny_sima.planner.competence import CompetencePrior
 from tiny_sima.planner.goal_selector import ScriptedGoalSelector
 from tiny_sima.planner.observation import ObservationConfig
@@ -115,7 +115,7 @@ OPEN_ENDED_CHAIN = SkillChainSpec(
     objective=OPEN_ENDED_OBJECTIVE,
     reference_skills=(),
     is_complete=_never_complete,
-    skills=ALL_SKILL_IDS,
+    skills=STONE_PICKAXE_SKILL_IDS,
     tree_count=0,
 )
 

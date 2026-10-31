@@ -43,6 +43,7 @@ from typing import Any, Literal
 
 from tiny_sima.goals import (
     ALL_SKILL_IDS,
+    STONE_PICKAXE_SKILL_IDS,
     SkillId,
     SkillMechanics,
     StateEffect,
@@ -53,6 +54,7 @@ from tiny_sima.memory import TransitionRecord
 from tiny_sima.planner.symbolic import (
     DEFAULT_MAX_PLAN_LENGTH,
     PLANNER_FIELDS,
+    STONE_PICKAXE_FIELDS,
     SkillModel,
     _blocked_reason,
     _first_steps,
@@ -73,6 +75,9 @@ from tiny_sima.planner.vlm import (
 # The fields a skill may read or change: every planner field except the
 # achievements, which each skill's unlock effect covers on its own.
 INDUCTION_FIELDS: tuple[str, ...] = tuple(
+    field for field in STONE_PICKAXE_FIELDS if not field.startswith("achievement.")
+)
+_ALL_INDUCTION_FIELDS: tuple[str, ...] = tuple(
     field for field in PLANNER_FIELDS if not field.startswith("achievement.")
 )
 INVENTORY_FIELDS: tuple[str, ...] = tuple(
@@ -80,6 +85,18 @@ INVENTORY_FIELDS: tuple[str, ...] = tuple(
 )
 # Fields a transition record reads: inventory counts and the drink level.
 OBSERVED_FIELDS: tuple[str, ...] = (*INVENTORY_FIELDS, "survival.drink")
+
+
+def induction_fields(skills: Sequence[SkillId]) -> tuple[str, ...]:
+    """Return the fields an induction over ``skills`` offers by default.
+
+    The stone-pickaxe catalog keeps the fields it was recorded with; any later
+    skill brings in the survival levels and the blocks it needs.
+    """
+
+    if set(skills) <= set(STONE_PICKAXE_SKILL_IDS):
+        return INDUCTION_FIELDS
+    return _ALL_INDUCTION_FIELDS
 
 MAX_INDUCED_VALUE = 9
 MAX_INDUCED_ITEMS = 4
@@ -96,12 +113,13 @@ _ANALYSIS_MAX_LENGTH = 160
 MANUAL_PATH = Path(__file__).resolve().parents[3] / "docs" / "craftax_classic_manual.md"
 
 # The state at a Craftax-Classic reset, as the planner reads it: nothing held,
-# drink full, trees, stone, water and free ground about, and no table yet.
+# vitals full, trees, stone, coal, water, grass, cows and free ground about,
+# and no table, furnace or ripe plant yet.
 EPISODE_START: tuple[tuple[str, int], ...] = tuple(
     (
         field,
         9
-        if field == "survival.drink"
+        if field in {"survival.drink", "survival.food", "survival.energy"}
         else int(
             field
             in {
@@ -109,6 +127,9 @@ EPISODE_START: tuple[tuple[str, int], ...] = tuple(
                 "world.stone_reachable",
                 "world.water_reachable",
                 "world.placement_space_reachable",
+                "world.coal_reachable",
+                "world.grass_reachable",
+                "world.cow_reachable",
             }
         ),
     )
@@ -513,9 +534,9 @@ def _skill_lines(
 
 
 def build_induction_prompt(
-    skills: Sequence[SkillId] = ALL_SKILL_IDS,
+    skills: Sequence[SkillId] = STONE_PICKAXE_SKILL_IDS,
     *,
-    fields: Sequence[str] = INDUCTION_FIELDS,
+    fields: Sequence[str] | None = None,
     descriptions: Mapping[SkillId, str] | None = None,
     start: Mapping[str, int] | None = None,
 ) -> str:
@@ -524,6 +545,8 @@ def build_induction_prompt(
     Each field is listed with its value at ``start``, which defaults to
     :data:`EPISODE_START` as in :func:`validate_model`.
     """
+    if fields is None:
+        fields = induction_fields(skills)
 
     values = dict(EPISODE_START)
     values.update(start or {})
@@ -588,8 +611,8 @@ def _item_types(fields: tuple[str, ...], max_value: int) -> tuple[Any, Any]:
 
 @lru_cache(maxsize=8)
 def induction_output_type(
-    skills: tuple[SkillId, ...] = ALL_SKILL_IDS,
-    fields: tuple[str, ...] = INDUCTION_FIELDS,
+    skills: tuple[SkillId, ...] = STONE_PICKAXE_SKILL_IDS,
+    fields: tuple[str, ...] | None = None,
     max_items: int = MAX_INDUCED_ITEMS,
     max_value: int = MAX_INDUCED_VALUE,
 ) -> Any:
@@ -599,6 +622,8 @@ def induction_output_type(
     exactly once; fields come from ``fields`` and values are bounded. Each
     skill needs at least one effect.
     """
+    if fields is None:
+        fields = induction_fields(skills)
 
     if not skills:
         raise ValueError("skills cannot be empty.")
@@ -728,9 +753,9 @@ class InducedModel:
 
 def parse_induced_model(
     text: str,
-    skills: Sequence[SkillId] = ALL_SKILL_IDS,
+    skills: Sequence[SkillId] = STONE_PICKAXE_SKILL_IDS,
     *,
-    fields: Sequence[str] = INDUCTION_FIELDS,
+    fields: Sequence[str] | None = None,
 ) -> InducedModel:
     """Parse an induction answer into a model, without trusting its entries.
 
@@ -741,6 +766,8 @@ def parse_induced_model(
     registry_model`. The answer is invalid only when it is not a JSON object
     or answers no skill.
     """
+    if fields is None:
+        fields = induction_fields(skills)
 
     payload = _json_object(text)
     if payload is None:
@@ -783,13 +810,15 @@ def _induction_request(
 def build_repair_prompt(
     induced: InducedModel,
     report: ValidationReport,
-    skills: Sequence[SkillId] = ALL_SKILL_IDS,
+    skills: Sequence[SkillId] = STONE_PICKAXE_SKILL_IDS,
     *,
-    fields: Sequence[str] = INDUCTION_FIELDS,
+    fields: Sequence[str] | None = None,
     descriptions: Mapping[SkillId, str] | None = None,
     start: Mapping[str, int] | None = None,
 ) -> str:
     """Return the induction prompt with the previous model and its violations."""
+    if fields is None:
+        fields = induction_fields(skills)
 
     problems = [str(violation) for violation in report.violations]
     problems.extend(induced.problems)
@@ -820,10 +849,10 @@ def _validated(
 
 def induce_models(
     backend: VisionLanguageBackend,
-    skills: Sequence[SkillId] = ALL_SKILL_IDS,
+    skills: Sequence[SkillId] = STONE_PICKAXE_SKILL_IDS,
     *,
     manual: str | None = None,
-    fields: Sequence[str] = INDUCTION_FIELDS,
+    fields: Sequence[str] | None = None,
     descriptions: Mapping[SkillId, str] | None = None,
     repeats: int = 1,
     start: Mapping[str, int] | None = None,
@@ -833,6 +862,8 @@ def induce_models(
     The request is text only. Repeats differ only when the backend samples;
     under greedy decoding one is enough.
     """
+    if fields is None:
+        fields = induction_fields(skills)
 
     if repeats < 1:
         raise ValueError("repeats must be positive.")
@@ -1248,10 +1279,10 @@ def repair_model(
 
 def induce_model(
     backend: VisionLanguageBackend,
-    skills: Sequence[SkillId] = ALL_SKILL_IDS,
+    skills: Sequence[SkillId] = STONE_PICKAXE_SKILL_IDS,
     *,
     manual: str | None = None,
-    fields: Sequence[str] = INDUCTION_FIELDS,
+    fields: Sequence[str] | None = None,
     descriptions: Mapping[SkillId, str] | None = None,
     repeats: int = 1,
     repair: bool = False,
@@ -1269,6 +1300,8 @@ def induce_model(
     ``drop_invalid``, skills still failing are removed, see
     :func:`drop_invalid_skills`.
     """
+    if fields is None:
+        fields = induction_fields(skills)
 
     manual_text = manual if manual is not None else load_manual()
     candidates = induce_models(
@@ -1626,7 +1659,7 @@ def gain_fields(model: SkillModel) -> tuple[str, ...]:
         for effect in mechanics.effects
         if effect.operation in ("increase", "set") and not _is_achievement(effect.field)
     }
-    return tuple(field for field in INDUCTION_FIELDS if field in gained)
+    return tuple(field for field in _ALL_INDUCTION_FIELDS if field in gained)
 
 
 @lru_cache(maxsize=16)

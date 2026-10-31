@@ -75,6 +75,7 @@ COLLECT_RESOURCES: dict[SkillId, str] = {
     SkillId.COLLECT_WOOD: "tree",
     SkillId.COLLECT_STONE: "stone",
     SkillId.DRINK_WATER: "water",
+    SkillId.COLLECT_COAL: "coal",
 }
 
 _WORLD_FACTS = {f"world.{block}_reachable": block for block in RESOURCE_BLOCKS}
@@ -473,7 +474,8 @@ class EpisodeMemory:
         evidence it is absent. A block only the agent places, such as a
         crafting table, counts only once one is known, because a generated map
         holds none. ``None`` means the field is not a world fact this memory
-        answers.
+        answers. Grass, like free ground, is everywhere, and cows keep spawning
+        on it, so those count as obtainable too.
         """
 
         block = _WORLD_FACTS.get(field)
@@ -481,7 +483,11 @@ class EpisodeMemory:
             if block in PLACED_BLOCKS:
                 return int(bool(self.positions(block)))
             return int(not self.ruled_out(block))
-        if field == "world.placement_space_reachable":
+        if field in {
+            "world.placement_space_reachable",
+            "world.grass_reachable",
+            "world.cow_reachable",
+        }:
             return 1
         return None
 

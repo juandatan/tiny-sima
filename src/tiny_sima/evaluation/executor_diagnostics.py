@@ -29,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 from craftax.craftax_classic.constants import DIRECTIONS, Action, BlockType
 
-from tiny_sima.envs.skills import _scenario_inventory
+from tiny_sima.envs.skills import _scenario_inventory, scenario_vitals
 from tiny_sima.evaluation.chains import (
     STONE_PICKAXE_AND_SWORD_CHAIN,
     TERSE_STONE_PICKAXE_CHAIN,
@@ -47,10 +47,13 @@ from tiny_sima.evaluation.goal_conditioned import evaluate_goal_conditioned_poli
 from tiny_sima.goals import (
     ALL_SKILL_IDS,
     DEFAULT_REACHABILITY,
+    MAX_VITAL,
     OBSERVATION_RADIUS,
     SkillGoal,
     SkillId,
+    is_crafting_skill,
     skill_interaction_distance,
+    skill_target_block,
     travel_distance_map,
     view_mask,
     walkable_mask,
@@ -105,22 +108,12 @@ COLLECT_FIRST_PLANS: dict[str, tuple[SkillId, ...]] = {
 # comparisons never select on worlds the planner ladder was tuned against.
 EXECUTOR_BENCHMARK_SEED = 101
 
-TARGET_BLOCKS: dict[SkillId, BlockType] = {
-    SkillId.COLLECT_WOOD: BlockType.TREE,
-    SkillId.COLLECT_STONE: BlockType.STONE,
-    SkillId.DRINK_WATER: BlockType.WATER,
-    SkillId.CRAFT_WOOD_PICKAXE: BlockType.CRAFTING_TABLE,
-    SkillId.CRAFT_WOOD_SWORD: BlockType.CRAFTING_TABLE,
-    SkillId.CRAFT_STONE_PICKAXE: BlockType.CRAFTING_TABLE,
-}
+def _diagnostic_target(skill_id: SkillId) -> BlockType | None:
+    # Grass is everywhere, so the planting skills have no telling target.
+    block = skill_target_block(skill_id)
+    return None if block is BlockType.GRASS else block
 
-_CRAFTING_SKILLS = frozenset(
-    {
-        SkillId.CRAFT_WOOD_PICKAXE,
-        SkillId.CRAFT_WOOD_SWORD,
-        SkillId.CRAFT_STONE_PICKAXE,
-    }
-)
+
 _MOVEMENT_ACTIONS = frozenset(
     {Action.LEFT.value, Action.RIGHT.value, Action.UP.value, Action.DOWN.value}
 )
@@ -222,7 +215,7 @@ def _cleared_window(state: Any) -> jax.Array:
 
 def _target_mask(state: Any, skill_id: SkillId) -> jax.Array:
     world_map = jnp.asarray(state.map)
-    block = TARGET_BLOCKS.get(skill_id)
+    block = _diagnostic_target(skill_id)
     if block is None:
         return jnp.zeros(world_map.shape, dtype=jnp.bool_)
     return world_map == block.value
@@ -415,14 +408,16 @@ def _training_inventory(state: Any, skill_id: SkillId) -> Any:
 
 
 def _training_vitals(state: Any, skill_id: SkillId) -> Any:
+    food, drink, energy = scenario_vitals(skill_id)
+
+    def like(value: int, current: Any) -> jax.Array:
+        return jnp.asarray(value, dtype=jnp.asarray(current).dtype)
+
     return state.replace(
-        player_health=jnp.asarray(9, dtype=jnp.asarray(state.player_health).dtype),
-        player_food=jnp.asarray(9, dtype=jnp.asarray(state.player_food).dtype),
-        player_drink=jnp.asarray(
-            5 if skill_id is SkillId.DRINK_WATER else 9,
-            dtype=jnp.asarray(state.player_drink).dtype,
-        ),
-        player_energy=jnp.asarray(9, dtype=jnp.asarray(state.player_energy).dtype),
+        player_health=like(MAX_VITAL, state.player_health),
+        player_food=like(food, state.player_food),
+        player_drink=like(drink, state.player_drink),
+        player_energy=like(energy, state.player_energy),
     )
 
 
@@ -434,7 +429,9 @@ def _training_clock(state: Any, skill_id: SkillId) -> Any:
     )
 
 
-_NON_TABLE_SKILLS = frozenset(set(ALL_SKILL_IDS) - _CRAFTING_SKILLS)
+_NON_TABLE_SKILLS = frozenset(
+    skill_id for skill_id in ALL_SKILL_IDS if not is_crafting_skill(skill_id)
+)
 
 COUNTERFACTUAL_EDITS: tuple[CounterfactualEdit, ...] = (
     CounterfactualEdit(
@@ -600,14 +597,14 @@ def rollout_features(
     only the movement features.
     """
 
-    block = TARGET_BLOCKS.get(skill_id)
+    block = _diagnostic_target(skill_id)
     targets = (
         np.zeros((0, 2), dtype=np.int64)
         if block is None
         else np.argwhere(np.asarray(state.map) == block.value)
     )
     target_set = {(int(row), int(column)) for row, column in targets}
-    diagonal = skill_id in _CRAFTING_SKILLS
+    diagonal = is_crafting_skill(skill_id)
     steps = trace.probe.steps
     start_position = np.asarray(state.player_position, dtype=np.int64)
     start_direction = int(np.asarray(state.player_direction))

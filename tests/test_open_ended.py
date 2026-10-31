@@ -23,7 +23,7 @@ from tiny_sima.evaluation import (
     open_ended_planners,
     summarize_open_ended,
 )
-from tiny_sima.goals import ALL_SKILL_IDS
+from tiny_sima.goals import ALL_SKILL_IDS, STONE_PICKAXE_SKILL_IDS
 from tiny_sima.memory import EpisodeMemory
 from tiny_sima.planner import (
     NOTHING_TO_DO,
@@ -247,7 +247,7 @@ def test_selector_reads_world_facts_from_memory() -> None:
 
 
 def test_open_ended_fields_offer_only_the_achievements_skills_unlock() -> None:
-    fields = open_ended_subgoal_fields(ALL_SKILL_IDS)
+    fields = open_ended_subgoal_fields(STONE_PICKAXE_SKILL_IDS)
 
     assert "achievement.make_stone_pickaxe" in fields
     assert "achievement.collect_drink" in fields

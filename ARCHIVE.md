@@ -2,8 +2,9 @@
 
 Material moved out of [README.md](README.md) on October 21, 2026, when the
 README was reduced to the current findings and status; on October 22, when the
-executor-improvement phase finished; and on October 28, when the README moved
-to the Phase 4b sub-goal setup. Everything here was accurate when it
+executor-improvement phase finished; on October 28, when the README moved
+to the Phase 4b sub-goal setup; and on October 31, when Phase 4b was
+measured. Everything here was accurate when it
 was written. Later runs supersede some of it: condition names changed on
 October 20, the executor changed on October 22, and the README's tables hold
 the latest numbers.
@@ -29,6 +30,8 @@ Contents:
   the full stone-pickaxe tables, the six-skill ablations and feasibility
   probes with the randomized executor, the executor-improvement result, and
   the Phase 4 closing diagnosis and work items, as of October 26, 2026.
+- [README material moved on October 31, 2026](#readme-material-moved-on-october-31-2026):
+  the Phase 4 baselines table and the Phase 4b plan as of October 28.
 - [Changelog](#changelog): dated status entries from October 8, 2026 onward.
 
 ## Phase 1 measurements
@@ -768,9 +771,9 @@ with the notebook; notebook 06's candidate path confirms the choice.
 
 The README's Phase 4 sections as of October 26, 2026, moved here on
 October 28 when the README switched to the Phase 4b sub-goal setup. In
-Phase 4 the VLM chose every skill directly. The README keeps a summary of the
-stone-pickaxe results, which are the per-turn arm and the plan-veto upper
-bound that Phase 4b is compared against.
+Phase 4 the VLM chose every skill directly. The README's summary of the
+stone-pickaxe results followed on October 31, to
+[Phase 4 baselines as of October 28, 2026](#phase-4-baselines-as-of-october-28-2026).
 
 ### Stone-pickaxe chain, seed 51
 
@@ -1258,6 +1261,92 @@ time.
    `subgoal_loop_seed51_n64.json` beside the checkpoint.
 
 **The bar** stays the collect-first scripted plan on each chain.
+
+## README material moved on October 31, 2026
+
+These are the README's Phase 4 baselines and its Phase 4b plan as of
+October 28, 2026. They moved here once Phase 4b was measured on the GPU. The
+README's [Phase 4b results](README.md#phase-4b-results) rerun the per-turn
+arm, the plan veto and the scripted plans with provenance, and they
+supersede the table below.
+
+### Phase 4 baselines as of October 28, 2026
+
+This is the per-turn arm and the upper bound that Phase 4b was to be
+compared against. They come from notebook 06 on seed 51, with the
+seven-skill `randomized-seed2` executor, on the stone-pickaxe chain: 8
+skills, 16 decisions, 64 paired episodes.
+
+| Condition | Closed-loop success | Decision limit |
+| --- | ---: | ---: |
+| `scripted_oracle` | 0.969 | 0 |
+| `scripted_collect_first` (the bar) | 1.000 | 0 |
+| `baseline_plus_reachability` | 0.453 | 34 |
+| `objective_first_plus_reachability` | 0.547 | 29 |
+| `recipe_aware_plus_competence_prior`, best per-turn | 0.672 | 20 |
+| `baseline_plus_plan`, plan veto | 0.984 | 0 |
+| `recipe_aware_plus_plan`, plan veto | 1.000 | 0 |
+| `plan_only_plus_reachability`, plan veto without a VLM | 1.000 | 0 |
+
+What the Phase 4 runs established:
+
+- **Grounding has to come from somewhere.** The ungrounded prompt with no
+  Can term solves 2 of 64.
+- **The planner's sequencing, not the executor, sets the ceiling.** Every
+  per-turn failure ends at the decision limit, on surplus resources, held
+  tools, or a stall before an out-of-view target.
+- **Each prompt fix moved the mistakes rather than removing them.**
+  `objective_first` fixed the out-of-view stall. `recipe_aware` fixed the
+  search states but not the counting.
+- **The plan veto removes every off-objective decision.** With it in place,
+  the VLM adds nothing on this chain: `plan_only` against `baseline_plus_plan`
+  is 1 discordant pair against 0.
+- **Single runs are noisy at this size.** Repeat runs moved closed loops by
+  1 to 3 episodes.
+- **The competence prior is informative on this executor.** Held out, its AUC
+  is 0.917. The critic's is 0.457.
+
+The notebook 06 cells that produced them were removed once Phase 4 closed.
+They are at commit `282ef35`.
+
+### Phase 4b experiments as planned
+
+The two experiments that have since run, as the README described them:
+
+1. **Phase 4b on the chains.** Notebook 06, section "Phase 4b", on seed 51
+   with the seven-skill executor. It runs three conditions on the
+   stone-pickaxe, terse and pickaxe-and-sword chains:
+   - `subgoal_formal_goal`, the hierarchy's ceiling under the memory belief;
+   - `subgoal_vlm_memory`;
+   - `subgoal_vlm_map_scan`.
+
+   Results go to `subgoal_loop_seed51_n64.json` beside the checkpoint. Read
+   `subgoal_formal_goal` first. Then pair `subgoal_vlm_memory` against the
+   per-turn arm and the plan veto.
+2. **The open-ended task.** Notebook 08 runs the three designs with
+   creatures off and on. It defaults to 4 episodes per design and setting,
+   because a sub-goal design can ask the VLM up to three times per decision;
+   raise `NUM_EPISODES` for the comparison. Results go to
+   `runs/open-ended/`.
+
+The next steps were, in order:
+
+1. **Run the experiments**, then confirm the chain results on seed 202 with
+   `CONFIRM = True`.
+2. **Add the survival and hard-tier skills, to cover all of Craftax-Classic.**
+   Survival first, since the open-ended runs with creatures will show what
+   kills the agent:
+   - eat a cow, sleep, and place and eat a plant;
+   - then stone tools, furnace, coal, iron and diamond;
+   - then combat.
+
+   Each needs registry entries, scenario support and executor training.
+   About 3M steps per added stage should suffice, since training success
+   reached 0.988 in every randomized seed by 2.15M steps.
+3. **The Qwen3-VL-8B scaling test**, once the 2B results are in.
+
+The survival and stone-tier skills were then added in one step, so the
+executor trains once: see the October 31 changelog entry.
 
 ## Changelog
 
@@ -1775,3 +1864,58 @@ Notebook 06 trimmed to Phase 4b on October 28, 2026:
   model learning. Phase 4b rebuilds the per-turn arms it is paired against:
   the scripted plans, `recipe_aware_plus_competence_prior` and
   `recipe_aware_plus_plan`.
+
+Phase 4b measured on the chains, October 29 to 31, 2026:
+
+- The 2B sub-goal planner repeated sub-goals that already held until its
+  rejection rounds ran out. Feedback now names held sub-goals and their
+  values (`a86fe31`) and the ones re-proposed after being reported held
+  (`e50ea85`). It also rejects `at_least` below 1 as always true
+  (`95cce9a`).
+- Saved results record their provenance and commit, and a baseline is
+  reused only when its provenance matches (`d637e26`). Notebook 06 gained
+  the `incremental` preset, and notebook 08 gained `REUSE_DESIGNS`.
+- Notebook 06 `incremental` at `e50ea85`. On seed 51, `subgoal_vlm_memory`
+  solved 64 of 64 on all three chains, against 45, 63 and 1 for
+  `recipe_aware_plus_competence_prior`. Seed 202 confirmed it, against 49, 63
+  and 2.
+
+Open-ended task measured, October 31, 2026:
+
+- Notebook 08 on seed 51 with Qwen3-VL-2B at `e50ea85`. The sub-goal VLM
+  reached 4.88 and 4.94 achievements per episode, against 6.88 and 6.94 for
+  the curriculum. It had spent its retries on achievements no skill
+  produces.
+- The open-ended sub-goals now offer only the achievements the skills
+  unlock (`d8e4d70`). The sub-goal VLM rose to 6.38 and 6.44.
+- Added `configs/vlm_planner_qwen3_8b.yaml` and ran notebook 08 with
+  Qwen3-VL-8B on seeds 51 and 202 (`6ff3b5d`, `7853c8d`). The notebooks now
+  keep the Hugging Face cache on the shared volume. The README's
+  [Phase 4b results](README.md#phase-4b-results) have the tables.
+
+Sixteen skills added on October 31, 2026 (`740103b`):
+
+- Added nine skills after `craft_stone_pickaxe`, in one step so the executor
+  trains once instead of once per stage:
+  - `craft_stone_sword`
+  - `collect_coal`
+  - `place_stone`
+  - `place_furnace`
+  - `collect_sapling`
+  - `place_plant`
+  - `eat_cow`
+  - `sleep`
+  - `eat_plant`
+
+  Each has registry entries, scenario support and planner rules. Sleep
+  length follows fatigue, and the eat effects match Craftax: +6 food for a
+  cow and +4 for a plant, capped at 9.
+- Added the `sixteen_skill_smoke` and `sixteen_skill` presets to notebook
+  07, with 256 environments and 26M steps.
+- Per-skill tables across evaluation and planning now derive from the
+  registry. The chain switches branch over every skill, because
+  `lax.switch` clamps an out-of-range index to the last branch.
+- Memory treats cows as obtainable. Model induction offers the survival
+  fields to sixteen-skill models.
+- Notebook 03 benchmarks the new skills at horizon 16. Notebook 08 offers
+  every skill the selected executor knows.

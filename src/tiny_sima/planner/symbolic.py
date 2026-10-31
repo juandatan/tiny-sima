@@ -42,6 +42,7 @@ from tiny_sima.goals import (
     ACHIEVEMENT_FIELDS,
     ALL_SKILL_IDS,
     SKILL_ACHIEVEMENTS,
+    STONE_PICKAXE_SKILL_IDS,
     SkillId,
     SkillMechanics,
     StateEffect,
@@ -68,19 +69,45 @@ SkillModel = tuple[tuple[SkillId, SkillMechanics], ...]
 # stops the search when the goal cannot be reached at all.
 DEFAULT_MAX_PLAN_LENGTH = 16
 
+_STONE_PICKAXE_BLOCKS = (
+    BlockType.TREE,
+    BlockType.STONE,
+    BlockType.WATER,
+    BlockType.CRAFTING_TABLE,
+)
+# Blocks the later skills mine, use or eat from, read like those above.
+_LATER_BLOCKS = (
+    BlockType.COAL,
+    BlockType.FURNACE,
+    BlockType.RIPE_PLANT,
+    BlockType.GRASS,
+)
+
+
+def _world_field(block: BlockType) -> str:
+    return f"world.{block.name.lower()}_reachable"
+
+
 _WORLD_BLOCKS = {
-    "world.tree_reachable": BlockType.TREE,
-    "world.stone_reachable": BlockType.STONE,
-    "world.water_reachable": BlockType.WATER,
-    "world.crafting_table_reachable": BlockType.CRAFTING_TABLE,
+    _world_field(block): block for block in (*_STONE_PICKAXE_BLOCKS, *_LATER_BLOCKS)
 }
 
-PLANNER_FIELDS: tuple[str, ...] = (
+# The fields the seven stone-pickaxe-stage skills read and change. The
+# induction prompts list these, so they stay as they were recorded.
+STONE_PICKAXE_FIELDS: tuple[str, ...] = (
     *(f"inventory.{item.name}" for item in dataclasses.fields(Inventory)),
     "survival.drink",
     "world.placement_space_reachable",
-    *_WORLD_BLOCKS,
+    *map(_world_field, _STONE_PICKAXE_BLOCKS),
     *ACHIEVEMENT_FIELDS,
+)
+
+PLANNER_FIELDS: tuple[str, ...] = (
+    *STONE_PICKAXE_FIELDS,
+    "survival.food",
+    "survival.energy",
+    *map(_world_field, _LATER_BLOCKS),
+    "world.cow_reachable",
 )
 
 _ACHIEVEMENTS = {
@@ -115,7 +142,9 @@ def registry_model(skills: Sequence[SkillId] = ALL_SKILL_IDS) -> SkillModel:
     )
 
 
-REGISTRY_MODEL: SkillModel = registry_model()
+# The stone-pickaxe stage's catalog, which the recorded model-learning runs
+# corrupt and compare against.
+REGISTRY_MODEL: SkillModel = registry_model(STONE_PICKAXE_SKILL_IDS)
 
 
 class WorldBelief(Protocol):
@@ -139,6 +168,10 @@ def read_field(state: Any, field: str, belief: WorldBelief | None = None) -> int
         return int(np.asarray(getattr(state.inventory, name)))
     if field == "survival.drink":
         return int(np.asarray(state.player_drink))
+    if field == "survival.food":
+        return int(np.asarray(state.player_food))
+    if field == "survival.energy":
+        return int(np.asarray(state.player_energy))
     if field in _ACHIEVEMENTS:
         return int(np.asarray(state.achievements[_ACHIEVEMENTS[field].value]))
     if belief is not None and field.startswith("world."):
@@ -149,6 +182,8 @@ def read_field(state: Any, field: str, belief: WorldBelief | None = None) -> int
         return int(bool(np.any(np.asarray(walkable_mask(state)))))
     if field in _WORLD_BLOCKS:
         return int(bool(np.any(np.asarray(state.map) == _WORLD_BLOCKS[field].value)))
+    if field == "world.cow_reachable":
+        return int(bool(np.any(np.asarray(state.cows.mask))))
     raise ValueError(f"No symbolic reading for registry field {field!r}.")
 
 
@@ -273,7 +308,7 @@ def _restrict(
 def shortest_plan(
     state: Any,
     goal: GoalCondition,
-    candidate_skills: Sequence[SkillId] = ALL_SKILL_IDS,
+    candidate_skills: Sequence[SkillId] = STONE_PICKAXE_SKILL_IDS,
     *,
     model: SkillModel | None = None,
     belief: WorldBelief | None = None,
@@ -297,7 +332,7 @@ def shortest_plan(
 def plan_next_skills(
     state: Any,
     goal: GoalCondition,
-    candidate_skills: Sequence[SkillId] = ALL_SKILL_IDS,
+    candidate_skills: Sequence[SkillId] = STONE_PICKAXE_SKILL_IDS,
     *,
     model: SkillModel | None = None,
     belief: WorldBelief | None = None,
@@ -422,7 +457,7 @@ def _blocked_reason(
 def check_subgoal(
     state: Any,
     subgoal: GoalCondition,
-    candidate_skills: Sequence[SkillId] = ALL_SKILL_IDS,
+    candidate_skills: Sequence[SkillId] = STONE_PICKAXE_SKILL_IDS,
     *,
     model: SkillModel | None = None,
     belief: WorldBelief | None = None,
@@ -502,7 +537,7 @@ class PlanProgressFeasibility:
     goal: GoalCondition
     base: FeasibilityScorer | BatchedFeasibilityScorer = reachability_feasibility
     off_plan: float = 0.0
-    skills: tuple[SkillId, ...] = ALL_SKILL_IDS
+    skills: tuple[SkillId, ...] = STONE_PICKAXE_SKILL_IDS
     model: SkillModel | None = None
 
     def score_all_feasibility(

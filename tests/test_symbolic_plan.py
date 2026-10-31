@@ -23,6 +23,7 @@ from tiny_sima.goals import (
     ACHIEVEMENT_FIELDS,
     ALL_SKILL_IDS,
     SKILL_ACHIEVEMENTS,
+    STONE_PICKAXE_SKILL_IDS,
     SkillId,
     SkillMechanics,
     StateEffect,
@@ -289,8 +290,8 @@ def _cheap_table_model(model: SkillModel) -> SkillModel:
 
 def test_registry_model_is_the_default() -> None:
     chain = WOOD_TO_STONE_PICKAXE_CHAIN
-    assert registry_model() == REGISTRY_MODEL
-    assert [skill_id for skill_id, _ in REGISTRY_MODEL] == list(ALL_SKILL_IDS)
+    assert registry_model(STONE_PICKAXE_SKILL_IDS) == REGISTRY_MODEL
+    assert [skill_id for skill_id, _ in REGISTRY_MODEL] == list(STONE_PICKAXE_SKILL_IDS)
     for point in _points(collect_prefix_trajectory(chain=chain, num_episodes=2)):
         assert shortest_plan(
             point.state, _goal(chain), chain.skills, model=REGISTRY_MODEL
@@ -505,7 +506,7 @@ def test_skill_achievements_match_the_game() -> None:
     assert drank.outcome is SkillOutcome.SUCCESS
     assert _unlocked(drank.state) - _unlocked(thirsty) == {"achievement.collect_drink"}
     executed.add(SkillId.DRINK_WATER)
-    assert executed == set(ALL_SKILL_IDS)
+    assert executed == set(STONE_PICKAXE_SKILL_IDS)
 
 
 def test_achievement_subgoals_plan_end_to_end() -> None:

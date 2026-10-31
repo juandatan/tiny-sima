@@ -27,7 +27,12 @@ from tiny_sima.evaluation.skill_rollout import (
     initialize_skill_tracker,
     update_skill_tracker,
 )
-from tiny_sima.goals.skills import SkillId, get_skill_spec
+from tiny_sima.goals.skills import (
+    SKILL_IDS,
+    SkillId,
+    get_skill_spec,
+    interacts_by_doing,
+)
 
 PolicyName = Literal["scripted", "random"]
 
@@ -40,18 +45,16 @@ class SkillRolloutCarry(NamedTuple):
     tracker: SkillEpisodeTracker
 
 
-_INTERACTION_SKILLS = {
-    SkillId.COLLECT_WOOD,
-    SkillId.COLLECT_STONE,
-    SkillId.DRINK_WATER,
-}
-
-
 def scripted_skill_action(
     environment: SkillEnvironment,
     state: SkillEpisodeState,
 ) -> jax.Array:
-    """Return a shortest-path action for a controlled skill scenario."""
+    """Return a shortest-path action for a controlled skill scenario.
+
+    The policy heads for where the scenario put the target, so it misses a cow
+    that wanders off; the breadth-first policy in tiny_sima.evaluation.chains
+    follows the live cow.
+    """
 
     skill_id = environment.goal.skill_id
     if environment.scenario.kind is SkillScenario.RANDOMIZED:
@@ -76,7 +79,7 @@ def scripted_skill_action(
             ),
         )
         at_approach = (row_delta == 0) & (column_delta == 0)
-        if skill_id in _INTERACTION_SKILLS:
+        if interacts_by_doing(skill_id):
             interaction = jnp.where(
                 state.env_state.player_direction == state.target_direction,
                 Action.DO.value,
@@ -90,7 +93,7 @@ def scripted_skill_action(
             )
         return jnp.where(at_approach, interaction, movement).astype(jnp.int32)
 
-    if skill_id in _INTERACTION_SKILLS:
+    if interacts_by_doing(skill_id):
         return jnp.where(
             state.env_state.player_direction == state.target_direction,
             Action.DO.value,
@@ -212,10 +215,11 @@ def evaluate_skill_suite(
     min_distance: int = 2,
     max_distance: int = 4,
     distractor_count: int = 6,
+    skill_ids: tuple[SkillId, ...] = SKILL_IDS,
 ) -> list[dict[str, Any]]:
-    """Evaluate scripted and random policies on every registered skill."""
+    """Evaluate scripted and random policies on each of ``skill_ids``."""
 
-    scenario_skills = skills_for_scenario(scenario)
+    scenario_skills = skills_for_scenario(scenario, skill_ids)
     return [
         evaluate_skill_policy(
             skill_id,
