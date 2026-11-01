@@ -9,7 +9,9 @@ Three stores, each read by the part that uses it reliably:
   :meth:`EpisodeMemory.world_fact` answers the planner's world facts from them
   instead of from a scan of the whole map, which the agent has never seen.
 - **Mob sightings:** where zombies, skeletons and cows were last seen, and
-  when. Mobs move, so these are forgotten after a few boundaries.
+  when. Mobs move, so these are forgotten after a few boundaries. Failed hunts
+  with no cow remembered rule cows out, as failed searches rule out a
+  resource, which matters in a world where none spawn.
 
 Memory only observes at skill boundaries. The executor's intermediate frames
 are not returned to the planner, so a resource passed mid-skill and out of view
@@ -77,6 +79,9 @@ COLLECT_RESOURCES: dict[SkillId, str] = {
     SkillId.DRINK_WATER: "water",
     SkillId.COLLECT_COAL: "coal",
 }
+# The skills that hunt a mob. Failing one while no instance is remembered
+# counts against the mob the same way.
+HUNT_MOBS: dict[SkillId, str] = {SkillId.EAT_COW: "cow"}
 
 _WORLD_FACTS = {f"world.{block}_reachable": block for block in RESOURCE_BLOCKS}
 
@@ -317,9 +322,10 @@ class EpisodeMemory:
     """Transitions, block sightings and mob sightings for one episode.
 
     ``known`` holds the map positions where each block was last seen, and
-    ``misses`` how many collect requests for a resource have failed in a row
-    while none was known. A resource is ruled out after ``miss_limit`` such
-    failures, and back in play as soon as one is seen.
+    ``misses`` how many collect requests for a resource, or hunts for a mob,
+    have failed in a row while none was known. A resource or mob is ruled out
+    after ``miss_limit`` such failures, and back in play as soon as one is
+    seen.
 
     ``mobs`` holds the last sighting of each mob seen, and a sighting more
     than ``mob_forget_after`` boundaries old is forgotten.
@@ -333,7 +339,7 @@ class EpisodeMemory:
         (block, ()) for block in RESOURCE_BLOCKS
     )
     misses: tuple[tuple[str, int], ...] = tuple(
-        (resource, 0) for resource in COLLECT_RESOURCES.values()
+        (target, 0) for target in (*COLLECT_RESOURCES.values(), *HUNT_MOBS.values())
     )
     mobs: tuple[tuple[str, tuple[MobSighting, ...]], ...] = tuple(
         (mob, ()) for mob in MOB_TYPES
@@ -349,12 +355,16 @@ class EpisodeMemory:
 
         return dict(self.mobs)[mob]
 
-    def ruled_out(self, resource: str) -> bool:
-        """Return whether repeated failed searches rule ``resource`` out."""
+    def _remembered(self, target: str) -> bool:
+        if target in MOB_TYPES:
+            return bool(self.mob_sightings(target))
+        return bool(self.positions(target))
 
-        return (
-            dict(self.misses).get(resource, 0) >= self.miss_limit
-            and not self.positions(resource)
+    def ruled_out(self, target: str) -> bool:
+        """Return whether repeated failed searches rule a block or mob out."""
+
+        return dict(self.misses).get(target, 0) >= self.miss_limit and (
+            not self._remembered(target)
         )
 
     def observe(self, state: Any) -> EpisodeMemory:
@@ -398,6 +408,8 @@ class EpisodeMemory:
                 MobSighting(position, boundary, timestep)
                 for position in visible_mobs[mob]
             ]
+            if seen and mob in misses:
+                misses[mob] = 0
             mobs.append(
                 (
                     mob,
@@ -454,12 +466,12 @@ class EpisodeMemory:
             inventory_extremes=_extremes(inventory_extremes),
         )
         misses = dict(memory.misses)
-        resource = COLLECT_RESOURCES.get(skill_id)
-        if resource is not None:
+        target = COLLECT_RESOURCES.get(skill_id) or HUNT_MOBS.get(skill_id)
+        if target is not None:
             if outcome_value == "success":
-                misses[resource] = 0
-            elif not memory.positions(resource):
-                misses[resource] += 1
+                misses[target] = 0
+            elif not memory._remembered(target):
+                misses[target] += 1
         return dataclasses.replace(
             memory,
             transitions=(*memory.transitions, transition),
@@ -474,8 +486,9 @@ class EpisodeMemory:
         evidence it is absent. A block only the agent places, such as a
         crafting table, counts only once one is known, because a generated map
         holds none. ``None`` means the field is not a world fact this memory
-        answers. Grass, like free ground, is everywhere, and cows keep spawning
-        on it, so those count as obtainable too.
+        answers. Grass, like free ground, is everywhere, so it counts as
+        obtainable. So do cows, which keep spawning on grass, until failed
+        hunts rule them out.
         """
 
         block = _WORLD_FACTS.get(field)
@@ -483,11 +496,9 @@ class EpisodeMemory:
             if block in PLACED_BLOCKS:
                 return int(bool(self.positions(block)))
             return int(not self.ruled_out(block))
-        if field in {
-            "world.placement_space_reachable",
-            "world.grass_reachable",
-            "world.cow_reachable",
-        }:
+        if field == "world.cow_reachable":
+            return int(not self.ruled_out("cow"))
+        if field in {"world.placement_space_reachable", "world.grass_reachable"}:
             return 1
         return None
 

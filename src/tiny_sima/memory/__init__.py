@@ -2,6 +2,7 @@
 
 from tiny_sima.memory.episode import (
     COLLECT_RESOURCES,
+    HUNT_MOBS,
     MOB_TYPES,
     PLACED_BLOCKS,
     PROMPT_BLOCKS,
@@ -19,6 +20,7 @@ __all__ = [
     "COLLECT_RESOURCES",
     "EpisodeMemory",
     "FailureCause",
+    "HUNT_MOBS",
     "MOB_TYPES",
     "MobSighting",
     "PLACED_BLOCKS",

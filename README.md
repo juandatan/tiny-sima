@@ -663,7 +663,7 @@ sub-goal planner:
 - It skips the feasibility study and model learning.
 - It reloads each baseline arm from the seed's saved results.
 
-Notebook 08 does the same for the designs listed in `REUSE_DESIGNS`.
+Notebook 08 does the same for the (design, mobs) runs listed in `REUSE_RUNS`.
 
 Every saved result records its provenance: the seed, the episode count, the
 executor, the VLM configuration, the competence prior, and for notebook 08 the

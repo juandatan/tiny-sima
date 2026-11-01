@@ -246,6 +246,34 @@ def test_selector_reads_world_facts_from_memory() -> None:
     assert _proposed(blind, _request(state, memory=NoWater())) == "survival.drink >= 7"
 
 
+def test_selector_moves_past_eat_cow_once_failed_hunts_rule_cows_out() -> None:
+    # Without creatures eat_cow is infeasible every time. Two failed hunts
+    # rule cows out, and the curriculum moves on instead of asking again.
+    unlocked = [
+        achievement
+        for achievement in TECH_TREE_ORDER
+        if achievement not in (Achievement.EAT_COW, Achievement.WAKE_UP)
+    ]
+    state = _unlock(_chain_state(), *unlocked)
+    state = state.replace(
+        player_food=5,
+        player_energy=5,
+        cows=state.cows.replace(mask=np.zeros_like(state.cows.mask)),
+    )
+    memory = EpisodeMemory().observe(state)
+    selector = ScriptedGoalSelector(candidate_skills=ALL_SKILL_IDS)
+    assert (
+        _proposed(selector, _request(state, memory=memory))
+        == "achievement.eat_cow >= 1"
+    )
+    for _ in range(2):
+        memory = memory.record(state, "eat_cow", "infeasible", 0, state)
+    assert (
+        _proposed(selector, _request(state, memory=memory))
+        == "achievement.wake_up >= 1"
+    )
+
+
 def test_open_ended_fields_offer_only_the_achievements_skills_unlock() -> None:
     fields = open_ended_subgoal_fields(STONE_PICKAXE_SKILL_IDS)
 

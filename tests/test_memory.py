@@ -129,6 +129,31 @@ def test_a_failure_with_the_resource_known_is_not_a_miss() -> None:
     assert memory.world_fact("world.stone_reachable") == 1
 
 
+def test_failed_hunts_with_no_cow_remembered_rule_cows_out() -> None:
+    # With mobs off no cow ever spawns, and eat_cow is infeasible every time.
+    bare = _grass_world()
+    memory = EpisodeMemory()
+    once = memory.record(bare, SkillId.EAT_COW, SkillOutcome.INFEASIBLE, 0, bare)
+    assert once.world_fact("world.cow_reachable") == 1
+    twice = once.record(bare, SkillId.EAT_COW, SkillOutcome.INFEASIBLE, 0, bare)
+    assert twice.ruled_out("cow")
+    assert twice.world_fact("world.cow_reachable") == 0
+
+    # A sighting puts cows back in play and resets the count.
+    seen = twice.observe(_with_mobs(bare, cow=[(1, 1)]))
+    assert dict(seen.misses)["cow"] == 0
+    assert seen.world_fact("world.cow_reachable") == 1
+
+
+def test_a_failed_hunt_with_a_cow_remembered_is_not_a_miss() -> None:
+    herd = _with_mobs(_grass_world(), cow=[(1, 1)])
+    memory = EpisodeMemory()
+    for _ in range(3):
+        memory = memory.record(herd, SkillId.EAT_COW, "timeout", 96, herd)
+    assert dict(memory.misses)["cow"] == 0
+    assert memory.world_fact("world.cow_reachable") == 1
+
+
 def test_world_facts() -> None:
     memory = EpisodeMemory()
     assert memory.world_fact("world.tree_reachable") == 1
