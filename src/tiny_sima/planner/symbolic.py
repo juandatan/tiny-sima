@@ -246,6 +246,63 @@ def _planning_problem(
     return tuple(sorted(fields)), projected
 
 
+def _may_hold(requirement: StateRequirement, low: int, high: int) -> bool:
+    target = int(requirement.value)
+    if requirement.comparison == "at_least":
+        return high >= target
+    if requirement.comparison == "less_than":
+        return low < target
+    return low <= target <= high
+
+
+def _relaxed_reachable(
+    start: _Values,
+    goal: GoalCondition,
+    model: SkillModel,
+    max_plan_length: int,
+) -> bool:
+    """Return False only when no plan of ``max_plan_length`` skills reaches it.
+
+    Each field keeps the range of values it could hold, and each round widens
+    it by one more application of every skill whose requirements its ranges
+    could meet. After ``k`` rounds the ranges contain every value a plan of
+    ``k`` skills reaches, so a goal they cannot meet is unreachable. It costs
+    a few rounds over the model, where the exact search must exhaust every
+    state up to the bound -- seconds once the inventory holds a few items.
+    """
+
+    low, high = dict(start), dict(start)
+    for _ in range(max_plan_length):
+        if all(
+            _may_hold(requirement, low[requirement.field], high[requirement.field])
+            for requirement in goal
+        ):
+            return True
+        next_low, next_high = dict(low), dict(high)
+        for _, mechanics in model:
+            if not all(
+                _may_hold(requirement, low[requirement.field], high[requirement.field])
+                for requirement in mechanics.requires
+            ):
+                continue
+            for effect in mechanics.effects:
+                field, amount = effect.field, int(effect.value)
+                if effect.operation == "increase":
+                    next_high[field] = max(next_high[field], high[field] + amount)
+                elif effect.operation == "decrease":
+                    next_low[field] = min(next_low[field], low[field] - amount)
+                else:
+                    next_low[field] = min(next_low[field], amount)
+                    next_high[field] = max(next_high[field], amount)
+        if next_low == low and next_high == high:
+            return False
+        low, high = next_low, next_high
+    return all(
+        _may_hold(requirement, low[requirement.field], high[requirement.field])
+        for requirement in goal
+    )
+
+
 @lru_cache(maxsize=65536)
 def _first_steps(
     start: _Values,
@@ -257,11 +314,14 @@ def _first_steps(
 
     A state reached at its shortest depth along several paths keeps the first
     skill of each, so the goal states of the shallowest layer hold every first
-    step of every shortest plan.
+    step of every shortest plan. A goal :func:`_relaxed_reachable` rules out
+    is answered without searching.
     """
 
     if all(_holds(requirement, dict(start)) for requirement in goal):
         return frozenset(), 0
+    if not _relaxed_reachable(start, goal, model, max_plan_length):
+        return None
     seen = {start}
     layer: dict[_Values, frozenset[SkillId]] = {start: frozenset()}
     for depth in range(1, max_plan_length + 1):

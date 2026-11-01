@@ -31,6 +31,7 @@ from tiny_sima.goals import (
     achievement_field,
     get_skill_spec,
 )
+from tiny_sima.planner import symbolic
 from tiny_sima.planner.saycan import (
     PlannerContext,
     SayCanPlanner,
@@ -567,3 +568,36 @@ def test_achievement_effects_leave_other_plans_unchanged(chain) -> None:
             assert shortest_plan(point.state, goal, chain.skills) == shortest_plan(
                 point.state, goal, chain.skills, model=bare
             ), point.label
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        _state(),
+        _with_inventory(_state(), wood=2, sapling=1),
+        _without_trees(_state()),
+    ],
+    ids=("start", "wood_and_sapling", "no_trees"),
+)
+def test_the_relaxed_precheck_never_changes_a_plan(state, monkeypatch) -> None:
+    goals = [
+        *((StateRequirement(field, "at_least", 1),) for field in ACHIEVEMENT_FIELDS),
+        (StateRequirement("inventory.wood", "equals", 4),),
+        (StateRequirement("inventory.wood", "less_than", 1),),
+        (
+            StateRequirement("inventory.stone_pickaxe", "at_least", 1),
+            StateRequirement("inventory.wood", "at_least", 2),
+        ),
+    ]
+    symbolic._first_steps.cache_clear()
+    checked = [shortest_plan(state, goal, ALL_SKILL_IDS) for goal in goals]
+    symbolic._first_steps.cache_clear()
+    monkeypatch.setattr(symbolic, "_relaxed_reachable", lambda *_: True)
+    try:
+        exact = [shortest_plan(state, goal, ALL_SKILL_IDS) for goal in goals]
+    finally:
+        symbolic._first_steps.cache_clear()
+    assert checked == exact
+    # Both outcomes are covered, so the agreement is not vacuous.
+    assert any(plan is None for plan in exact)
+    assert any(plan is not None and plan[1] > 0 for plan in exact)
