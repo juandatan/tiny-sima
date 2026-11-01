@@ -123,9 +123,10 @@ and a sound external checker verifies and gives feedback.
   [planner/symbolic.py](src/tiny_sima/planner/symbolic.py) searches the skill
   model breadth first. A sub-goal it cannot reach goes back to the VLM with a
   reason, such as `inventory.iron_pickaxe needs 1 more: no available skill
-  produces it`. Rejections are batched across episodes. Every chosen skill is
-  the first step of a shortest plan to the current sub-goal. Ties go to the
-  executor's competence prior.
+  produces it`. The reachable sub-goals of an answer are kept, and the VLM
+  is asked again only when none is. Rejections are batched across episodes.
+  Every chosen skill is the first step of a shortest plan to the current
+  sub-goal. Ties go to the executor's competence prior.
 - **Triggers.** The VLM is called only at these events:
   - **The episode starts.**
   - **Every sub-goal is reached** and the objective is not complete.

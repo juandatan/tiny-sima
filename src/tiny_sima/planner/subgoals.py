@@ -842,7 +842,11 @@ class SubgoalPlanner:
             else:
                 reasons.append(f"{text}: {check.reason}")
                 plan = plan.with_event(text, "rejected", check.reason)
-        if reasons or not accepted:
+        # The reachable sub-goals of an answer are kept; the rest stay in the
+        # events with their reasons, which the next request shows. Turning
+        # the whole answer down for one unreachable sub-goal ended episodes
+        # where the VLM kept asking for food with no cow left.
+        if not accepted:
             pending.plan = replace(plan, rejections=plan.rejections + 1)
             pending.feedback = (*reasons, *held)
             if not reasons:

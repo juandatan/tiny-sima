@@ -18,6 +18,7 @@ from tiny_sima.planner.subgoals import (
     SubgoalPlan,
     SubgoalPlanner,
     parse_subgoal_response,
+    render_subgoal,
     subgoal_output_type,
 )
 from tiny_sima.planner.vlm import VLMRequest
@@ -433,3 +434,35 @@ def test_closed_loop_reaches_the_objective_from_subgoals(chain_name, answer) -> 
         record = json.loads(json.dumps(chain_episode_record(result)))
         assert record["trace"][0]["plan_state"]["trigger"] == "start"
     assert len(backend.requests) == 2
+
+
+def test_the_reachable_subgoals_of_an_answer_are_kept() -> None:
+    backend = ScriptedBackend(
+        _answer(("inventory.iron_pickaxe", 1), ("inventory.stone_pickaxe", 1))
+    )
+    planner = SubgoalPlanner(backend)
+
+    selection = _select(planner, _state(), PlannerContext(OBJECTIVE))
+
+    assert selection.status is PlannerSelectionStatus.SELECTED
+    assert len(backend.requests) == 1
+    plan = selection.plan_state
+    assert plan.rejections == 0
+    assert [render_subgoal(subgoal) for subgoal in plan.pending] == [
+        "inventory.stone_pickaxe >= 1"
+    ]
+    rejected, proposed = plan.events
+    assert (rejected.subgoal, rejected.status) == (
+        "inventory.iron_pickaxe >= 1",
+        "rejected",
+    )
+    assert proposed.status == "proposed"
+
+    # The next request shows the VLM why the other sub-goal was dropped.
+    later = PlannerContext(
+        OBJECTIVE,
+        history=(_attempt(SkillId.COLLECT_WOOD, SkillOutcome.TIMEOUT),),
+        plan_state=plan,
+    )
+    _select(planner, _state(), later)
+    assert "inventory.iron_pickaxe >= 1: rejected (" in backend.requests[1].user_prompt
