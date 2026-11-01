@@ -10,8 +10,8 @@ Three stores, each read by the part that uses it reliably:
   instead of from a scan of the whole map, which the agent has never seen.
 - **Mob sightings:** where zombies, skeletons and cows were last seen, and
   when. Mobs move, so these are forgotten after a few boundaries. Failed hunts
-  with no cow remembered rule cows out, as failed searches rule out a
-  resource, which matters in a world where none spawn.
+  with none of the hunted mob remembered rule it out, as failed searches rule
+  out a resource, which matters in a world where none spawn.
 
 Memory only observes at skill boundaries. The executor's intermediate frames
 are not returned to the planner, so a resource passed mid-skill and out of view
@@ -32,7 +32,15 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from craftax.craftax_classic.constants import BlockType
 
-from tiny_sima.goals import OBSERVATION_RADIUS, SkillId, get_skill_spec, view_mask
+from tiny_sima.goals import (
+    MOB_TYPES,
+    OBSERVATION_RADIUS,
+    SKILL_MOBS,
+    SkillId,
+    get_skill_spec,
+    mob_field,
+    view_mask,
+)
 
 if TYPE_CHECKING:
     from tiny_sima.planner.saycan import SkillOutcome
@@ -64,12 +72,6 @@ PLACED_BLOCKS = frozenset(("crafting_table", "furnace", "plant", "ripe_plant"))
 
 PROMPT_BLOCKS = ("tree", "stone", "water", "crafting_table")
 
-# Mob type to the state field holding its instances.
-MOB_TYPES: dict[str, str] = {
-    "zombie": "zombies",
-    "skeleton": "skeletons",
-    "cow": "cows",
-}
 
 # The skills that search for a resource. Failing one while no instance of the
 # resource is known is the evidence that rules the resource out.
@@ -79,11 +81,9 @@ COLLECT_RESOURCES: dict[SkillId, str] = {
     SkillId.DRINK_WATER: "water",
     SkillId.COLLECT_COAL: "coal",
 }
-# The skills that hunt a mob. Failing one while no instance is remembered
-# counts against the mob the same way.
-HUNT_MOBS: dict[SkillId, str] = {SkillId.EAT_COW: "cow"}
 
 _WORLD_FACTS = {f"world.{block}_reachable": block for block in RESOURCE_BLOCKS}
+_MOB_FACTS = {mob_field(mob): mob for mob in MOB_TYPES}
 
 
 class FailureCause(str, Enum):
@@ -339,7 +339,7 @@ class EpisodeMemory:
         (block, ()) for block in RESOURCE_BLOCKS
     )
     misses: tuple[tuple[str, int], ...] = tuple(
-        (target, 0) for target in (*COLLECT_RESOURCES.values(), *HUNT_MOBS.values())
+        (target, 0) for target in (*COLLECT_RESOURCES.values(), *SKILL_MOBS.values())
     )
     mobs: tuple[tuple[str, tuple[MobSighting, ...]], ...] = tuple(
         (mob, ()) for mob in MOB_TYPES
@@ -466,7 +466,9 @@ class EpisodeMemory:
             inventory_extremes=_extremes(inventory_extremes),
         )
         misses = dict(memory.misses)
-        target = COLLECT_RESOURCES.get(skill_id) or HUNT_MOBS.get(skill_id)
+        # Failing to hunt a mob while none is remembered counts against it the
+        # same way.
+        target = COLLECT_RESOURCES.get(skill_id) or SKILL_MOBS.get(skill_id)
         if target is not None:
             if outcome_value == "success":
                 misses[target] = 0
@@ -487,8 +489,8 @@ class EpisodeMemory:
         crafting table, counts only once one is known, because a generated map
         holds none. ``None`` means the field is not a world fact this memory
         answers. Grass, like free ground, is everywhere, so it counts as
-        obtainable. So do cows, which keep spawning on grass, until failed
-        hunts rule them out.
+        obtainable. So do the mobs, which keep spawning, until failed hunts
+        rule them out.
         """
 
         block = _WORLD_FACTS.get(field)
@@ -496,8 +498,8 @@ class EpisodeMemory:
             if block in PLACED_BLOCKS:
                 return int(bool(self.positions(block)))
             return int(not self.ruled_out(block))
-        if field == "world.cow_reachable":
-            return int(not self.ruled_out("cow"))
+        if field in _MOB_FACTS:
+            return int(not self.ruled_out(_MOB_FACTS[field]))
         if field in {"world.placement_space_reachable", "world.grass_reachable"}:
             return 1
         return None

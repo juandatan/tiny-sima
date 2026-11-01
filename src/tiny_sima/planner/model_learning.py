@@ -43,12 +43,14 @@ from typing import Any, Literal
 
 from tiny_sima.goals import (
     ALL_SKILL_IDS,
+    MOB_TYPES,
     STONE_PICKAXE_SKILL_IDS,
     SkillId,
     SkillMechanics,
     StateEffect,
     StateRequirement,
     get_skill_spec,
+    mob_field,
 )
 from tiny_sima.memory import TransitionRecord
 from tiny_sima.planner.symbolic import (
@@ -113,7 +115,7 @@ _ANALYSIS_MAX_LENGTH = 160
 MANUAL_PATH = Path(__file__).resolve().parents[3] / "docs" / "craftax_classic_manual.md"
 
 # The state at a Craftax-Classic reset, as the planner reads it: nothing held,
-# vitals full, trees, stone, coal, water, grass, cows and free ground about,
+# vitals full, trees, stone, coal, water, grass, mobs and free ground about,
 # and no table, furnace or ripe plant yet.
 EPISODE_START: tuple[tuple[str, int], ...] = tuple(
     (
@@ -129,7 +131,7 @@ EPISODE_START: tuple[tuple[str, int], ...] = tuple(
                 "world.placement_space_reachable",
                 "world.coal_reachable",
                 "world.grass_reachable",
-                "world.cow_reachable",
+                *map(mob_field, MOB_TYPES),
             }
         ),
     )

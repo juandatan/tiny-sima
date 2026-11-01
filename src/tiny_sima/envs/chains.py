@@ -43,9 +43,19 @@ class SkillChainEnvironment:
         )
 
 
-def _clear_mobs(state: Any) -> Any:
+def clear_mobs(state: Any) -> Any:
+    """Remove every mob and arrow, for good.
+
+    Craftax resets every mask to ``health > 0`` on each DO action, so a
+    cleared slot with health left would come back at its stored position.
+    Unused slots sit at (0, 0) and are despawned at once unless the player is
+    within ``mob_despawn_distance`` of that corner.
+    """
+
     def clear(mobs: Any) -> Any:
-        return mobs.replace(mask=jnp.zeros_like(mobs.mask))
+        return mobs.replace(
+            mask=jnp.zeros_like(mobs.mask), health=jnp.zeros_like(mobs.health)
+        )
 
     return state.replace(
         mob_map=jnp.zeros_like(state.mob_map),
@@ -124,7 +134,7 @@ def prepare_chain_scenario(
         position = player_position + shuffled_offsets[index]
         clean_map = clean_map.at[position[0], position[1]].set(block.value)
 
-    state = _clear_mobs(state)
+    state = clear_mobs(state)
     return state.replace(
         map=clean_map,
         player_position=player_position,

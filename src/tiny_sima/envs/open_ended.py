@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import jax
 
-from tiny_sima.envs.chains import SkillChainEnvironment, SkillChainReset, _clear_mobs
+from tiny_sima.envs.chains import SkillChainEnvironment, SkillChainReset, clear_mobs
 from tiny_sima.envs.craftax import CraftaxBundle, make_environment
 
 # Long enough for the open-ended step budget plus one skill's overrun.
@@ -37,7 +37,7 @@ class OpenEndedEnvironment(SkillChainEnvironment):
     def reset(self, rng: jax.Array) -> SkillChainReset:
         _, state = self.bundle.env.reset(rng, self.bundle.params)
         if not self.mobs:
-            state = _clear_mobs(state)
+            state = clear_mobs(state)
         return SkillChainReset(
             observation=self.bundle.env.get_obs(state),
             state=state,

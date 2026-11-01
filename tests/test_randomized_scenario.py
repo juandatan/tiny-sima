@@ -45,9 +45,11 @@ _TARGETS = {
     SkillId.CRAFT_STONE_PICKAXE: BlockType.CRAFTING_TABLE,
     SkillId.CRAFT_STONE_SWORD: BlockType.CRAFTING_TABLE,
     SkillId.COLLECT_COAL: BlockType.COAL,
-    # The cow stands on grass.
+    # The cow and the zombie stand on grass, the skeleton on a tunnel path.
     SkillId.EAT_COW: BlockType.GRASS,
     SkillId.EAT_PLANT: BlockType.RIPE_PLANT,
+    SkillId.DEFEAT_ZOMBIE: BlockType.GRASS,
+    SkillId.DEFEAT_SKELETON: BlockType.PATH,
 }
 
 

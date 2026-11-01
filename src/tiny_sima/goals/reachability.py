@@ -38,9 +38,11 @@ from craftax.craftax_classic.constants import OBS_DIM, BlockType
 from tiny_sima.goals.skills import (
     MAX_VITAL,
     SKILL_IDS,
+    SKILL_MOBS,
     SkillGoal,
     SkillId,
     is_crafting_skill,
+    skill_mobs,
     skill_precondition,
     skill_target_block,
 )
@@ -303,8 +305,8 @@ def _skill_target(
 ) -> tuple[jax.Array, bool]:
     """Return the interaction target mask and adjacency rule for a skill."""
 
-    if skill_id is SkillId.EAT_COW:
-        return _cow_mask(state), False
+    if skill_id in SKILL_MOBS:
+        return _mob_mask(skill_mobs(skill_id, state), state), False
     block = skill_target_block(skill_id)
     if block is None:
         # The placements need only a free tile to face.
@@ -313,14 +315,14 @@ def _skill_target(
     return block_mask(state, block), is_crafting_skill(skill_id)
 
 
-def _cow_mask(state: Any) -> jax.Array:
-    """Return the tiles a live cow stands on."""
+def _mob_mask(mobs: Any, state: Any) -> jax.Array:
+    """Return the tiles a live one of ``mobs`` stands on."""
 
-    positions = jnp.asarray(state.cows.position)
+    positions = jnp.asarray(mobs.position)
     return (
         jnp.zeros(jnp.asarray(state.map).shape, dtype=jnp.bool_)
         .at[positions[:, 0], positions[:, 1]]
-        .max(jnp.asarray(state.cows.mask))
+        .max(jnp.asarray(mobs.mask))
     )
 
 

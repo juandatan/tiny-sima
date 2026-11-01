@@ -41,6 +41,7 @@ from craftax.craftax_classic.envs.craftax_state import Inventory
 from tiny_sima.goals import (
     ACHIEVEMENT_FIELDS,
     ALL_SKILL_IDS,
+    MOB_TYPES,
     SKILL_ACHIEVEMENTS,
     STONE_PICKAXE_SKILL_IDS,
     SkillId,
@@ -49,6 +50,8 @@ from tiny_sima.goals import (
     StateRequirement,
     achievement_field,
     get_skill_spec,
+    mob_field,
+    mob_instances,
     walkable_mask,
 )
 from tiny_sima.planner.saycan import (
@@ -107,8 +110,9 @@ PLANNER_FIELDS: tuple[str, ...] = (
     "survival.food",
     "survival.energy",
     *map(_world_field, _LATER_BLOCKS),
-    "world.cow_reachable",
+    *map(mob_field, MOB_TYPES),
 )
+_MOB_FIELDS = {mob_field(mob): mob for mob in MOB_TYPES}
 
 _ACHIEVEMENTS = {
     achievement_field(achievement): achievement for achievement in Achievement
@@ -182,8 +186,9 @@ def read_field(state: Any, field: str, belief: WorldBelief | None = None) -> int
         return int(bool(np.any(np.asarray(walkable_mask(state)))))
     if field in _WORLD_BLOCKS:
         return int(bool(np.any(np.asarray(state.map) == _WORLD_BLOCKS[field].value)))
-    if field == "world.cow_reachable":
-        return int(bool(np.any(np.asarray(state.cows.mask))))
+    if field in _MOB_FIELDS:
+        mobs = mob_instances(_MOB_FIELDS[field], state)
+        return int(bool(np.any(np.asarray(mobs.mask))))
     raise ValueError(f"No symbolic reading for registry field {field!r}.")
 
 

@@ -28,6 +28,7 @@ from tiny_sima.evaluation.skills import evaluate_skill_policy
 from tiny_sima.goals import (
     ALL_SKILL_IDS,
     SKILL_ACHIEVEMENTS,
+    SKILL_MOBS,
     STONE_PICKAXE_SKILL_IDS,
     SkillGoal,
     SkillId,
@@ -56,20 +57,21 @@ from tiny_sima.planner.symbolic import (
 
 NEW_SKILLS = ALL_SKILL_IDS[len(STONE_PICKAXE_SKILL_IDS) :]
 # Skills a short scripted episode always completes: a fixed target and one
-# interaction. Saplings drop one time in ten, a cow takes three hits and
-# wanders, and sleep takes eleven steps per missing energy point.
+# interaction. Saplings drop one time in ten, mobs take several hits and move,
+# and sleep takes eleven steps per missing energy point.
 DETERMINISTIC_SKILLS = tuple(
     skill
     for skill in NEW_SKILLS
-    if skill not in {SkillId.COLLECT_SAPLING, SkillId.EAT_COW, SkillId.SLEEP}
+    if skill not in {SkillId.COLLECT_SAPLING, SkillId.SLEEP, *SKILL_MOBS}
 )
 
 
 def test_new_skills_append_after_the_stone_pickaxe_catalog() -> None:
-    assert len(ALL_SKILL_IDS) == 16
+    assert len(ALL_SKILL_IDS) == 18
     assert ALL_SKILL_IDS[:7] == STONE_PICKAXE_SKILL_IDS
     assert STONE_PICKAXE_SKILL_IDS[-1] is SkillId.CRAFT_STONE_PICKAXE
-    assert executor_skill_ids(16) == ALL_SKILL_IDS
+    assert executor_skill_ids(16)[-1] is SkillId.EAT_PLANT
+    assert executor_skill_ids(18) == ALL_SKILL_IDS
     assert set(SKILL_ACHIEVEMENTS) == set(ALL_SKILL_IDS)
     # The evaluations still offer the catalog the recorded executors know.
     assert WOOD_TO_STONE_PICKAXE_CHAIN.skills == STONE_PICKAXE_SKILL_IDS
@@ -101,9 +103,11 @@ def test_scripted_policy_completes_the_stochastic_new_skills() -> None:
     for skill_id, floor in (
         (SkillId.COLLECT_SAPLING, 0.75),
         (SkillId.SLEEP, 1.0),
-        # The scripted policy keeps facing the cow's starting tile, so it
-        # fails whenever the cow wanders off before its third hit.
+        # The scripted policy keeps facing the mob's starting tile, so it
+        # fails whenever the mob moves off before its last hit.
         (SkillId.EAT_COW, 0.25),
+        (SkillId.DEFEAT_ZOMBIE, 0.5),
+        (SkillId.DEFEAT_SKELETON, 0.05),
     ):
         result = evaluate_skill_policy(
             skill_id, policy="scripted", num_episodes=32, horizon=64

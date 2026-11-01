@@ -51,9 +51,9 @@ def scripted_skill_action(
 ) -> jax.Array:
     """Return a shortest-path action for a controlled skill scenario.
 
-    The policy heads for where the scenario put the target, so it misses a cow
-    that wanders off; the breadth-first policy in tiny_sima.evaluation.chains
-    follows the live cow.
+    The policy heads for where the scenario put the target, so it misses a
+    mob that moves off; the breadth-first policy in tiny_sima.evaluation.chains
+    follows the live mob.
     """
 
     skill_id = environment.goal.skill_id

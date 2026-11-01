@@ -2,9 +2,10 @@ import json
 import math
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
-from craftax.craftax_classic.constants import Achievement
+from craftax.craftax_classic.constants import Achievement, Action
 
 from tiny_sima.envs import OpenEndedEnvironment, make_open_ended_environment
 from tiny_sima.envs.chains import make_skill_chain_environment
@@ -108,6 +109,19 @@ def test_reset_without_mobs_clears_generated_creatures() -> None:
     rng = jax.random.PRNGKey(0)
     assert _mob_counts(OpenEndedEnvironment(crowded, mobs=True).reset(rng).state)
     assert not _mob_counts(OpenEndedEnvironment(crowded, mobs=False).reset(rng).state)
+
+
+def test_cleared_creatures_stay_gone_after_an_action_near_the_corner() -> None:
+    # Craftax revives every slot with health left on a DO action; unused
+    # slots sit at (0, 0) and survive the despawn check near that corner.
+    environment = make_open_ended_environment(mobs=False)
+    bundle = environment.bundle
+    state = environment.reset(jax.random.PRNGKey(0)).state
+    state = state.replace(player_position=jnp.array([3, 3]))
+    _, state, _, _, _ = bundle.env.step(
+        jax.random.PRNGKey(1), state, Action.DO.value, bundle.params
+    )
+    assert _mob_counts(state) == 0
 
 
 def _chain_state(seed: int = 0, **inventory):
@@ -462,6 +476,8 @@ def test_summary_aggregates_records() -> None:
     assert summary["tiers"]["survival"]["success_rate"] == 0.25
     assert summary["tiers"]["basic"]["achievements_per_episode"]["mean"] == 1.5
     assert summary["termination_counts"]["died"] == 1
+    # Records saved before the fallback existed count none.
+    assert summary["fallback_calls"] == {"mean": 0.0, "std": 0.0}
     expected = crafter_score({"collect_wood": 1.0, "place_table": 0.5, "eat_cow": 0.5})
     assert summary["crafter_score"] == pytest.approx(expected)
 
@@ -485,6 +501,9 @@ def test_design_factory_builds_the_three_designs() -> None:
     vlm, scripted = planners["subgoal_vlm"], planners["subgoal_scripted"]
     assert isinstance(vlm, SubgoalPlanner) and isinstance(scripted, SubgoalPlanner)
     assert isinstance(scripted.backend, ScriptedGoalSelector)
+    # Only the VLM design falls back to the curriculum.
+    assert isinstance(vlm.fallback, ScriptedGoalSelector)
+    assert scripted.fallback is None
     for planner in (vlm, scripted):
         assert planner.fields == open_ended_subgoal_fields(ALL_SKILL_IDS)
         assert planner.vital_thresholds == ALL_VITAL_THRESHOLDS

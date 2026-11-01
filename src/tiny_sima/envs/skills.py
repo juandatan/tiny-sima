@@ -17,6 +17,7 @@ from craftax.craftax_classic.constants import (
 from craftax.craftax_classic.envs.craftax_state import EnvParams, Inventory
 from craftax.craftax_classic.game_logic import calculate_light_level
 
+from tiny_sima.envs.chains import clear_mobs
 from tiny_sima.envs.craftax import (
     CraftaxBundle,
     EnvironmentSpec,
@@ -31,7 +32,9 @@ from tiny_sima.goals.reachability import (
 from tiny_sima.goals.skills import (
     ALL_SKILL_IDS,
     MAX_VITAL,
+    MOB_TYPES,
     SKILL_IDS,
+    SKILL_MOBS,
     SkillGoal,
     SkillId,
     executor_skill_ids,
@@ -294,25 +297,20 @@ class SkillEnvironment:
         )
 
 
-def _clear_mobs(state: Any) -> Any:
-    def clear(mobs: Any) -> Any:
-        return mobs.replace(mask=jnp.zeros_like(mobs.mask))
-
-    return state.replace(
-        mob_map=jnp.zeros_like(state.mob_map),
-        zombies=clear(state.zombies),
-        cows=clear(state.cows),
-        skeletons=clear(state.skeletons),
-        arrows=clear(state.arrows),
-    )
+# The ground each hunted mob stands on in a scenario; see :func:`_add_mob`.
+# Skeletons live in tunnels, whose floor is path.
+_MOB_GROUND: dict[str, BlockType] = {
+    "cow": BlockType.GRASS,
+    "zombie": BlockType.GRASS,
+    "skeleton": BlockType.PATH,
+}
 
 
 def _target_block(skill_id: SkillId) -> BlockType | None:
     """Return the block a scenario places in front of the skill's target."""
 
-    if skill_id is SkillId.EAT_COW:
-        # The cow stands on this grass; see :func:`_add_cow`.
-        return BlockType.GRASS
+    if skill_id in SKILL_MOBS:
+        return _MOB_GROUND[SKILL_MOBS[skill_id]]
     return skill_target_block(skill_id)
 
 
@@ -321,7 +319,7 @@ def _target_block(skill_id: SkillId) -> BlockType | None:
 LOCAL_NAVIGATION_SKILLS: tuple[SkillId, ...] = tuple(
     skill_id
     for skill_id in ALL_SKILL_IDS
-    if skill_id is SkillId.EAT_COW
+    if skill_id in SKILL_MOBS
     or skill_target_block(skill_id) not in {None, BlockType.GRASS}
 )
 
@@ -824,17 +822,21 @@ def _lowest_sleep_energy(goal: SkillGoal) -> int:
     return min(max(MAX_VITAL - affordable, 3), MAX_VITAL - 1)
 
 
-def _add_cow(state: Any, position: jax.Array) -> Any:
-    """Put one full-health cow on ``position``."""
+def _add_mob(state: Any, mob: str, position: jax.Array) -> Any:
+    """Put one full-health ``mob`` on ``position``."""
 
-    cows = state.cows
+    attribute = MOB_TYPES[mob]
+    mobs = getattr(state, attribute)
+    health = getattr(_DEFAULT_PARAMS, f"{mob}_health")
     return state.replace(
-        cows=cows.replace(
-            position=cows.position.at[0].set(position),
-            health=cows.health.at[0].set(_DEFAULT_PARAMS.cow_health),
-            mask=cows.mask.at[0].set(True),
-            attack_cooldown=cows.attack_cooldown.at[0].set(0),
-        ),
+        **{
+            attribute: mobs.replace(
+                position=mobs.position.at[0].set(position),
+                health=mobs.health.at[0].set(health),
+                mask=mobs.mask.at[0].set(True),
+                attack_cooldown=mobs.attack_cooldown.at[0].set(0),
+            )
+        },
         mob_map=state.mob_map.at[position[0], position[1]].set(True),
     )
 
@@ -917,9 +919,11 @@ def prepare_skill_scenario(
         )
 
     player_food, player_drink, player_energy = scenario_vitals(goal.skill_id)
-    prepared_state = _clear_mobs(scenario.state)
-    if goal.skill_id is SkillId.EAT_COW:
-        prepared_state = _add_cow(prepared_state, scenario.target_position)
+    prepared_state = clear_mobs(scenario.state)
+    if goal.skill_id in SKILL_MOBS:
+        prepared_state = _add_mob(
+            prepared_state, SKILL_MOBS[goal.skill_id], scenario.target_position
+        )
     prepared_state = prepared_state.replace(
         player_health=9,
         player_food=player_food,

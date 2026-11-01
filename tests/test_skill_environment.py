@@ -26,9 +26,15 @@ from tiny_sima.goals.skills import (
     skill_precondition,
 )
 
-# A sapling drops one time in ten, a cow wanders between hits and sleep
+# A sapling drops one time in ten, a mob wanders between hits and sleep
 # takes eleven steps per energy point; test_survival_skills covers them.
-_STOCHASTIC_SKILLS = {SkillId.COLLECT_SAPLING, SkillId.EAT_COW, SkillId.SLEEP}
+_STOCHASTIC_SKILLS = {
+    SkillId.COLLECT_SAPLING,
+    SkillId.EAT_COW,
+    SkillId.SLEEP,
+    SkillId.DEFEAT_ZOMBIE,
+    SkillId.DEFEAT_SKELETON,
+}
 
 
 @pytest.mark.parametrize(

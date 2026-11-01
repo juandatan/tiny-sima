@@ -6,8 +6,8 @@ import numpy as np
 from craftax.craftax_classic.constants import BlockType
 
 from tiny_sima.envs.chains import make_skill_chain_environment
-from tiny_sima.goals import OBSERVATION_RADIUS, SkillId
-from tiny_sima.memory import MOB_TYPES, EpisodeMemory
+from tiny_sima.goals import MOB_TYPES, OBSERVATION_RADIUS, SkillId
+from tiny_sima.memory import EpisodeMemory
 from tiny_sima.planner.saycan import SkillOutcome
 
 

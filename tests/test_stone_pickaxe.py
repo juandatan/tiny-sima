@@ -58,9 +58,9 @@ def test_the_six_skill_catalog_is_unchanged() -> None:
     assert STONE_PICKAXE_SKILL_IDS[-1] is SkillId.CRAFT_STONE_PICKAXE
     assert executor_skill_ids(6) == SKILL_IDS
     assert executor_skill_ids(7) == STONE_PICKAXE_SKILL_IDS
-    assert executor_skill_ids(16) == ALL_SKILL_IDS
+    assert executor_skill_ids(18) == ALL_SKILL_IDS
     with pytest.raises(ValueError):
-        executor_skill_ids(17)
+        executor_skill_ids(19)
     assert chain_decision_limit(WOOD_TO_STONE_CHAIN) == 12
     assert chain_decision_limit(WOOD_TO_STONE_PICKAXE_CHAIN) == 16
 
@@ -214,8 +214,8 @@ def test_config_bounds_the_executor_catalog() -> None:
     )
     assert SkillPPOConfig(**base).num_skills == 6
     assert SkillPPOConfig(**base, num_skills=7).validate().num_skills == 7
-    assert SkillPPOConfig(**base, num_skills=16).validate().num_skills == 16
-    for num_skills in (0, 17):
+    assert SkillPPOConfig(**base, num_skills=18).validate().num_skills == 18
+    for num_skills in (0, 19):
         with pytest.raises(ValueError, match="num_skills"):
             SkillPPOConfig(**base, num_skills=num_skills).validate()
 

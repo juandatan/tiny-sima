@@ -52,6 +52,7 @@ from tiny_sima.executor.model import (
 from tiny_sima.goals import (
     ALL_SKILL_IDS,
     SKILL_IDS,
+    SKILL_MOBS,
     STONE_PICKAXE_SKILL_IDS,
     SkillGoal,
     SkillId,
@@ -61,6 +62,7 @@ from tiny_sima.goals import (
     is_crafting_skill,
     skill_index,
     skill_metric,
+    skill_mobs,
     skill_precondition,
     skill_target_block,
 )
@@ -570,8 +572,9 @@ def _is_walkable(map_array: np.ndarray, position: tuple[int, int]) -> bool:
 
 
 def _skill_target_positions(state: Any, skill_id: SkillId) -> set[tuple[int, int]]:
-    if skill_id is SkillId.EAT_COW:
-        positions = np.asarray(state.cows.position)[np.asarray(state.cows.mask)]
+    if skill_id in SKILL_MOBS:
+        mobs = skill_mobs(skill_id, state)
+        positions = np.asarray(mobs.position)[np.asarray(mobs.mask)]
     else:
         block = skill_target_block(skill_id)
         assert block is not None, skill_id
@@ -627,7 +630,7 @@ def _scripted_action(state: Any, skill_id: SkillId) -> int:
     interaction = get_skill_spec(skill_id).interaction_action
     if skill_id is SkillId.SLEEP:
         return interaction.value
-    if skill_target_block(skill_id) is None and skill_id is not SkillId.EAT_COW:
+    if skill_target_block(skill_id) is None and skill_id not in SKILL_MOBS:
         # A placement: face any free tile and place.
         front = np.asarray(state.player_position) + np.asarray(
             DIRECTIONS[int(state.player_direction)]

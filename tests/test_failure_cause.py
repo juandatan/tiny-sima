@@ -43,12 +43,14 @@ def test_skill_targets_come_from_the_registry() -> None:
         SkillId.COLLECT_COAL: "coal",
         SkillId.PLACE_STONE: None,
         SkillId.PLACE_FURNACE: None,
-        # Grass and cows are not remembered blocks.
+        # Grass and mobs are not remembered blocks.
         SkillId.COLLECT_SAPLING: None,
         SkillId.PLACE_PLANT: None,
         SkillId.EAT_COW: None,
         SkillId.SLEEP: None,
         SkillId.EAT_PLANT: "ripe_plant",
+        SkillId.DEFEAT_ZOMBIE: None,
+        SkillId.DEFEAT_SKELETON: None,
     }
 
 
