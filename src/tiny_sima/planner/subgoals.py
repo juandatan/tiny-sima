@@ -17,7 +17,9 @@ the planner follows the plan alone.
 
 The goal source is pluggable: a :class:`SubgoalSource` such as a scripted
 goal selector can stand in for the VLM, and its answers go through the same
-parsing, checking and rejection feedback.
+parsing, checking and rejection feedback. A source can also back the VLM up:
+when every answer of a decision is rejected and no earlier sub-goal is still
+reachable, the fallback answers once instead of the episode ending.
 
 The planner never sees the chain's formal goal. Turning the objective into
 sub-goals is the VLM's whole job, and the closed loop still judges success
@@ -211,7 +213,8 @@ class SubgoalEvent:
     decision_index: int
     subgoal: str
     # "proposed", "achieved", "already_held", "rejected", "abandoned",
-    # "timed_out" or "skill_failed".
+    # "timed_out" or "skill_failed". A sub-goal the fallback source proposed
+    # has reason "fallback".
     status: str
     reason: str = ""
 
@@ -235,6 +238,9 @@ class SubgoalPlan:
     trigger: ReplanTrigger | None = None
     trigger_detail: str = ""
     vlm_calls: int = 0
+    # Answers from the planner's fallback source, counted apart from the
+    # goal source's own calls.
+    fallback_calls: int = 0
     rejections: int = 0
     invalid_responses: int = 0
     # Alerts ("drink", "threat", "night", ...) already raised with the VLM.
@@ -291,6 +297,7 @@ class SubgoalPlan:
                 if event.decision_index == self.decision_index
             ],
             "vlm_calls": self.vlm_calls,
+            "fallback_calls": self.fallback_calls,
             "rejections": self.rejections,
             "invalid_responses": self.invalid_responses,
             "alerts": list(self.alerts),
@@ -587,6 +594,10 @@ class SubgoalPlanner:
     ``vital_thresholds`` raise an alert when a vital falls to its threshold,
     ``threat_radius`` when a hostile creature comes within that many tiles
     (Chebyshev), and ``replan_at_night`` at nightfall.
+    ``fallback`` answers once for an episode whose answers were all rejected
+    and whose earlier sub-goals are no longer reachable, so it keeps playing
+    rather than stopping; its sub-goals are proposed with reason
+    ``"fallback"``.
     """
 
     backend: VisionLanguageBackend | SubgoalSource
@@ -608,6 +619,7 @@ class SubgoalPlanner:
     vital_thresholds: tuple[tuple[str, int], ...] = DEFAULT_VITAL_THRESHOLDS
     threat_radius: int | None = None
     replan_at_night: bool = False
+    fallback: SubgoalSource | None = None
     _cache: dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
     def _belief(self, context: PlannerContext) -> Any:
@@ -788,16 +800,20 @@ class SubgoalPlanner:
         self._cache.update(zip(missing, responses, strict=True))
         return [self._cache[key] for key, _ in prepared]
 
-    def _accept(self, pending: SubgoalRequest, response: str) -> SubgoalPlan | None:
+    def _accept(
+        self, pending: SubgoalRequest, response: str, *, fallback: bool = False
+    ) -> SubgoalPlan | None:
         """Return the plan a response gives, or record why it was rejected.
 
         On rejection the episode's ``plan`` keeps the counts and events and
-        its ``feedback`` holds the reasons for the next round.
+        its ``feedback`` holds the reasons for the next round. ``fallback``
+        counts the response as the fallback source's rather than a call.
         """
 
         plan = replace(
             pending.plan,
-            vlm_calls=pending.plan.vlm_calls + 1,
+            vlm_calls=pending.plan.vlm_calls + (not fallback),
+            fallback_calls=pending.plan.fallback_calls + fallback,
             trigger=pending.trigger,
             raw_response=response,
         )
@@ -857,7 +873,9 @@ class SubgoalPlanner:
                 )
             return None
         for subgoal in accepted:
-            plan = plan.with_event(render_subgoal(subgoal), "proposed")
+            plan = plan.with_event(
+                render_subgoal(subgoal), "proposed", "fallback" if fallback else ""
+            )
         return replace(
             plan,
             pending=tuple(accepted),
@@ -939,7 +957,9 @@ class SubgoalPlanner:
         Each round asks the VLM once for every episode still without an
         accepted plan, so rejections cost a round rather than a serial call.
         An episode whose answers are all rejected keeps the plan it had, if
-        that plan is still reachable, and otherwise stops.
+        that plan is still reachable. Otherwise the fallback source answers
+        once, and without one, or when that answer is rejected too, the
+        episode stops.
         """
 
         if len(states) != len(contexts):
@@ -969,6 +989,8 @@ class SubgoalPlanner:
                 else:
                     plans[pending.index] = accepted
             waiting = rejected
+        fallback = self.fallback
+        stranded: list[SubgoalRequest] = []
         for pending in waiting:
             # Keep the counts and events from the failed rounds, but fall
             # back to the sub-goals the episode already had.
@@ -979,6 +1001,15 @@ class SubgoalPlanner:
             ):
                 kept = ()
             plans[pending.index] = replace(pending.plan, pending=kept)
+            if not kept and fallback is not None:
+                stranded.append(pending)
+        if fallback is not None and stranded:
+            responses = fallback.propose_subgoals(stranded)
+            for pending, response in zip(stranded, responses, strict=True):
+                accepted = self._accept(pending, response, fallback=True)
+                plans[pending.index] = (
+                    replace(pending.plan, pending=()) if accepted is None else accepted
+                )
         return [
             self._selection(state, context, plans[index])
             for index, (state, context) in enumerate(zip(states, contexts, strict=True))

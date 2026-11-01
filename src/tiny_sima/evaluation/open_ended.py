@@ -7,6 +7,8 @@ in an unmodified Craftax-Classic world, with creatures or without:
   multiplies by the competence prior.
 * ``subgoal_vlm`` asks the VLM for formal sub-goals over the achievements
   its skills unlock, re-asking on low vitals, nearby threats and nightfall.
+  When every answer of a decision is unreachable, the scripted curriculum
+  supplies the next sub-goal, so the episode goes on.
 * ``subgoal_scripted`` is the same sub-goal planner with a fixed curriculum,
   :class:`~tiny_sima.planner.goal_selector.ScriptedGoalSelector`, in place
   of the VLM.
@@ -176,6 +178,10 @@ def open_ended_episode_record(
         unlock.to_dict() for unlock in episode.achievement_unlocks
     ]
     record["vlm_calls"] = episode_vlm_calls(episode, planner)
+    plan = episode.final_plan_state
+    record["fallback_calls"] = (
+        plan.fallback_calls if isinstance(plan, SubgoalPlan) else 0
+    )
     return record
 
 
@@ -219,6 +225,10 @@ def summarize_open_ended(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]
             [record["environment_steps"] for record in records]
         ),
         "vlm_calls": _mean_std([record["vlm_calls"] for record in records]),
+        # Records saved before the fallback existed have none.
+        "fallback_calls": _mean_std(
+            [record.get("fallback_calls", 0) for record in records]
+        ),
         "termination_counts": {
             termination.value: sum(
                 record["termination"] == termination.value for record in records
@@ -322,12 +332,16 @@ def open_ended_planners(
 
     Without a prior, the SayCan Can term and the sub-goal tie-break fall
     back to reachability, as in notebook 06. Both sub-goal planners share
-    every setting but the goal source.
+    every setting but the goal source, and ``subgoal_vlm`` falls back on the
+    curriculum ``subgoal_scripted`` follows.
     """
 
     feasibility = prior if prior is not None else reachability_feasibility
 
-    def subgoal_planner(source: Any) -> SubgoalPlanner:
+    def curriculum() -> ScriptedGoalSelector:
+        return ScriptedGoalSelector(candidate_skills=candidate_skills, model=model)
+
+    def subgoal_planner(source: Any, **options: Any) -> SubgoalPlanner:
         return SubgoalPlanner(
             source,
             candidate_skills=candidate_skills,
@@ -339,6 +353,7 @@ def open_ended_planners(
             vital_thresholds=ALL_VITAL_THRESHOLDS,
             threat_radius=threat_radius,
             replan_at_night=True,
+            **options,
         )
 
     return {
@@ -352,8 +367,6 @@ def open_ended_planners(
             feasibility_scorer=feasibility,
             candidate_skills=candidate_skills,
         ),
-        "subgoal_vlm": subgoal_planner(backend),
-        "subgoal_scripted": subgoal_planner(
-            ScriptedGoalSelector(candidate_skills=candidate_skills, model=model)
-        ),
+        "subgoal_vlm": subgoal_planner(backend, fallback=curriculum()),
+        "subgoal_scripted": subgoal_planner(curriculum()),
     }

@@ -466,3 +466,74 @@ def test_the_reachable_subgoals_of_an_answer_are_kept() -> None:
     )
     _select(planner, _state(), later)
     assert "inventory.iron_pickaxe >= 1: rejected (" in backend.requests[1].user_prompt
+
+
+class FixedSource:
+    """A sub-goal source that gives the same answer to every request."""
+
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+        self.requests: list = []
+
+    def propose_subgoals(self, requests) -> list[str]:
+        self.requests.extend(requests)
+        return [self.answer] * len(requests)
+
+
+def test_the_fallback_answers_once_every_answer_is_rejected() -> None:
+    backend = ScriptedBackend(_answer(("inventory.iron_sword", 1)))
+    fallback = FixedSource(_answer(("inventory.wood_pickaxe", 1)))
+    planner = SubgoalPlanner(backend, max_rejections=1, fallback=fallback)
+
+    selection = _select(planner, _state(), PlannerContext(OBJECTIVE))
+
+    assert selection.status is PlannerSelectionStatus.SELECTED
+    assert selection.decision is not None
+    assert selection.decision.skill_id is SkillId.COLLECT_WOOD
+    assert len(backend.requests) == 2
+    assert len(fallback.requests) == 1
+    # The fallback sees the VLM's rejections among the events.
+    assert fallback.requests[0].plan.rejections == 2
+    plan = selection.plan_state
+    assert (plan.vlm_calls, plan.fallback_calls, plan.rejections) == (2, 1, 2)
+    assert plan.to_dict()["fallback_calls"] == 1
+    proposed = plan.events[-1]
+    assert (proposed.subgoal, proposed.status, proposed.reason) == (
+        "inventory.wood_pickaxe >= 1",
+        "proposed",
+        "fallback",
+    )
+
+
+def test_a_rejected_fallback_answer_still_stops() -> None:
+    backend = ScriptedBackend(_answer(("inventory.iron_sword", 1)))
+    fallback = FixedSource(_answer(("inventory.iron_sword", 1)))
+    planner = SubgoalPlanner(backend, max_rejections=0, fallback=fallback)
+
+    selection = _select(planner, _state(), PlannerContext(OBJECTIVE))
+
+    assert selection.status is PlannerSelectionStatus.NO_VIABLE_SKILL
+    plan = selection.plan_state
+    assert (plan.vlm_calls, plan.fallback_calls, plan.rejections) == (1, 1, 2)
+    assert plan.pending == ()
+
+
+def test_a_reachable_earlier_plan_is_kept_without_the_fallback() -> None:
+    backend = ScriptedBackend(
+        _answer(("inventory.stone_pickaxe", 1)), _answer(("inventory.iron_sword", 1))
+    )
+    fallback = FixedSource(_answer(("inventory.wood_pickaxe", 1)))
+    planner = SubgoalPlanner(backend, max_rejections=0, fallback=fallback)
+    first = _select(planner, _state(), PlannerContext(OBJECTIVE))
+
+    failed = PlannerContext(
+        OBJECTIVE,
+        history=(_attempt(SkillId.COLLECT_WOOD, SkillOutcome.TIMEOUT),),
+        plan_state=first.plan_state,
+    )
+    selection = _select(planner, _state(), failed)
+
+    assert fallback.requests == []
+    assert [render_subgoal(subgoal) for subgoal in selection.plan_state.pending] == [
+        "inventory.stone_pickaxe >= 1"
+    ]
