@@ -64,6 +64,7 @@ from tiny_sima.planner.saycan import (
     PlannerDecision,
     PlannerSelection,
     PlannerSelectionStatus,
+    SkillOutcome,
     SkillScore,
     catalog_feasibility,
     reachability_feasibility,
@@ -714,8 +715,12 @@ class SubgoalPlanner:
         """Advance past reached sub-goals and decide whether to ask the VLM."""
 
         decision_index = len(context.history)
-        # A defence fight spends no budget, and its failure is not the plan's.
-        defended = plan.defending
+        # A defence fight or an interrupted skill spends no budget, and
+        # neither failure is the plan's.
+        defended = plan.defending or (
+            bool(context.history)
+            and context.history[-1].outcome is SkillOutcome.INTERRUPTED
+        )
         spent = max(decision_index - plan.decision_index - int(defended), 0)
         trigger: ReplanTrigger | None = None
         detail = ""

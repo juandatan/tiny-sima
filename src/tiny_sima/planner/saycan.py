@@ -31,6 +31,9 @@ class SkillOutcome(str, Enum):
     PRECONDITION_LOST = "precondition_lost"
     ENVIRONMENT_TERMINATED = "environment_terminated"
     INFEASIBLE = "infeasible"
+    # Handed back to the planner early by a SkillInterruption rule, so
+    # neither a success nor a failure of the skill.
+    INTERRUPTED = "interrupted"
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,12 @@ class SkillAttempt:
     @property
     def succeeded(self) -> bool:
         return self.outcome is SkillOutcome.SUCCESS
+
+    @property
+    def failed(self) -> bool:
+        """Whether the skill ended without success and was not interrupted."""
+
+        return self.outcome not in (SkillOutcome.SUCCESS, SkillOutcome.INTERRUPTED)
 
 
 class PlannerMemory(Protocol):
@@ -574,7 +583,7 @@ class SayCanPlanner:
             utility = float(utility_batch.utilities.get(skill_id, 0.0))
             feasibility = feasibilities[skill_id]
             failures = sum(
-                attempt.skill_id is skill_id and not attempt.succeeded
+                attempt.skill_id is skill_id and attempt.failed
                 for attempt in context.history
             )
             failure_penalty = 1.0 / (1.0 + failures)

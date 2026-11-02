@@ -326,6 +326,16 @@ achievements as you can."
 
 - **Budget:** 80 skill calls or 3,000 environment steps. An episode also ends
   on death, or when the planner has nothing left to propose.
+- **Skill interruption:** a planner decides only between skills, and a skill
+  runs up to 64 steps, so a zombie that turns up mid-skill used to hit the
+  player until the skill ended. `SkillInterruption` in
+  [evaluation/chains.py](src/tiny_sima/evaluation/chains.py) ends a skill
+  `interrupted` when a zombie comes within 3 tiles or the player is hit while
+  food, drink and energy are above zero. The planner then decides again.
+  `defeat_zombie` is never interrupted. An interrupted skill takes a skill
+  call, but it does not count as a failure for SayCan's penalty, the
+  sub-goal trigger or budget, or memory's miss counts. It applies to all
+  three designs, and with creatures off it never fires.
 - **Scoring:** as in Crafter, the per-achievement success rate and their
   geometric mean. The report also breaks results down by tier: basic, wood,
   stone, iron and diamond, survival, combat.
@@ -572,8 +582,9 @@ Next steps, in order:
 4. **Run Experiments 3 to 5**, the feasibility study, model learning and the
    observation ablation.
 
-Deferred from the Phase 3 plan: learned skill termination, text-embedding
-skill conditioning, and paraphrase evaluation.
+Deferred from the Phase 3 plan: learned skill termination (the open-ended
+task uses the fixed `SkillInterruption` rule instead), text-embedding skill
+conditioning, and paraphrase evaluation.
 
 ## Quick start
 

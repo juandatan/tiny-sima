@@ -191,6 +191,20 @@ def test_a_close_zombie_is_fought_off_outside_the_plan() -> None:
     assert _select(unarmed, close, context).decision.skill_id is SkillId.COLLECT_WOOD
 
 
+def test_an_interrupted_skill_is_neither_a_failure_nor_budget() -> None:
+    backend = ScriptedBackend(_answer(("inventory.wood", 1)))
+    planner = SubgoalPlanner(backend, subgoal_slack=1)
+    state = _state()
+    plan = _select(planner, state, PlannerContext(OBJECTIVE)).plan_state
+
+    plan = _follow(
+        planner, state, plan, [_attempt(SkillId.COLLECT_WOOD, SkillOutcome.INTERRUPTED)]
+    )
+    assert plan.trigger is None
+    assert plan.skills_on_current == 0
+    assert len(backend.requests) == 1
+
+
 def test_nightfall_asks_once() -> None:
     backend = ScriptedBackend(_answer(("inventory.wood", 1)))
     planner = SubgoalPlanner(backend, replan_at_night=True)

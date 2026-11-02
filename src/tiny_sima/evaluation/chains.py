@@ -60,6 +60,7 @@ from tiny_sima.goals import (
     executor_skill_ids,
     get_skill_spec,
     is_crafting_skill,
+    mob_instances,
     skill_index,
     skill_metric,
     skill_mobs,
@@ -531,6 +532,67 @@ class BatchedChainOutput(NamedTuple):
     boundary_states: Any
 
 
+@dataclass(frozen=True)
+class SkillInterruption:
+    """When a running skill hands control back to the planner early.
+
+    A skill ends ``interrupted`` at the first step where the player loses
+    health while food, drink and energy are all above zero, which only a
+    creature does, or where one of ``mobs`` comes within ``threat_radius``
+    tiles (Chebyshev) after none was. The planner decides only between
+    skills, so without this a zombie that turns up mid-skill can hit the
+    player until the skill's horizon runs out. A skill that hunts one of
+    ``mobs`` is never interrupted: the fight is the answer to both.
+    """
+
+    threat_radius: int = 3
+    mobs: tuple[str, ...] = ("zombie",)
+
+    def exempts(self, skill_id: SkillId) -> bool:
+        """Whether ``skill_id`` runs on regardless."""
+
+        return SKILL_MOBS.get(skill_id) in self.mobs
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"threat_radius": self.threat_radius, "mobs": list(self.mobs)}
+
+
+def _threat_near(interruption: SkillInterruption, state: Any) -> jax.Array:
+    near = jnp.asarray(False)
+    for mob in interruption.mobs:
+        instances = mob_instances(mob, state)
+        distance = jnp.max(
+            jnp.abs(
+                jnp.asarray(instances.position) - jnp.asarray(state.player_position)
+            ),
+            axis=-1,
+        )
+        near |= jnp.any(
+            jnp.asarray(instances.mask) & (distance <= interruption.threat_radius)
+        )
+    return near
+
+
+def _interrupts(
+    interruption: SkillInterruption,
+    previous: Any,
+    state: Any,
+) -> jax.Array:
+    """Return whether the step from ``previous`` to ``state`` interrupts."""
+
+    # Health lost to an empty need is the planner's to answer at the next
+    # boundary, as before.
+    needs_met = jnp.asarray(True)
+    for world in (previous, state):
+        for need in (world.player_food, world.player_drink, world.player_energy):
+            needs_met &= jnp.asarray(need) > 0
+    hurt = needs_met & (
+        jnp.asarray(state.player_health) < jnp.asarray(previous.player_health)
+    )
+    arrived = _threat_near(interruption, state) & ~_threat_near(interruption, previous)
+    return hurt | arrived
+
+
 class SkillExecutor(Protocol):
     """Boundary implemented by scripted and learned low-level policies."""
 
@@ -542,8 +604,13 @@ class SkillExecutor(Protocol):
         rng: jax.Array,
         *,
         horizon: int,
+        interruption: SkillInterruption | None = None,
     ) -> SkillExecutionResult:
-        """Attempt one requested skill without resetting the world."""
+        """Attempt one requested skill without resetting the world.
+
+        With ``interruption``, the skill ends ``interrupted`` when its rule
+        fires.
+        """
 
         ...
 
@@ -734,6 +801,7 @@ class ScriptedSkillExecutor:
         rng: jax.Array,
         *,
         horizon: int,
+        interruption: SkillInterruption | None = None,
     ) -> SkillExecutionResult:
         skill_environment, episode_state = _start_skill(
             environment,
@@ -756,6 +824,7 @@ class ScriptedSkillExecutor:
         native_return = 0.0
         minimum, maximum = start, start
         current = episode_state
+        interruptible = interruption is not None and not interruption.exempts(skill_id)
         step_keys = jax.random.split(rng, horizon)
         for step_index in range(horizon):
             action = _scripted_action(current.env_state, skill_id)
@@ -764,13 +833,21 @@ class ScriptedSkillExecutor:
                 current,
                 jnp.asarray(action, dtype=jnp.int32),
             )
-            current = result.state
+            previous, current = current, result.state
             skill_return += float(np.asarray(result.reward))
             native_return += float(np.asarray(result.info["native_reward"]))
             counts = _inventory_counts(current.env_state)
             minimum = tuple(map(min, minimum, counts))
             maximum = tuple(map(max, maximum, counts))
             outcome = _outcome_from_step(result)
+            if (
+                interruptible
+                and outcome in (None, SkillOutcome.TIMEOUT)
+                and bool(
+                    _interrupts(interruption, previous.env_state, current.env_state)
+                )
+            ):
+                outcome = SkillOutcome.INTERRUPTED
             if outcome is not None:
                 return SkillExecutionResult(
                     state=current.env_state,
@@ -803,6 +880,7 @@ class BatchedSkillExecutor(Protocol):
         *,
         horizon: int,
         batch_size: int | None = None,
+        interruption: SkillInterruption | None = None,
     ) -> list[SkillExecutionResult]:
         """Attempt ``skill_ids[i]`` from ``states[i]`` with ``rngs[i]``."""
 
@@ -818,9 +896,17 @@ def _execute_many(
     *,
     horizon: int,
     batch_size: int | None = None,
+    interruption: SkillInterruption | None = None,
 ) -> list[SkillExecutionResult]:
-    """Run attempts together when the executor can, one by one otherwise."""
+    """Run attempts together when the executor can, one by one otherwise.
 
+    ``interruption`` is passed on only when set, so an executor without the
+    argument still runs uninterrupted skills.
+    """
+
+    options: dict[str, Any] = (
+        {} if interruption is None else {"interruption": interruption}
+    )
     if isinstance(executor, BatchedSkillExecutor):
         return executor.execute_many(
             environment,
@@ -829,9 +915,10 @@ def _execute_many(
             rngs,
             horizon=horizon,
             batch_size=batch_size,
+            **options,
         )
     return [
-        executor.execute(environment, state, skill_id, rng, horizon=horizon)
+        executor.execute(environment, state, skill_id, rng, horizon=horizon, **options)
         for state, skill_id, rng in zip(states, skill_ids, rngs, strict=True)
     ]
 
@@ -882,6 +969,7 @@ class LearnedSkillExecutor:
         rng: jax.Array,
         *,
         horizon: int,
+        interruption: SkillInterruption | None = None,
     ) -> SkillExecutionResult:
         return self.execute_many(
             environment,
@@ -889,6 +977,7 @@ class LearnedSkillExecutor:
             [skill_id],
             [rng],
             horizon=horizon,
+            interruption=interruption,
         )[0]
 
     def execute_many(
@@ -900,6 +989,7 @@ class LearnedSkillExecutor:
         *,
         horizon: int,
         batch_size: int | None = None,
+        interruption: SkillInterruption | None = None,
     ) -> list[SkillExecutionResult]:
         """Run independent attempts in parallel on device.
 
@@ -932,6 +1022,7 @@ class LearnedSkillExecutor:
             skill_embedding_size=self.config.skill_embedding_size,
             num_skills=self.config.num_skills,
             deterministic=self.deterministic,
+            interruption=interruption,
         )
         output = run(
             self.params,
@@ -1961,6 +2052,7 @@ def _batched_skill_execution(
     skill_embedding_size: int,
     deterministic: bool,
     num_skills: int = len(SKILL_IDS),
+    interruption: SkillInterruption | None = None,
 ) -> BatchedExecution:
     """Build and cache one compiled executor for a static batch shape.
 
@@ -1984,6 +2076,7 @@ def _batched_skill_execution(
         skill_embedding_size,
         num_skills,
         deterministic,
+        interruption,
     )
     cached = _BATCHED_EXECUTIONS.get(key)
     if cached is not None:
@@ -2000,6 +2093,14 @@ def _batched_skill_execution(
     precondition_lost_code = _PROBE_OUTCOMES.index(SkillOutcome.PRECONDITION_LOST)
     terminated_code = _PROBE_OUTCOMES.index(SkillOutcome.ENVIRONMENT_TERMINATED)
     infeasible_code = _PROBE_OUTCOMES.index(SkillOutcome.INFEASIBLE)
+    interrupted_code = _PROBE_OUTCOMES.index(SkillOutcome.INTERRUPTED)
+    # Indexed by executor skill index.
+    exempt = jnp.asarray(
+        [
+            interruption is not None and interruption.exempts(skill_id)
+            for skill_id in ALL_SKILL_IDS
+        ]
+    )
 
     def sample_action(logits: jax.Array, rng: jax.Array) -> jax.Array:
         return select_action(logits[None], rng, deterministic=deterministic)[0]
@@ -2069,16 +2170,29 @@ def _batched_skill_execution(
             steps = carry.steps + running.astype(jnp.int32)
             metric = _batched_skill_metric(skill_ids, state)
             success = running & (metric - initial_metric >= 1)
-            timeout = running & ~success & (steps >= skill_horizon)
             terminated = running & ~success & done
-            ended = success | timeout | terminated
+            if interruption is None:
+                interrupted = jnp.zeros_like(running)
+            else:
+                interrupted = (
+                    running
+                    & ~success
+                    & ~done
+                    & ~exempt[skill_ids]
+                    & jax.vmap(partial(_interrupts, interruption))(carry.state, state)
+                )
+            timeout = running & ~success & ~interrupted & (steps >= skill_horizon)
+            ended = success | timeout | terminated | interrupted
             # Same ordering as the skill environment: a lost precondition is
             # only reported once the option has ended for another reason.
-            precondition_lost = ended & ~success & ~_batched_skill_precondition(
-                skill_ids,
-                state,
+            precondition_lost = (
+                ended
+                & ~success
+                & ~interrupted
+                & ~_batched_skill_precondition(skill_ids, state)
             )
             outcome = jnp.where(timeout, timeout_code, terminated_code)
+            outcome = jnp.where(interrupted, interrupted_code, outcome)
             outcome = jnp.where(precondition_lost, precondition_lost_code, outcome)
             outcome = jnp.where(success, success_code, outcome)
 
@@ -2152,6 +2266,7 @@ def evaluate_chain_episodes(
     memory_factory: Callable[[], PlannerMemory] | None = None,
     max_environment_steps: int | None = None,
     stop_on_death: bool = False,
+    interruption: SkillInterruption | None = None,
 ) -> list[ChainEpisodeResult]:
     """Run independent planner/executor episodes in lockstep by decision.
 
@@ -2172,7 +2287,9 @@ def evaluate_chain_episodes(
     skills have taken that many steps. It is checked after each skill, so an
     episode can overrun it by less than one skill horizon. ``stop_on_death``
     ends one with ``DIED`` when a skill leaves the player dead. Every episode
-    records the achievements it unlocks and when.
+    records the achievements it unlocks and when. ``interruption`` lets a
+    skill end early on its rule; an interrupted skill still takes a
+    decision but does not count towards ``max_failures_per_skill``.
     """
 
     if max_decisions is None:
@@ -2249,6 +2366,7 @@ def evaluate_chain_episodes(
             # Padded to the episode count so one compiled loop serves every
             # decision, however many episodes are still running.
             batch_size=len(cursors),
+            interruption=interruption,
         )
         for (cursor, selection, decision, _), result in zip(
             executing,
@@ -2332,7 +2450,7 @@ def evaluate_chain_episodes(
                 )
             cursor.unlocked = unlocked
             failures = sum(
-                item.skill_id is decision.skill_id and not item.succeeded
+                item.skill_id is decision.skill_id and item.failed
                 for item in cursor.context.history
             )
             if stop_on_death and _died(cursor.state):

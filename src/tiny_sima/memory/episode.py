@@ -103,6 +103,7 @@ class FailureCause(str, Enum):
     DRINK_DEPLETED = "drink_depleted"
     ENERGY_DEPLETED = "energy_depleted"
     HEALTH_LOW = "health_low"
+    INTERRUPTED = "interrupted"
     INFEASIBLE = "infeasible"
     PRECONDITION_LOST = "precondition_lost"
     TARGET_NOT_SEEN = "target_not_seen"
@@ -220,7 +221,8 @@ def classify_failure(
        ran out during the request, in that order.
     4. ``health_low``: health fell during the request to ``low_health`` or
        below, with no vital run out to explain it.
-    5. ``infeasible`` and ``precondition_lost``, from the outcome.
+    5. ``interrupted``, ``infeasible`` and ``precondition_lost``, from the
+       outcome.
     6. For a timeout, ``target_not_seen`` when no instance of the skill's
        target block was known before the request, ``target_not_reached``
        when one was, and ``timeout`` for a skill without a target.
@@ -244,6 +246,8 @@ def classify_failure(
     health = _vital(post_state, "health")
     if health <= low_health and health < _vital(pre_state, "health"):
         return FailureCause.HEALTH_LOW
+    if outcome_value == "interrupted":
+        return FailureCause.INTERRUPTED
     if outcome_value == "infeasible":
         return FailureCause.INFEASIBLE
     if outcome_value == "precondition_lost":
@@ -470,12 +474,12 @@ class EpisodeMemory:
         )
         misses = dict(memory.misses)
         # Failing to hunt a mob while none is remembered counts against it the
-        # same way.
+        # same way. An interrupted skill did not get to look.
         target = COLLECT_RESOURCES.get(skill_id) or SKILL_MOBS.get(skill_id)
         if target is not None:
             if outcome_value == "success":
                 misses[target] = 0
-            elif not memory._remembered(target):
+            elif outcome_value != "interrupted" and not memory._remembered(target):
                 misses[target] += 1
         return dataclasses.replace(
             memory,

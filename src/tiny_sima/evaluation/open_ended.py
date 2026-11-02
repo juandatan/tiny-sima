@@ -37,6 +37,7 @@ from tiny_sima.evaluation.chains import (
     LearnedSkillExecutor,
     SkillChainSpec,
     SkillExecutor,
+    SkillInterruption,
     chain_episode_record,
     evaluate_chain_episodes,
 )
@@ -69,6 +70,9 @@ DEFAULT_MAX_ENVIRONMENT_STEPS = 3000
 # Hostile creatures within this many tiles (Chebyshev) trigger a re-ask: the
 # view's row radius, so anything visible above or below counts.
 DEFAULT_THREAT_RADIUS = 3
+# A skill hands back to the planner when a zombie comes that close or the
+# player is hurt, so the planners can fight it off mid-skill.
+DEFAULT_INTERRUPTION = SkillInterruption(threat_radius=DEFAULT_THREAT_RADIUS)
 
 ACHIEVEMENT_NAMES: tuple[str, ...] = tuple(
     achievement.name.lower() for achievement in Achievement
@@ -251,6 +255,7 @@ def evaluate_open_ended(
     max_failures_per_skill: int | None = None,
     memory_factory: Callable[[], PlannerMemory] | None = None,
     include_trace: bool = True,
+    interruption: SkillInterruption | None = DEFAULT_INTERRUPTION,
 ) -> dict[str, Any]:
     """Run the open-ended task and return its metrics and episode records.
 
@@ -260,7 +265,8 @@ def evaluate_open_ended(
     when the planner has nothing to propose. ``max_failures_per_skill`` is
     off by default, since the budget already bounds a stuck episode; the
     chain evals' limit of two would end most open-ended episodes on the
-    first hard resource.
+    first hard resource. ``interruption`` ends a skill early when a zombie
+    comes close or the player is hurt; ``None`` runs every skill to its end.
     """
 
     if num_episodes < 1:
@@ -286,6 +292,7 @@ def evaluate_open_ended(
         memory_factory=memory_factory,
         max_environment_steps=max_environment_steps,
         stop_on_death=True,
+        interruption=interruption,
     )
     records = [
         open_ended_episode_record(episode, planner, include_trace=include_trace)
@@ -298,6 +305,7 @@ def evaluate_open_ended(
         "skill_horizon": skill_horizon,
         "max_skill_calls": max_skill_calls,
         "max_environment_steps": max_environment_steps,
+        "interruption": None if interruption is None else interruption.to_dict(),
         "summary": summarize_open_ended(records),
         "episodes": records,
     }
