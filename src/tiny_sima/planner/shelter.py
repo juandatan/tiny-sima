@@ -227,24 +227,33 @@ def _use_wall(state: Any, walls: list[tuple[Position, int]]) -> int:
     return _towards(player, walls[0][0])
 
 
-def shelter_feasible(state: Any) -> bool:
-    """Whether the shelter can start: night, a pickaxe, food, drink, a room."""
+def shelter_blocker(state: Any) -> str | None:
+    """Why the shelter cannot start now, or ``None`` when it can."""
 
-    if not is_night(state) or _food(state) <= SHELTER_NEED_FLOOR:
-        return False
+    if not is_night(state):
+        return "it is day"
+    if _food(state) <= SHELTER_NEED_FLOOR:
+        return "food is too low to stay in"
     if int(np.asarray(state.inventory.wood_pickaxe)) < 1:
-        return False
+        return "it needs a wood pickaxe"
     room = choose_room(state)
     if room is None:
-        return False
+        return "there is no room to wall in nearby"
     world_map = np.asarray(state.map)
     # Low drink is fine in a room the player can drink inside.
     if needs_low(state) and not _walls_of(room, world_map, BlockType.WATER):
-        return False
-    return (
-        _stone(state) >= len(room.open_walls(world_map))
-        or _mine_stone(state, world_map, _player(state), _walls(room)) is not None
-    )
+        return "drink is too low to stay in"
+    if _stone(state) < len(room.open_walls(world_map)) and (
+        _mine_stone(state, world_map, _player(state), _walls(room)) is None
+    ):
+        return "there is too little stone and none to mine nearby"
+    return None
+
+
+def shelter_feasible(state: Any) -> bool:
+    """Whether the shelter can start: night, a pickaxe, food, drink, a room."""
+
+    return shelter_blocker(state) is None
 
 
 def _face(state: Any, move: int, action: Action) -> int:

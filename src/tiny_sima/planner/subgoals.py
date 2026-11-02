@@ -69,7 +69,7 @@ from tiny_sima.planner.saycan import (
     catalog_feasibility,
     reachability_feasibility,
 )
-from tiny_sima.planner.shelter import shelter_feasible
+from tiny_sima.planner.shelter import is_night, shelter_blocker
 from tiny_sima.planner.symbolic import (
     DEFAULT_MAX_PLAN_LENGTH,
     GoalCondition,
@@ -263,6 +263,8 @@ class SubgoalPlan:
     # current sub-goal, so it neither spends the sub-goal's budget nor counts
     # as the sub-goal's failure.
     defending: bool = False
+    # Whether the goal source chose to shelter for the rest of this night.
+    sheltering: bool = False
 
     @property
     def current(self) -> GoalCondition | None:
@@ -315,6 +317,7 @@ class SubgoalPlan:
             "skills_on_current": self.skills_on_current,
             "current_budget": self.current_budget,
             "defending": self.defending,
+            "sheltering": self.sheltering,
         }
 
 
@@ -327,6 +330,7 @@ class ParsedSubgoals:
     raw_response: str
     valid: bool
     error: str | None = None
+    shelter: bool = False
 
 
 def parse_subgoal_response(
@@ -365,19 +369,30 @@ def parse_subgoal_response(
         assessment=assessment if isinstance(assessment, str) else "",
         raw_response=text,
         valid=True,
+        shelter=payload.get("shelter") is True,
     )
 
 
-@lru_cache(maxsize=8)
 def subgoal_output_type(
     fields: tuple[str, ...] = SUBGOAL_FIELDS,
     max_subgoals: int = DEFAULT_MAX_SUBGOALS,
+    shelter: bool = False,
 ) -> Any:
     """Create the constrained Pydantic type consumed by Outlines.
 
     ``assessment`` comes first so the model states the situation before it
     commits to sub-goals; see ``_ranking_output_type`` in the VLM module.
+    With ``shelter`` the model also says whether to shelter for the night.
+    The same arguments, however passed, give the same type.
     """
+
+    return _subgoal_output_type(tuple(fields), max_subgoals, shelter)
+
+
+@lru_cache(maxsize=8)
+def _subgoal_output_type(
+    fields: tuple[str, ...], max_subgoals: int, shelter: bool
+) -> Any:
 
     try:
         from pydantic import (  # pyright: ignore[reportMissingImports]
@@ -402,10 +417,12 @@ def subgoal_output_type(
         field=(field_enum, ...),  # pyright: ignore[reportArgumentType]
         at_least=(int, Field(ge=1, le=_MAX_FIELD_VALUE)),
     )
+    choice: dict[str, Any] = {"shelter": (bool, ...)} if shelter else {}
     return create_model(
         "SubgoalOutput",
         __config__=ConfigDict(extra="forbid"),
         assessment=(str, Field(max_length=_ASSESSMENT_MAX_LENGTH)),
+        **choice,
         subgoals=(
             list[item_type],  # pyright: ignore[reportInvalidTypeForm]
             Field(min_length=1, max_length=max_subgoals),
@@ -441,17 +458,29 @@ _SUBGOAL_INSTRUCTIONS = (
 )
 
 
+_SHELTER_NOTE = (
+    "Zombies come out at night and hit hard, hardest while the player "
+    "sleeps. Also return shelter, true or false. True walls the player into "
+    "a small stone room until morning, where it sleeps and drinks from any "
+    "water beside it; that needs a wood pickaxe and stone or stone nearby, "
+    "and it leaves early when food runs low. Sub-goals wait until it is "
+    "out. False keeps working through the night. Shelter only counts at "
+    "night."
+)
+
+
 def build_subgoal_system_prompt(
     candidate_skills: Sequence[SkillId] = STONE_PICKAXE_SKILL_IDS,
     fields: Sequence[str] = SUBGOAL_FIELDS,
     max_subgoals: int = DEFAULT_MAX_SUBGOALS,
     observation: ObservationConfig | None = None,
+    shelter: bool = False,
 ) -> str:
     """Return the sub-goal planner's role, documentation and output format.
 
-    The achievement note and the observation legend appear only when the
-    fields include achievements or the observation has text, so the default
-    prompt is unchanged.
+    The achievement note, the shelter choice and the observation legend
+    appear only when the fields include achievements, ``shelter`` is set or
+    the observation has text, so the default prompt is unchanged.
     """
 
     has_achievements = any(name.startswith("achievement.") for name in fields)
@@ -460,6 +489,8 @@ def build_subgoal_system_prompt(
         fields=", ".join(fields),
         achievement_note=_ACHIEVEMENT_NOTE if has_achievements else "",
     )
+    if shelter:
+        instructions = f"{instructions} {_SHELTER_NOTE}"
     prompt = instructions + "\n" + _mechanics_line(candidate_skills)
     if observation is not None:
         observation_text = observation_system_text(observation)
@@ -492,8 +523,12 @@ def build_subgoal_prompt(
     fields: Sequence[str] = SUBGOAL_FIELDS,
     max_events: int = DEFAULT_MAX_EVENTS,
     observation: ObservationConfig | None = None,
+    shelter: bool = False,
 ) -> str:
-    """Return the user prompt for one sub-goal request."""
+    """Return the user prompt for one sub-goal request.
+
+    With ``shelter`` it says whether the shelter could start now, and why not.
+    """
 
     lines = [
         f"Objective: {context.objective}",
@@ -524,6 +559,12 @@ def build_subgoal_prompt(
                     for event in plan.events[-max_events:]
                 ]
             )
+        )
+    if shelter:
+        blocker = shelter_blocker(state)
+        lines.append(
+            "Shelter: "
+            + ("possible now." if blocker is None else f"not possible now: {blocker}.")
         )
     if feedback:
         lines.append("Planner rejected your last answer: " + " ".join(feedback))
@@ -608,10 +649,11 @@ class SubgoalPlanner:
     (Chebyshev), and ``replan_at_night`` at nightfall. A mob in
     ``defend_against`` within ``threat_radius`` is fought at once with its
     hunting skill, when that is a candidate, before the plan goes on.
-    With ``shelter_at_night`` the player walls itself in with the scripted
-    ``shelter`` skill whenever night falls and it can (see
-    :mod:`tiny_sima.planner.shelter`); like a defence fight, that spends no
-    sub-goal budget.
+    With ``shelter_at_night`` the goal source is offered the scripted
+    ``shelter`` skill (see :mod:`tiny_sima.planner.shelter`): its answer says
+    whether to wall the player in, and once accepted at night the player
+    shelters whenever it can until morning. Like a defence fight, that
+    spends no sub-goal budget.
     ``fallback`` answers once for an episode whose answers were all rejected
     and whose earlier sub-goals are no longer reachable, so it keeps playing
     rather than stopping; its sub-goals are proposed with reason
@@ -738,6 +780,8 @@ class SubgoalPlanner:
             raw_response=None,
             skills_on_current=plan.skills_on_current + spent,
             defending=False,
+            # A shelter chosen for one night lapses at dawn.
+            sheltering=plan.sheltering and is_night(state),
         )
         if plan.vlm_calls == 0:
             trigger = ReplanTrigger.START
@@ -808,6 +852,7 @@ class SubgoalPlanner:
             self.fields,
             self.max_subgoals,
             observation=self.observation,
+            shelter=self.shelter_at_night,
         )
         user_prompt = build_subgoal_prompt(
             pending.state,
@@ -818,6 +863,7 @@ class SubgoalPlanner:
             fields=self.fields,
             max_events=self.max_events,
             observation=self.observation,
+            shelter=self.shelter_at_night,
         )
         cache_key = sha256(
             system_prompt.encode("utf-8")
@@ -829,7 +875,9 @@ class SubgoalPlanner:
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             candidate_skills=self.candidate_skills,
-            output_type=subgoal_output_type(self.fields, self.max_subgoals),
+            output_type=subgoal_output_type(
+                self.fields, self.max_subgoals, self.shelter_at_night
+            ),
         )
 
     def _generate(self, waiting: Sequence[SubgoalRequest]) -> list[str]:
@@ -868,6 +916,18 @@ class SubgoalPlanner:
         accepted: list[GoalCondition] = []
         reasons: list[str] = []
         held: list[str] = []
+        sheltering = False
+        # The latest answer at night decides; by day the choice is moot.
+        if self.shelter_at_night and parsed.shelter and is_night(pending.state):
+            blocker = shelter_blocker(pending.state)
+            if blocker is None:
+                sheltering = True
+                plan = plan.with_event(
+                    "shelter", "proposed", "fallback" if fallback else ""
+                )
+            else:
+                reasons.append(f"shelter: {blocker}")
+                plan = plan.with_event("shelter", "rejected", blocker)
         # Sub-goals an earlier round of this decision already reported as
         # held; the 2B model repeats them until its rounds run out.
         reported = {
@@ -905,6 +965,14 @@ class SubgoalPlanner:
         # events with their reasons, which the next request shows. Turning
         # the whole answer down for one unreachable sub-goal ended episodes
         # where the VLM kept asking for food with no cow left.
+        if sheltering and not accepted:
+            # The night's shelter alone is a plan; the sub-goals wait.
+            return replace(
+                plan,
+                pending=pending.plan.pending,
+                assessment=parsed.assessment,
+                sheltering=True,
+            )
         if not accepted:
             pending.plan = replace(plan, rejections=plan.rejections + 1)
             pending.feedback = (*reasons, *held)
@@ -925,6 +993,7 @@ class SubgoalPlanner:
             assessment=parsed.assessment,
             skills_on_current=0,
             current_budget=None,
+            sheltering=sheltering,
         )
 
     def _selection(
@@ -940,7 +1009,7 @@ class SubgoalPlanner:
             return self._selected(
                 state, context, replace(plan, defending=True), {defence}
             )
-        if self.shelter_at_night and shelter_feasible(state):
+        if plan.sheltering and shelter_blocker(state) is None:
             return self._selected(
                 state, context, replace(plan, defending=True), {SkillId.SHELTER}
             )

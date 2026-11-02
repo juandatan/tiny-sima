@@ -1,3 +1,5 @@
+import json
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -22,6 +24,7 @@ from tiny_sima.evaluation.chains import (
     evaluate_chain_episodes,
 )
 from tiny_sima.goals import ALL_SKILL_IDS, SkillId
+from tiny_sima.planner.goal_selector import ScriptedGoalSelector
 from tiny_sima.planner.saycan import (
     PlannerContext,
     SayCanPlanner,
@@ -34,7 +37,7 @@ from tiny_sima.planner.shelter import (
     shelter_action,
     shelter_feasible,
 )
-from tiny_sima.planner.subgoals import SubgoalPlanner
+from tiny_sima.planner.subgoals import SubgoalPlanner, render_subgoal
 
 
 def _at(state, timestep):
@@ -146,26 +149,98 @@ def test_a_water_wall_is_drunk_from_instead_of_leaving() -> None:
     assert int(result.state.player_drink) > 2
 
 
-def _night_planner(**options):
-    backend = ScriptedBackend(_answer(("inventory.wood", 1)))
-    return SubgoalPlanner(backend, candidate_skills=(SkillId.COLLECT_WOOD,), **options)
+def _shelter_answer(shelter: bool) -> str:
+    answer = json.loads(_answer(("inventory.wood", 1)))
+    return json.dumps({"shelter": shelter, **answer})
 
 
-def test_night_sends_the_planner_to_shelter() -> None:
-    state, _ = _sealed()
-    selection = _select(
-        _night_planner(shelter_at_night=True), state, PlannerContext(OBJECTIVE)
+def _night_planner(shelter: bool = True, **options):
+    backend = ScriptedBackend(_shelter_answer(shelter))
+    options.setdefault("shelter_at_night", True)
+    planner = SubgoalPlanner(
+        backend, candidate_skills=(SkillId.COLLECT_WOOD,), **options
     )
+    return planner, backend
+
+
+def test_the_vlm_chooses_to_shelter_at_night() -> None:
+    state, _ = _sealed()
+    planner, backend = _night_planner()
+    selection = _select(planner, state, PlannerContext(OBJECTIVE))
+
     assert selection.decision.skill_id is SkillId.SHELTER
     assert selection.plan_state.defending
+    assert selection.plan_state.sheltering
     assert SkillId.SHELTER in {score.skill_id for score in selection.decision.scores}
+    # The sub-goals wait for the morning.
+    assert [render_subgoal(goal) for goal in selection.plan_state.pending] == [
+        "inventory.wood >= 1"
+    ]
+    (request,) = backend.requests
+    assert "Also return shelter" in request.system_prompt
+    assert "Shelter: possible now." in request.user_prompt
 
+
+def test_the_planner_keeps_working_unless_the_vlm_shelters() -> None:
+    state, _ = _sealed()
     for planner, world in (
-        (_night_planner(shelter_at_night=True), _at(state, 0)),
-        (_night_planner(), state),
+        (_night_planner(shelter=False)[0], state),
+        (_night_planner()[0], _at(state, 0)),
+        (_night_planner(shelter_at_night=False)[0], state),
     ):
         selection = _select(planner, world, PlannerContext(OBJECTIVE))
         assert selection.decision.skill_id is SkillId.COLLECT_WOOD
+        assert not selection.plan_state.sheltering
+    # Without the option the prompt is unchanged.
+    planner, backend = _night_planner(shelter_at_night=False)
+    _select(planner, state, PlannerContext(OBJECTIVE))
+    assert "shelter" not in backend.requests[0].system_prompt.lower()
+
+
+def test_a_shelter_the_player_cannot_build_is_turned_down() -> None:
+    state, _ = _sealed()
+    planner, backend = _night_planner()
+    selection = _select(
+        planner, _with_inventory(state, wood_pickaxe=0), PlannerContext(OBJECTIVE)
+    )
+    assert selection.decision.skill_id is SkillId.COLLECT_WOOD
+    assert "Shelter: not possible now: it needs a wood pickaxe." in (
+        backend.requests[0].user_prompt
+    )
+    assert any(
+        event.subgoal == "shelter"
+        and event.status == "rejected"
+        and event.reason == "it needs a wood pickaxe"
+        for event in selection.plan_state.events
+    )
+
+
+def test_the_shelter_lapses_at_dawn() -> None:
+    state, _ = _sealed()
+    planner, _ = _night_planner()
+    night = _select(planner, state, PlannerContext(OBJECTIVE))
+    context = PlannerContext(OBJECTIVE, plan_state=night.plan_state)
+
+    again = _select(planner, state, context)
+    assert again.decision.skill_id is SkillId.SHELTER
+    morning = _select(planner, _at(state, 0), context)
+    assert morning.decision.skill_id is SkillId.COLLECT_WOOD
+    assert not morning.plan_state.sheltering
+
+
+def test_the_curriculum_shelters_whenever_it_can() -> None:
+    state, _ = _sealed()
+    selector = ScriptedGoalSelector(
+        candidate_skills=(SkillId.COLLECT_WOOD,), shelter_at_night=True
+    )
+    planner = SubgoalPlanner(
+        selector, candidate_skills=(SkillId.COLLECT_WOOD,), shelter_at_night=True
+    )
+    assert _select(planner, state, PlannerContext(OBJECTIVE)).decision.skill_id is (
+        SkillId.SHELTER
+    )
+    day = _select(planner, _at(state, 0), PlannerContext(OBJECTIVE))
+    assert day.decision.skill_id is SkillId.COLLECT_WOOD
 
 
 class _Recording:

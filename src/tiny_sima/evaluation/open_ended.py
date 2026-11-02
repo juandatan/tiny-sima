@@ -343,9 +343,10 @@ def open_ended_planners(
     back to reachability, as in notebook 06. Both sub-goal planners share
     every setting but the goal source, and ``subgoal_vlm`` falls back on the
     curriculum ``subgoal_scripted`` follows. Both fight off a zombie within
-    ``threat_radius`` before going on with their plan, and with
-    ``shelter_at_night`` wall themselves in with stone to sleep through each
-    night they can.
+    ``threat_radius`` before going on with their plan. With
+    ``shelter_at_night`` their goal source chooses whether to wall the
+    player in with stone for the night: the VLM decides, and the curriculum
+    shelters whenever it can.
     """
 
     feasibility = prior if prior is not None else reachability_feasibility
@@ -355,6 +356,7 @@ def open_ended_planners(
             candidate_skills=candidate_skills,
             model=model,
             vital_rules=SURVIVAL_VITAL_RULES,
+            shelter_at_night=shelter_at_night,
         )
 
     def subgoal_planner(source: Any, **options: Any) -> SubgoalPlanner:

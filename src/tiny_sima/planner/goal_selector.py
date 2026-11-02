@@ -11,6 +11,7 @@ fixed tech-tree order, that the symbolic planner can reach. An achievement
 that has timed out, been abandoned or been rejected ``max_failures`` times is
 skipped for the rest of the episode, and one rejected earlier in the same
 decision is skipped at once, so a re-ask moves on to the next candidate.
+Offered the night shelter, it takes it whenever the shelter can start.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from craftax.craftax_classic.constants import Achievement
 
 from tiny_sima.goals import STONE_PICKAXE_SKILL_IDS, SkillId, StateRequirement
 from tiny_sima.planner.observation import vitals
+from tiny_sima.planner.shelter import shelter_blocker
 from tiny_sima.planner.subgoals import SubgoalRequest, render_subgoal
 from tiny_sima.planner.symbolic import (
     DEFAULT_MAX_PLAN_LENGTH,
@@ -94,16 +96,17 @@ def achievement_subgoal(achievement: Achievement) -> GoalCondition:
     return (StateRequirement(field, "at_least", 1),)
 
 
-def _answer(subgoal: GoalCondition, assessment: str) -> str:
-    return json.dumps(
-        {
-            "assessment": assessment,
-            "subgoals": [
-                {"field": requirement.field, "at_least": int(requirement.value)}
-                for requirement in subgoal
-            ],
-        }
-    )
+def _answer(
+    subgoal: GoalCondition, assessment: str, shelter: bool | None = None
+) -> str:
+    answer: dict[str, object] = {"assessment": assessment}
+    if shelter is not None:
+        answer["shelter"] = shelter
+    answer["subgoals"] = [
+        {"field": requirement.field, "at_least": int(requirement.value)}
+        for requirement in subgoal
+    ]
+    return json.dumps(answer)
 
 
 @dataclass(frozen=True)
@@ -113,7 +116,8 @@ class ScriptedGoalSelector:
     ``candidate_skills`` and ``model`` should be the planner's, so that the
     selector only proposes what the planner will accept. With
     ``use_memory_belief`` the world facts come from the episode memory when
-    it has any, as in the planner.
+    it has any, as in the planner. With ``shelter_at_night``, which should
+    match the planner's, every answer says to shelter when it can start.
 
     When no candidate is left it answers with :data:`NOTHING_TO_DO`, which
     always holds, so the planner rejects it as it would a VLM that has run
@@ -129,6 +133,7 @@ class ScriptedGoalSelector:
     vital_rules: tuple[tuple[str, int, int], ...] = DEFAULT_VITAL_RULES
     max_failures: int = DEFAULT_MAX_FAILURES
     failure_statuses: tuple[str, ...] = DEFAULT_FAILURE_STATUSES
+    shelter_at_night: bool = False
 
     def candidates(self, request: SubgoalRequest) -> list[GoalCondition]:
         """Return the sub-goals worth proposing, in priority order."""
@@ -150,6 +155,9 @@ class ScriptedGoalSelector:
         """Return the JSON answer for one request."""
 
         plan = request.plan
+        shelter = (
+            shelter_blocker(request.state) is None if self.shelter_at_night else None
+        )
         rejected_now = {
             event.subgoal
             for event in plan.events
@@ -178,8 +186,8 @@ class ScriptedGoalSelector:
                 max_plan_length=self.max_plan_length,
             )
             if check.reachable and not check.already_holds:
-                return _answer(subgoal, f"next: {text}")
-        return _answer(NOTHING_TO_DO, "nothing left to reach")
+                return _answer(subgoal, f"next: {text}", shelter)
+        return _answer(NOTHING_TO_DO, "nothing left to reach", shelter)
 
     def propose_subgoals(self, requests: Sequence[SubgoalRequest]) -> list[str]:
         return [self.select(request) for request in requests]
