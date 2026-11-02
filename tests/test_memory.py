@@ -154,6 +154,18 @@ def test_a_failed_hunt_with_a_cow_remembered_is_not_a_miss() -> None:
     assert memory.world_fact("world.cow_reachable") == 1
 
 
+def test_skeletons_count_only_while_one_is_remembered() -> None:
+    # Skeletons keep to the dark tunnels, so never having seen one is
+    # evidence enough to leave defeat_skeleton off the plan.
+    bare = _grass_world()
+    memory = EpisodeMemory().observe(bare)
+    assert memory.world_fact("world.skeleton_reachable") == 0
+    assert memory.world_fact("world.zombie_reachable") == 1
+
+    seen = memory.observe(_with_mobs(bare, skeleton=[(1, 1)]))
+    assert seen.world_fact("world.skeleton_reachable") == 1
+
+
 def test_world_facts() -> None:
     memory = EpisodeMemory()
     assert memory.world_fact("world.tree_reachable") == 1

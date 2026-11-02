@@ -154,8 +154,9 @@ def test_failed_hunts_rule_the_mob_out(skill_id: SkillId) -> None:
     )
     field = f"world.{COMBAT[skill_id]}_reachable"
     memory = EpisodeMemory().observe(state)
-    # Mobs keep spawning, so none in sight does not rule them out.
-    assert memory.world_fact(field) == 1
+    # Zombies keep spawning, so none in sight does not rule them out, while
+    # skeletons keep to the tunnels and count only once one has been seen.
+    assert memory.world_fact(field) == int(skill_id is SkillId.DEFEAT_ZOMBIE)
     for _ in range(2):
         memory = memory.record(state, skill_id, SkillOutcome.INFEASIBLE, 0, state)
     assert memory.ruled_out(COMBAT[skill_id])

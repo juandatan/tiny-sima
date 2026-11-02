@@ -147,6 +147,50 @@ def test_a_close_zombie_raises_one_threat_alert() -> None:
     assert plan.alerts == ()
 
 
+def test_a_close_zombie_is_fought_off_outside_the_plan() -> None:
+    backend = ScriptedBackend(_answer(("inventory.wood", 1)))
+    skills = (SkillId.COLLECT_WOOD, SkillId.DEFEAT_ZOMBIE)
+    planner = SubgoalPlanner(
+        backend,
+        candidate_skills=skills,
+        subgoal_slack=1,
+        threat_radius=2,
+        defend_against=("zombie",),
+    )
+    state = _grass_world(tree=[(0, 2)])
+    plan = _select(planner, state, PlannerContext(OBJECTIVE)).plan_state
+
+    # The threat re-asks once, and the zombie is fought while it stays close.
+    close = _with_mobs(state, "zombies", (1, 1))
+    attempts = [_attempt(SkillId.COLLECT_WOOD)]
+    for _ in range(2):
+        context = PlannerContext(OBJECTIVE, history=tuple(attempts), plan_state=plan)
+        fight = _select(planner, close, context)
+        assert fight.decision.skill_id is SkillId.DEFEAT_ZOMBIE
+        plan = fight.plan_state
+        assert plan.defending
+        attempts.append(_attempt(SkillId.DEFEAT_ZOMBIE, SkillOutcome.TIMEOUT))
+    assert len(backend.requests) == 2
+
+    # A failed fight is neither the sub-goal's failure nor part of its budget.
+    context = PlannerContext(OBJECTIVE, history=tuple(attempts), plan_state=plan)
+    after = _select(planner, state, context)
+    assert after.decision.skill_id is SkillId.COLLECT_WOOD
+    assert after.plan_state.trigger is None
+    assert after.plan_state.skills_on_current == 0
+    assert not after.plan_state.defending
+
+    # Without the hunting skill there is nothing to fight with.
+    unarmed = SubgoalPlanner(
+        backend,
+        candidate_skills=(SkillId.COLLECT_WOOD,),
+        threat_radius=2,
+        defend_against=("zombie",),
+    )
+    context = PlannerContext(OBJECTIVE, history=tuple(attempts[:1]), plan_state=plan)
+    assert _select(unarmed, close, context).decision.skill_id is SkillId.COLLECT_WOOD
+
+
 def test_nightfall_asks_once() -> None:
     backend = ScriptedBackend(_answer(("inventory.wood", 1)))
     planner = SubgoalPlanner(backend, replan_at_night=True)

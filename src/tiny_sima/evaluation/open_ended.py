@@ -42,7 +42,7 @@ from tiny_sima.evaluation.chains import (
 )
 from tiny_sima.goals import STONE_PICKAXE_SKILL_IDS, SkillId
 from tiny_sima.planner.competence import CompetencePrior
-from tiny_sima.planner.goal_selector import ScriptedGoalSelector
+from tiny_sima.planner.goal_selector import SURVIVAL_VITAL_RULES, ScriptedGoalSelector
 from tiny_sima.planner.observation import ObservationConfig
 from tiny_sima.planner.saycan import (
     PlannerMemory,
@@ -333,13 +333,18 @@ def open_ended_planners(
     Without a prior, the SayCan Can term and the sub-goal tie-break fall
     back to reachability, as in notebook 06. Both sub-goal planners share
     every setting but the goal source, and ``subgoal_vlm`` falls back on the
-    curriculum ``subgoal_scripted`` follows.
+    curriculum ``subgoal_scripted`` follows. Both fight off a zombie within
+    ``threat_radius`` before going on with their plan.
     """
 
     feasibility = prior if prior is not None else reachability_feasibility
 
     def curriculum() -> ScriptedGoalSelector:
-        return ScriptedGoalSelector(candidate_skills=candidate_skills, model=model)
+        return ScriptedGoalSelector(
+            candidate_skills=candidate_skills,
+            model=model,
+            vital_rules=SURVIVAL_VITAL_RULES,
+        )
 
     def subgoal_planner(source: Any, **options: Any) -> SubgoalPlanner:
         return SubgoalPlanner(
@@ -353,6 +358,7 @@ def open_ended_planners(
             vital_thresholds=ALL_VITAL_THRESHOLDS,
             threat_radius=threat_radius,
             replan_at_night=True,
+            defend_against=("zombie",),
             **options,
         )
 

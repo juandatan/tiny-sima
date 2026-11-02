@@ -84,6 +84,9 @@ COLLECT_RESOURCES: dict[SkillId, str] = {
 
 _WORLD_FACTS = {f"world.{block}_reachable": block for block in RESOURCE_BLOCKS}
 _MOB_FACTS = {mob_field(mob): mob for mob in MOB_TYPES}
+# Mobs that live only in the dark tunnel areas rather than spawning near the
+# player, so one counts as reachable only while a sighting is remembered.
+SIGHTED_MOBS = frozenset(("skeleton",))
 
 
 class FailureCause(str, Enum):
@@ -490,7 +493,8 @@ class EpisodeMemory:
         holds none. ``None`` means the field is not a world fact this memory
         answers. Grass, like free ground, is everywhere, so it counts as
         obtainable. So do the mobs, which keep spawning, until failed hunts
-        rule them out.
+        rule them out, except :data:`SIGHTED_MOBS`, which count only while
+        one is remembered.
         """
 
         block = _WORLD_FACTS.get(field)
@@ -499,7 +503,10 @@ class EpisodeMemory:
                 return int(bool(self.positions(block)))
             return int(not self.ruled_out(block))
         if field in _MOB_FACTS:
-            return int(not self.ruled_out(_MOB_FACTS[field]))
+            mob = _MOB_FACTS[field]
+            if mob in SIGHTED_MOBS:
+                return int(self._remembered(mob))
+            return int(not self.ruled_out(mob))
         if field in {"world.placement_space_reachable", "world.grass_reachable"}:
             return 1
         return None

@@ -36,6 +36,7 @@ from tiny_sima.planner import (
     SubgoalPlanner,
     achievement_subgoal,
 )
+from tiny_sima.planner.goal_selector import SURVIVAL_VITAL_RULES
 from tiny_sima.planner.subgoals import (
     ALL_VITAL_THRESHOLDS,
     OPEN_ENDED_SUBGOAL_FIELDS,
@@ -509,6 +510,9 @@ def test_design_factory_builds_the_three_designs() -> None:
         assert planner.vital_thresholds == ALL_VITAL_THRESHOLDS
         assert planner.threat_radius is not None
         assert planner.replan_at_night
+        assert planner.defend_against == ("zombie",)
+    for selector in (vlm.fallback, scripted.backend):
+        assert selector.vital_rules == SURVIVAL_VITAL_RULES
 
     # The scripted design answers without the VLM.
     selection = scripted.select_many(

@@ -135,10 +135,13 @@ and a sound external checker verifies and gives feedback.
   - **A sub-goal times out:** it is not reached within its plan length plus
     `subgoal_slack = 4` skills.
   - **A vital drops** to its threshold or below. This fires once per spell.
-    The thresholds default to drink alone, and `ALL_VITAL_THRESHOLDS` covers
-    health, food, drink and energy.
+    The thresholds default to drink alone. `ALL_VITAL_THRESHOLDS` covers
+    health, food and drink at 5, so there is time to restock before night,
+    and energy at 3, since sleeping in the open is when zombies hit hardest.
   - **A hostile creature comes close**, within `threat_radius`. Off by
-    default.
+    default. A mob in `defend_against` within that radius is also fought
+    at once with its hunting skill, outside the plan: the fight neither
+    spends the sub-goal's budget nor counts as its failure.
   - **Night falls**, if `replan_at_night` is set. Off by default.
   - **The current sub-goal becomes unreachable.**
 
@@ -330,14 +333,18 @@ achievements as you can."
   1. `saycan_recipe_aware`: the per-turn VLM, with the recipe-aware prompt
      and the competence prior.
   2. `subgoal_vlm`: VLM sub-goals over the achievements its skills unlock.
-     It uses all four vitals, a threat radius of 3 and nightfall triggers.
+     It uses all four vitals, a threat radius of 3 and nightfall triggers,
+     and fights off a zombie within that radius. Memory counts a skeleton
+     reachable only once one has been seen, since skeletons keep to the dark
+     tunnels.
      When every answer is rejected and no earlier sub-goal is still
      reachable, it takes the curriculum's next sub-goal instead of ending
      the episode. These fallback calls are counted apart from VLM calls.
   3. `subgoal_scripted`: the same sub-goal planner with
      `ScriptedGoalSelector` in place of the VLM. The selector gives survival
-     first, then a fixed tech-tree order, and skips a goal after two
-     failures. It is what the VLM has to beat.
+     first, drink and food at 5 with no sleep rule, then a fixed tech-tree
+     order, and skips a goal after two failures. It shares the zombie
+     defence. It is what the VLM has to beat.
 
 The planners offer every skill the executor knows, and each skill unlocks
 one achievement, so the skill set caps the score:

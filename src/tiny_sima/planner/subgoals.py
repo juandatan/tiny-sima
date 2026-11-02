@@ -43,6 +43,7 @@ from tiny_sima.envs.craftax import render_state
 from tiny_sima.goals import (
     ACHIEVEMENT_FIELDS,
     SKILL_ACHIEVEMENTS,
+    SKILL_MOBS,
     STONE_PICKAXE_SKILL_IDS,
     SkillId,
     StateRequirement,
@@ -108,13 +109,17 @@ DEFAULT_SUBGOAL_SLACK = 4
 # The vital readings, as :func:`vitals` names them, that raise an alert at or
 # below a threshold. Only drink has a skill that restores it so far.
 DEFAULT_VITAL_THRESHOLDS: tuple[tuple[str, int], ...] = (("drink", 3),)
+# Every vital. Health, food and drink alert early, while there is time to
+# restock before night; energy alerts late, since sleeping in the open is
+# when zombies hit hardest.
 ALL_VITAL_THRESHOLDS: tuple[tuple[str, int], ...] = (
-    ("health", 3),
-    ("food", 3),
-    ("drink", 3),
+    ("health", 5),
+    ("food", 5),
+    ("drink", 5),
     ("energy", 3),
 )
 HOSTILE_MOBS: tuple[str, ...] = ("zombie", "skeleton")
+_HUNTING_SKILLS: dict[str, SkillId] = {mob: skill for skill, mob in SKILL_MOBS.items()}
 _ASSESSMENT_MAX_LENGTH = 120
 _MAX_FIELD_VALUE = 9
 
@@ -252,6 +257,10 @@ class SubgoalPlan:
     skills_on_current: int = 0
     current_budget: int | None = None
     raw_response: str | None = None
+    # Whether this decision fights off a nearby mob rather than following the
+    # current sub-goal, so it neither spends the sub-goal's budget nor counts
+    # as the sub-goal's failure.
+    defending: bool = False
 
     @property
     def current(self) -> GoalCondition | None:
@@ -303,6 +312,7 @@ class SubgoalPlan:
             "alerts": list(self.alerts),
             "skills_on_current": self.skills_on_current,
             "current_budget": self.current_budget,
+            "defending": self.defending,
         }
 
 
@@ -593,7 +603,9 @@ class SubgoalPlanner:
     skills before it times out; ``None`` never times out.
     ``vital_thresholds`` raise an alert when a vital falls to its threshold,
     ``threat_radius`` when a hostile creature comes within that many tiles
-    (Chebyshev), and ``replan_at_night`` at nightfall.
+    (Chebyshev), and ``replan_at_night`` at nightfall. A mob in
+    ``defend_against`` within ``threat_radius`` is fought at once with its
+    hunting skill, when that is a candidate, before the plan goes on.
     ``fallback`` answers once for an episode whose answers were all rejected
     and whose earlier sub-goals are no longer reachable, so it keeps playing
     rather than stopping; its sub-goals are proposed with reason
@@ -619,6 +631,7 @@ class SubgoalPlanner:
     vital_thresholds: tuple[tuple[str, int], ...] = DEFAULT_VITAL_THRESHOLDS
     threat_radius: int | None = None
     replan_at_night: bool = False
+    defend_against: tuple[str, ...] = ()
     fallback: SubgoalSource | None = None
     _cache: dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
@@ -649,6 +662,27 @@ class SubgoalPlanner:
             f"{field} is {read_field(state, field, belief)}" for field in fields
         )
 
+    def _threats(self, state: Any) -> list[dict[str, Any]]:
+        """Return the hostile mobs within ``threat_radius``, nearest first."""
+
+        if self.threat_radius is None:
+            return []
+        return [
+            mob
+            for mob in mobs_in_view(state)
+            if mob["type"] in HOSTILE_MOBS
+            and max(abs(offset) for offset in mob["offset"]) <= self.threat_radius
+        ]
+
+    def _defence(self, state: Any) -> SkillId | None:
+        """Return the hunting skill for the nearest mob to fight off, if any."""
+
+        for mob in self._threats(state):
+            skill_id = _HUNTING_SKILLS.get(mob["type"])
+            if mob["type"] in self.defend_against and skill_id in self.candidate_skills:
+                return skill_id
+        return None
+
     def _alerts(self, state: Any) -> dict[str, str]:
         """Return the alert conditions that hold now, with their details.
 
@@ -662,17 +696,11 @@ class SubgoalPlanner:
             for vital, threshold in self.vital_thresholds
             if readings[vital] <= threshold
         }
-        if self.threat_radius is not None:
-            threats = [
-                mob
-                for mob in mobs_in_view(state)
-                if mob["type"] in HOSTILE_MOBS
-                and max(abs(offset) for offset in mob["offset"]) <= self.threat_radius
-            ]
-            if threats:
-                active["threat"] = ", ".join(
-                    f"{mob['type']} at offset {mob['offset']}" for mob in threats
-                )
+        threats = self._threats(state)
+        if threats:
+            active["threat"] = ", ".join(
+                f"{mob['type']} at offset {mob['offset']}" for mob in threats
+            )
         if self.replan_at_night and readings["night"]:
             active["night"] = ""
         return active
@@ -686,7 +714,9 @@ class SubgoalPlanner:
         """Advance past reached sub-goals and decide whether to ask the VLM."""
 
         decision_index = len(context.history)
-        spent = max(decision_index - plan.decision_index, 0)
+        # A defence fight spends no budget, and its failure is not the plan's.
+        defended = plan.defending
+        spent = max(decision_index - plan.decision_index - int(defended), 0)
         trigger: ReplanTrigger | None = None
         detail = ""
         plan = replace(
@@ -696,6 +726,7 @@ class SubgoalPlanner:
             trigger_detail="",
             raw_response=None,
             skills_on_current=plan.skills_on_current + spent,
+            defending=False,
         )
         if plan.vlm_calls == 0:
             trigger = ReplanTrigger.START
@@ -709,6 +740,7 @@ class SubgoalPlanner:
             self.replan_on_failure
             and bool(context.history)
             and not context.history[-1].succeeded
+            and not defended
         )
         if trigger is not None:
             pass
@@ -892,6 +924,15 @@ class SubgoalPlanner:
     ) -> PlannerSelection:
         """Choose the best first step towards the current sub-goal."""
 
+        defence = self._defence(state)
+        if defence is not None:
+            return PlannerSelection(
+                decision=PlannerDecision(skill_id=defence, scores=()),
+                status=PlannerSelectionStatus.SELECTED,
+                utility_ranking=(defence,),
+                utility_raw_response=plan.raw_response,
+                plan_state=replace(plan, defending=True),
+            )
         if plan.current is None:
             last = plan.events[-1] if plan.events else None
             return PlannerSelection(

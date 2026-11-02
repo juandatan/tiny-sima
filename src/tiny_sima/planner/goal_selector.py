@@ -73,12 +73,12 @@ VITAL_SUBGOAL_FIELDS: dict[str, str | None] = {
 }
 # (vital, threshold, target): at or below the threshold, ask for the target.
 DEFAULT_VITAL_RULES: tuple[tuple[str, int, int], ...] = (("drink", 3, 7),)
-# For a catalog with the eating and sleeping skills. Sleep only ends rested,
-# so its target is full energy.
+# For a catalog with the eating skills: drink and food early, at the
+# thresholds the open-ended sub-goal planners alert at. Low energy costs
+# little health, while a zombie hits a sleeper hard, so there is no sleep rule.
 SURVIVAL_VITAL_RULES: tuple[tuple[str, int, int], ...] = (
-    ("drink", 3, 7),
-    ("food", 3, 7),
-    ("energy", 3, 9),
+    ("drink", 5, 7),
+    ("food", 5, 7),
 )
 # Plan events that count against a sub-goal.
 DEFAULT_FAILURE_STATUSES: tuple[str, ...] = ("timed_out", "abandoned", "rejected")
