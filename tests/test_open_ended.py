@@ -5,8 +5,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from craftax.craftax_classic.constants import Achievement, Action
+from craftax.craftax_classic.constants import Achievement, Action, BlockType
 
+from tiny_sima.config import VLMPlannerConfig
 from tiny_sima.envs import OpenEndedEnvironment, make_open_ended_environment
 from tiny_sima.envs.chains import make_skill_chain_environment
 from tiny_sima.envs.craftax import CraftaxBundle
@@ -102,6 +103,27 @@ class _CowAtReset:
 
     def get_obs(self, state):
         return self.env.get_obs(state)
+
+
+class _ZombieAtReset:
+    """A Craftax env whose generated world starts with a zombie beside the player."""
+
+    def __init__(self, env) -> None:
+        self.env = env
+
+    def reset(self, rng, params):
+        observation, state = self.env.reset(rng, params)
+        beside = state.player_position + jnp.array([0, 1])
+        zombies = state.zombies.replace(
+            mask=state.zombies.mask.at[0].set(True),
+            position=state.zombies.position.at[0].set(beside),
+            health=state.zombies.health.at[0].set(5),
+        )
+        world_map = state.map.at[beside[0], beside[1]].set(BlockType.GRASS.value)
+        return observation, state.replace(zombies=zombies, map=world_map)
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
 
 
 def test_reset_without_mobs_clears_generated_creatures() -> None:
@@ -313,6 +335,32 @@ def _scripted_design() -> SubgoalPlanner:
     )
 
 
+def test_a_zombie_at_reset_is_fought_off_in_the_closed_loop() -> None:
+    bundle = make_open_ended_environment(mobs=True).bundle
+    haunted = CraftaxBundle(_ZombieAtReset(bundle.env), bundle.params, bundle.spec)
+
+    class Backend:
+        def generate(self, request):
+            raise AssertionError("not called")
+
+    # The design the notebook runs, so the defence goes through its wiring.
+    planner = open_ended_planners(
+        ALL_SKILL_IDS, Backend(), VLMPlannerConfig(), None, None
+    )["subgoal_scripted"]
+    result = evaluate_open_ended(
+        planner,
+        ScriptedSkillExecutor(),
+        OpenEndedEnvironment(haunted, mobs=True),
+        num_episodes=1,
+        seed=0,
+        max_skill_calls=2,
+        memory_factory=EpisodeMemory,
+    )
+    trace = result["episodes"][0]["trace"]
+    assert trace[0]["requested_skill"] == "defeat_zombie"
+    assert trace[0]["plan_state"]["defending"]
+
+
 def test_scripted_design_unlocks_achievements_in_the_closed_loop() -> None:
     result = evaluate_open_ended(
         _scripted_design(),
@@ -484,8 +532,6 @@ def test_summary_aggregates_records() -> None:
 
 
 def test_design_factory_builds_the_three_designs() -> None:
-    from tiny_sima.config import VLMPlannerConfig
-
     class Backend:
         def generate(self, request):
             raise AssertionError("not called")

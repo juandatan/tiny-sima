@@ -29,7 +29,7 @@ with the chain's own completion test.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import lru_cache
@@ -926,12 +926,8 @@ class SubgoalPlanner:
 
         defence = self._defence(state)
         if defence is not None:
-            return PlannerSelection(
-                decision=PlannerDecision(skill_id=defence, scores=()),
-                status=PlannerSelectionStatus.SELECTED,
-                utility_ranking=(defence,),
-                utility_raw_response=plan.raw_response,
-                plan_state=replace(plan, defending=True),
+            return self._selected(
+                state, context, replace(plan, defending=True), {defence}
             )
         if plan.current is None:
             last = plan.events[-1] if plan.events else None
@@ -953,23 +949,6 @@ class SubgoalPlanner:
         ):
             # The budget is fixed by the plan from where the sub-goal starts.
             plan = replace(plan, current_budget=check.plan_length + self.subgoal_slack)
-        tie_break = catalog_feasibility(
-            self.tie_break, state, context, self.candidate_skills
-        )
-        scores = sorted(
-            (
-                SkillScore(
-                    skill_id=skill_id,
-                    utility=float(skill_id in check.first_steps),
-                    feasibility=tie_break[skill_id],
-                    failure_penalty=1.0,
-                    combined=float(skill_id in check.first_steps)
-                    * max(tie_break[skill_id], 1e-6),
-                )
-                for skill_id in self.candidate_skills
-            ),
-            key=lambda score: -score.combined,
-        )
         if not check.first_steps:
             return PlannerSelection(
                 decision=None,
@@ -978,6 +957,34 @@ class SubgoalPlanner:
                 utility_raw_response=plan.raw_response,
                 plan_state=plan,
             )
+        return self._selected(state, context, plan, check.first_steps)
+
+    def _selected(
+        self,
+        state: Any,
+        context: PlannerContext,
+        plan: SubgoalPlan,
+        first_steps: Collection[SkillId],
+    ) -> PlannerSelection:
+        """Select the best of ``first_steps`` by tie-break, scoring the catalog."""
+
+        tie_break = catalog_feasibility(
+            self.tie_break, state, context, self.candidate_skills
+        )
+        scores = sorted(
+            (
+                SkillScore(
+                    skill_id=skill_id,
+                    utility=float(skill_id in first_steps),
+                    feasibility=tie_break[skill_id],
+                    failure_penalty=1.0,
+                    combined=float(skill_id in first_steps)
+                    * max(tie_break[skill_id], 1e-6),
+                )
+                for skill_id in self.candidate_skills
+            ),
+            key=lambda score: -score.combined,
+        )
         return PlannerSelection(
             decision=PlannerDecision(skill_id=scores[0].skill_id, scores=tuple(scores)),
             status=PlannerSelectionStatus.SELECTED,
