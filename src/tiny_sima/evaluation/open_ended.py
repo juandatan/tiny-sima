@@ -335,6 +335,7 @@ def open_ended_planners(
     *,
     model: SkillModel | None = None,
     threat_radius: int = DEFAULT_THREAT_RADIUS,
+    shelter_at_night: bool = True,
 ) -> dict[str, SkillPlanner]:
     """Return the three designs, built as notebook 06 builds its planners.
 
@@ -342,7 +343,9 @@ def open_ended_planners(
     back to reachability, as in notebook 06. Both sub-goal planners share
     every setting but the goal source, and ``subgoal_vlm`` falls back on the
     curriculum ``subgoal_scripted`` follows. Both fight off a zombie within
-    ``threat_radius`` before going on with their plan.
+    ``threat_radius`` before going on with their plan, and with
+    ``shelter_at_night`` wall themselves in with stone to sleep through each
+    night they can.
     """
 
     feasibility = prior if prior is not None else reachability_feasibility
@@ -367,6 +370,7 @@ def open_ended_planners(
             threat_radius=threat_radius,
             replan_at_night=True,
             defend_against=("zombie",),
+            shelter_at_night=shelter_at_night,
             **options,
         )
 

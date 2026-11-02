@@ -69,6 +69,7 @@ from tiny_sima.planner.saycan import (
     catalog_feasibility,
     reachability_feasibility,
 )
+from tiny_sima.planner.shelter import shelter_feasible
 from tiny_sima.planner.symbolic import (
     DEFAULT_MAX_PLAN_LENGTH,
     GoalCondition,
@@ -607,6 +608,10 @@ class SubgoalPlanner:
     (Chebyshev), and ``replan_at_night`` at nightfall. A mob in
     ``defend_against`` within ``threat_radius`` is fought at once with its
     hunting skill, when that is a candidate, before the plan goes on.
+    With ``shelter_at_night`` the player walls itself in with the scripted
+    ``shelter`` skill whenever night falls and it can (see
+    :mod:`tiny_sima.planner.shelter`); like a defence fight, that spends no
+    sub-goal budget.
     ``fallback`` answers once for an episode whose answers were all rejected
     and whose earlier sub-goals are no longer reachable, so it keeps playing
     rather than stopping; its sub-goals are proposed with reason
@@ -633,6 +638,7 @@ class SubgoalPlanner:
     threat_radius: int | None = None
     replan_at_night: bool = False
     defend_against: tuple[str, ...] = ()
+    shelter_at_night: bool = False
     fallback: SubgoalSource | None = None
     _cache: dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
@@ -934,6 +940,10 @@ class SubgoalPlanner:
             return self._selected(
                 state, context, replace(plan, defending=True), {defence}
             )
+        if self.shelter_at_night and shelter_feasible(state):
+            return self._selected(
+                state, context, replace(plan, defending=True), {SkillId.SHELTER}
+            )
         if plan.current is None:
             last = plan.events[-1] if plan.events else None
             return PlannerSelection(
@@ -976,17 +986,19 @@ class SubgoalPlanner:
         tie_break = catalog_feasibility(
             self.tie_break, state, context, self.candidate_skills
         )
+        # A macro such as the shelter is scored too, though not a candidate.
+        skill_ids = dict.fromkeys((*self.candidate_skills, *sorted(first_steps)))
         scores = sorted(
             (
                 SkillScore(
                     skill_id=skill_id,
                     utility=float(skill_id in first_steps),
-                    feasibility=tie_break[skill_id],
+                    feasibility=tie_break.get(skill_id, 1.0),
                     failure_penalty=1.0,
                     combined=float(skill_id in first_steps)
-                    * max(tie_break[skill_id], 1e-6),
+                    * max(tie_break.get(skill_id, 1.0), 1e-6),
                 )
-                for skill_id in self.candidate_skills
+                for skill_id in skill_ids
             ),
             key=lambda score: -score.combined,
         )

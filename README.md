@@ -336,6 +336,23 @@ achievements as you can."
   call, but it does not count as a failure for SayCan's penalty, the
   sub-goal trigger or budget, or memory's miss counts. It applies to all
   three designs, and with creatures off it never fires.
+- **Shelter at night:** the sub-goal designs wall the player in with stone
+  and sleep through each night they can, with `shelter_at_night`. Zombies
+  cannot walk through stone, and sleeping in the open was when they hit
+  hardest. `shelter` is a scripted macro in
+  [planner/shelter.py](src/tiny_sima/planner/shelter.py), not a learned
+  skill, so the executor needs no retraining. It fights off an adjacent
+  zombie, mines stone if it has too little, builds a 2x2 room and sleeps
+  inside. In the morning, or once food or drink falls to 2, it mines a way
+  out. The room is 2x2 because Craftax has no turn action: the player
+  faces a free tile only by stepping towards it, so it can face every wall
+  of a 2x2 room from inside, but not the last wall of a one-tile room.
+  The macro starts at nightfall when the player has a wood pickaxe and a
+  room is within 8 steps. It runs to its own 256-step horizon, and like a
+  zombie fight it spends no sub-goal budget. Notebook 08 turns it on with
+  creatures only.
+- **Traces:** each decision records the player's vitals before and after
+  its skill, as `vitals_before` and `vitals_after`.
 - **Scoring:** as in Crafter, the per-achievement success rate and their
   geometric mean. The report also breaks results down by tier: basic, wood,
   stone, iron and diamond, survival, combat.

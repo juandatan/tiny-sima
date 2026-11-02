@@ -38,6 +38,8 @@ class SkillId(str, Enum):
     # Combat, appended after the survival skills.
     DEFEAT_ZOMBIE = "defeat_zombie"
     DEFEAT_SKELETON = "defeat_skeleton"
+    # A scripted macro, outside the registry and the executor's skills.
+    SHELTER = "shelter"
 
 
 RequirementComparison = Literal["at_least", "less_than", "equals"]
@@ -497,6 +499,28 @@ SKILL_REGISTRY: dict[SkillId, SkillSpec] = {
 
 # Every skill the registry defines, in categorical index order.
 ALL_SKILL_IDS: tuple[SkillId, ...] = tuple(SKILL_REGISTRY)
+
+# Skills the chain evaluator runs as scripted macros, never through the
+# low-level executor; see tiny_sima.planner.shelter.
+MACRO_REGISTRY: dict[SkillId, SkillSpec] = {
+    SkillId.SHELTER: SkillSpec(
+        skill_id=SkillId.SHELTER,
+        instruction="Wall yourself in with stone and sleep through the night.",
+        description=(
+            "Build a 2x2 stone room, sleep inside until morning, then mine "
+            "a way out; zombies cannot walk through stone."
+        ),
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("inventory.wood_pickaxe", "at_least", 1),
+            ),
+            effects=(),
+        ),
+        # Long enough to gather stone, build and sit out a night.
+        default_horizon=256,
+        interaction_action=Action.PLACE_STONE,
+    ),
+}
 # The six-skill catalog every executor before the stone-pickaxe stage was
 # trained on, and the default candidate set of the planner. Keeping it the
 # default leaves those checkpoints, priors and planner prompts unchanged.
@@ -592,7 +616,8 @@ def executor_skill_ids(num_skills: int) -> tuple[SkillId, ...]:
 def get_skill_spec(skill_id: SkillId | str) -> SkillSpec:
     """Return metadata for a known skill."""
 
-    return SKILL_REGISTRY[SkillId(skill_id)]
+    skill_id = SkillId(skill_id)
+    return SKILL_REGISTRY.get(skill_id) or MACRO_REGISTRY[skill_id]
 
 
 def skill_index(skill_id: SkillId | str) -> int:

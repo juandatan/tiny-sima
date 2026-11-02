@@ -19,6 +19,7 @@ from tiny_sima.goals.reachability import (
 from tiny_sima.goals.skills import (
     ACHIEVEMENT_FIELDS,
     ALL_SKILL_IDS,
+    MACRO_REGISTRY,
     MAX_VITAL,
     MOB_TYPES,
     SKILL_ACHIEVEMENTS,
@@ -59,6 +60,7 @@ __all__ = [
     "ACHIEVEMENT_FIELDS",
     "ALL_SKILL_IDS",
     "DEFAULT_REACHABILITY",
+    "MACRO_REGISTRY",
     "MAX_VITAL",
     "MOB_TYPES",
     "OBSERVATION_RADIUS",

@@ -11,7 +11,7 @@ from collections import Counter, deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from functools import lru_cache, partial
+from functools import cache, lru_cache, partial
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 
@@ -68,6 +68,7 @@ from tiny_sima.goals import (
     skill_target_block,
 )
 from tiny_sima.memory import EpisodeMemory
+from tiny_sima.planner.observation import vitals
 from tiny_sima.planner.saycan import (
     PlannerContext,
     PlannerDecision,
@@ -80,6 +81,12 @@ from tiny_sima.planner.saycan import (
     SkillOutcome,
     SkillPlanner,
     SkillScore,
+)
+from tiny_sima.planner.shelter import (
+    is_night,
+    needs_low,
+    shelter_action,
+    shelter_feasible,
 )
 from tiny_sima.planner.symbolic import GoalCondition, plan_next_skills
 
@@ -400,6 +407,10 @@ class ChainStepTrace:
     # The executor's inventory extremes over this attempt, when it reports
     # them.
     inventory_extremes: InventoryExtremes | None = None
+    # The player's vitals (see planner.observation.vitals) when the decision
+    # was made and once the attempt ended.
+    vitals_before: Mapping[str, Any] | None = None
+    vitals_after: Mapping[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return this decision as plain Python values, for JSON."""
@@ -432,6 +443,14 @@ class ChainStepTrace:
             ],
             **_plan_state_record(self.plan_state),
             **_inventory_extremes_record(self.inventory_extremes),
+            **{
+                key: dict(value)
+                for key, value in (
+                    ("vitals_before", self.vitals_before),
+                    ("vitals_after", self.vitals_after),
+                )
+                if value is not None
+            },
         }
 
 
@@ -904,23 +923,101 @@ def _execute_many(
     argument still runs uninterrupted skills.
     """
 
+    # Macro skills are scripted here, whatever the executor.
+    results = {
+        index: _run_shelter(environment, states[index], rngs[index])
+        for index, skill_id in enumerate(skill_ids)
+        if skill_id is SkillId.SHELTER
+    }
+    rest = [index for index in range(len(skill_ids)) if index not in results]
     options: dict[str, Any] = (
         {} if interruption is None else {"interruption": interruption}
     )
-    if isinstance(executor, BatchedSkillExecutor):
-        return executor.execute_many(
+    if not rest:
+        executed = []
+    elif isinstance(executor, BatchedSkillExecutor):
+        executed = executor.execute_many(
             environment,
-            states,
-            skill_ids,
-            rngs,
+            [states[index] for index in rest],
+            [skill_ids[index] for index in rest],
+            [rngs[index] for index in rest],
             horizon=horizon,
             batch_size=batch_size,
             **options,
         )
-    return [
-        executor.execute(environment, state, skill_id, rng, horizon=horizon, **options)
-        for state, skill_id, rng in zip(states, skill_ids, rngs, strict=True)
-    ]
+    else:
+        executed = [
+            executor.execute(
+                environment,
+                states[index],
+                skill_ids[index],
+                rngs[index],
+                horizon=horizon,
+                **options,
+            )
+            for index in rest
+        ]
+    results.update(zip(rest, executed, strict=True))
+    return [results[index] for index in range(len(skill_ids))]
+
+
+@cache
+def _compiled_step(env: Any) -> Callable[..., Any]:
+    return jax.jit(env.step)
+
+
+def _run_shelter(
+    environment: SkillChainEnvironment,
+    state: Any,
+    rng: jax.Array,
+) -> SkillExecutionResult:
+    """Run the scripted shelter of :mod:`tiny_sima.planner.shelter`.
+
+    It runs to its own horizon, which spans a night, rather than the chain's
+    skill horizon. It succeeds once the player is out again in the morning
+    and loses its precondition when food or drink runs low first.
+    """
+
+    start = _inventory_counts(state)
+    minimum, maximum = start, start
+    native_return = 0.0
+    step = _compiled_step(environment.bundle.env)
+    room = None
+    outcome = SkillOutcome.INFEASIBLE if not shelter_feasible(state) else None
+    horizon = get_skill_spec(SkillId.SHELTER).default_horizon
+    keys = jax.random.split(rng, horizon)
+    steps = 0
+    while outcome is None and steps < horizon:
+        action, room = shelter_action(state, room)
+        if action is None:
+            if needs_low(state):
+                outcome = SkillOutcome.PRECONDITION_LOST
+            elif is_night(state):
+                outcome = SkillOutcome.INFEASIBLE
+            else:
+                outcome = SkillOutcome.SUCCESS
+            break
+        _, state, reward, done, _ = step(
+            keys[steps],
+            state,
+            jnp.asarray(action, dtype=jnp.int32),
+            environment.bundle.params,
+        )
+        steps += 1
+        native_return += float(np.asarray(reward))
+        counts = _inventory_counts(state)
+        minimum = tuple(map(min, minimum, counts))
+        maximum = tuple(map(max, maximum, counts))
+        if bool(np.asarray(done)):
+            outcome = SkillOutcome.ENVIRONMENT_TERMINATED
+    return SkillExecutionResult(
+        state=state,
+        outcome=SkillOutcome.TIMEOUT if outcome is None else outcome,
+        steps=steps,
+        skill_return=0.0,
+        native_return=native_return,
+        inventory_extremes=_inventory_extremes(minimum, maximum),
+    )
 
 
 @dataclass(frozen=True)
@@ -2399,6 +2496,8 @@ def evaluate_chain_episodes(
                     ),
                     plan_state=selection.plan_state,
                     inventory_extremes=result.inventory_extremes,
+                    vitals_before=vitals(cursor.state),
+                    vitals_after=vitals(result.state),
                 )
             )
             memory = cursor.context.memory
