@@ -529,8 +529,50 @@ def test_summary_aggregates_records() -> None:
     assert summary["termination_counts"]["died"] == 1
     # Records saved before the fallback existed count none.
     assert summary["fallback_calls"] == {"mean": 0.0, "std": 0.0}
+    assert summary["fallback_share"] == 0.0
+    assert summary["choices"]["shelter"]["differ_rate"] is None
     expected = crafter_score({"collect_wood": 1.0, "place_table": 0.5, "eat_cow": 0.5})
     assert summary["crafter_score"] == pytest.approx(expected)
+
+
+def test_summary_sets_choices_against_the_curriculum() -> None:
+    def choice(kind, answer, possible=True, fallback=False):
+        return {
+            "decision_index": 0,
+            "kind": kind,
+            "answer": answer,
+            "possible": possible,
+            "fallback": fallback,
+        }
+
+    record = {
+        "achievements": [],
+        "decisions": 10,
+        "environment_steps": 100,
+        "vlm_calls": 3,
+        "fallback_calls": 1,
+        "termination": "died",
+        "choices": [
+            choice("shelter", "now"),
+            choice("shelter", "after"),
+            choice("shelter", "no", possible=False),
+            choice("shelter", "now", possible=False),
+            # The fallback's answers are the curriculum's own.
+            choice("shelter", "no", fallback=True),
+            choice("fight", "true"),
+            choice("fight", "false"),
+        ],
+    }
+    summary = summarize_open_ended([record])
+    assert summary["fallback_share"] == 0.25
+    shelter = summary["choices"]["shelter"]
+    assert (shelter["answers"], shelter["differ"]) == (4, 2)
+    assert shelter["counts"] == {
+        "possible": {"now": 1, "after": 1},
+        "not possible": {"no": 1, "now": 1},
+    }
+    fight = summary["choices"]["fight"]
+    assert (fight["answers"], fight["differ"], fight["differ_rate"]) == (2, 1, 0.5)
 
 
 def test_design_factory_builds_the_three_designs() -> None:

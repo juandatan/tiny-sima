@@ -147,6 +147,27 @@ def test_a_close_zombie_raises_one_threat_alert() -> None:
     assert plan.alerts == ()
 
 
+def test_a_zombie_arriving_beside_a_skeleton_is_a_fresh_threat() -> None:
+    backend = ScriptedBackend(_answer(("inventory.wood", 1)))
+    planner = SubgoalPlanner(backend, threat_radius=2)
+    state = _grass_world(tree=[(0, 2)])
+    plan = _select(planner, state, PlannerContext(OBJECTIVE)).plan_state
+
+    skeleton = _with_mobs(state, "skeletons", (2, 0))
+    attempts = [_attempt(SkillId.COLLECT_WOOD)]
+    plan = _follow(planner, skeleton, plan, attempts)
+    assert plan.trigger is ReplanTrigger.THREAT
+    assert plan.alerts == ("threat:skeleton",)
+
+    both = _with_mobs(skeleton, "zombies", (1, 1))
+    attempts.append(_attempt(SkillId.COLLECT_WOOD))
+    plan = _follow(planner, both, plan, attempts)
+    assert plan.trigger is ReplanTrigger.THREAT
+    assert plan.trigger_detail == "zombie at offset [1, 1]"
+    assert plan.alerts == ("threat:skeleton", "threat:zombie")
+    assert len(backend.requests) == 3
+
+
 def test_a_close_zombie_is_fought_off_outside_the_plan() -> None:
     backend = ScriptedBackend(_answer(("inventory.wood", 1)))
     skills = (SkillId.COLLECT_WOOD, SkillId.DEFEAT_ZOMBIE)
@@ -297,6 +318,12 @@ def test_the_vlm_chooses_whether_to_fight_a_close_zombie() -> None:
         selection = _select(planner, close, PlannerContext(OBJECTIVE))
         assert selection.decision.skill_id is skill_id
         assert selection.plan_state.fighting is fight
+        (choice,) = selection.plan_state.choices
+        assert (choice.kind, choice.answer, choice.possible) == (
+            "fight",
+            "true" if fight else "false",
+            True,
+        )
         (request,) = backend.requests
         assert "Also return fight" in request.system_prompt
         assert "Close threats: zombie at offset [1, 1]; health is 9." in (

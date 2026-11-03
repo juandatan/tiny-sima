@@ -186,12 +186,71 @@ def open_ended_episode_record(
     record["fallback_calls"] = (
         plan.fallback_calls if isinstance(plan, SubgoalPlan) else 0
     )
+    record["choices"] = (
+        [choice.to_dict() for choice in plan.choices]
+        if isinstance(plan, SubgoalPlan)
+        else []
+    )
     return record
+
+
+def _fallback_share(records: Sequence[Mapping[str, Any]]) -> float | None:
+    """The share of goal-source answers the fallback gave, pooled."""
+
+    fallback = sum(record.get("fallback_calls", 0) for record in records)
+    total = fallback + sum(record["vlm_calls"] for record in records)
+    return fallback / total if total else None
 
 
 def _mean_std(values: Sequence[float]) -> dict[str, float]:
     array = np.asarray(values, dtype=float)
     return {"mean": float(array.mean()), "std": float(array.std())}
+
+
+def curriculum_choice(choice: Mapping[str, Any]) -> str:
+    """Return what the curriculum answers where a recorded choice was made.
+
+    It shelters whenever the shelter could start and always fights; see
+    :class:`~tiny_sima.planner.goal_selector.ScriptedGoalSelector`.
+    """
+
+    if choice["kind"] == "fight":
+        return "true"
+    return "now" if choice["possible"] else "no"
+
+
+def summarize_choices(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Set the goal source's own shelter and fight answers against the curriculum.
+
+    For each kind it pools the answers over episodes, leaving out the
+    fallback's, which are the curriculum's own. ``counts`` breaks them down by
+    whether the shelter could start and by answer, and ``differ`` counts the
+    answers the curriculum would not have given in the same state.
+    """
+
+    summary: dict[str, Any] = {}
+    for kind in ("shelter", "fight"):
+        answers = [
+            choice
+            for record in records
+            for choice in record.get("choices", ())
+            if choice["kind"] == kind and not choice["fallback"]
+        ]
+        differ = sum(
+            choice["answer"] != curriculum_choice(choice) for choice in answers
+        )
+        counts: dict[str, dict[str, int]] = {}
+        for choice in answers:
+            state = "possible" if choice["possible"] else "not possible"
+            by_answer = counts.setdefault(state, {})
+            by_answer[choice["answer"]] = by_answer.get(choice["answer"], 0) + 1
+        summary[kind] = {
+            "answers": len(answers),
+            "differ": differ,
+            "differ_rate": differ / len(answers) if answers else None,
+            "counts": counts,
+        }
+    return summary
 
 
 def summarize_open_ended(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -233,6 +292,8 @@ def summarize_open_ended(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]
         "fallback_calls": _mean_std(
             [record.get("fallback_calls", 0) for record in records]
         ),
+        "fallback_share": _fallback_share(records),
+        "choices": summarize_choices(records),
         "termination_counts": {
             termination.value: sum(
                 record["termination"] == termination.value for record in records

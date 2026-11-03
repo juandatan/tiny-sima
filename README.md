@@ -139,7 +139,8 @@ and a sound external checker verifies and gives feedback.
     health, food and drink at 5, so there is time to restock before night,
     and energy at 3, since sleeping in the open is when zombies hit hardest.
   - **A hostile creature comes close**, within `threat_radius`. Off by
-    default. A mob in `defend_against` within that radius is also fought
+    default. Each kind of creature raises its own alert, so a zombie that
+    arrives while a skeleton is close still asks again. A mob in `defend_against` within that radius is also fought
     with its hunting skill, outside the plan: the fight neither spends the
     sub-goal's budget nor counts as its failure. By default every such mob
     is fought at once. With `choose_fights`, each answer carries `fight`,
@@ -383,6 +384,10 @@ achievements as you can."
      When every answer is rejected and no earlier sub-goal is still
      reachable, it takes the curriculum's next sub-goal instead of ending
      the episode. These fallback calls are counted apart from VLM calls.
+     The report gives their share of all answers. It also gives how often
+     the VLM's own shelter and fight answers differ from what the
+     curriculum would answer in the same state, where it shelters whenever
+     it can and always fights.
   3. `subgoal_scripted`: the same sub-goal planner with
      `ScriptedGoalSelector` in place of the VLM. The selector gives survival
      first, drink and food at 5 with no sleep rule, then a fixed tech-tree

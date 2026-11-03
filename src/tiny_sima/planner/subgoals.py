@@ -245,6 +245,33 @@ class SubgoalEvent:
 
 
 @dataclass(frozen=True)
+class SubgoalChoice:
+    """One answer's shelter or fight choice, for the reports.
+
+    ``possible`` says whether the shelter could start when the answer came;
+    a fight is only offered while one could start. With it a report can set
+    the answer against the curriculum's rule in the same state.
+    """
+
+    decision_index: int
+    # "shelter" or "fight".
+    kind: str
+    # One of SHELTER_CHOICES, or "true" or "false".
+    answer: str
+    possible: bool
+    fallback: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "decision_index": self.decision_index,
+            "kind": self.kind,
+            "answer": self.answer,
+            "possible": self.possible,
+            "fallback": self.fallback,
+        }
+
+
+@dataclass(frozen=True)
 class SubgoalPlan:
     """Per-episode planner state, carried between decisions by the loop."""
 
@@ -260,7 +287,7 @@ class SubgoalPlan:
     fallback_calls: int = 0
     rejections: int = 0
     invalid_responses: int = 0
-    # Alerts ("drink", "threat", "night", ...) already raised with the VLM.
+    # Alerts ("drink", "threat:zombie", "night", ...) already raised with the VLM.
     # One leaves when its condition clears, so an alert asks once per spell
     # rather than at every decision.
     alerts: tuple[str, ...] = ()
@@ -278,6 +305,8 @@ class SubgoalPlan:
     shelter: str = "no"
     # Whether the goal source chose to fight off the zombie that is close.
     fighting: bool = False
+    # Every valid answer's shelter and fight choices, where they were offered.
+    choices: tuple[SubgoalChoice, ...] = ()
 
     @property
     def current(self) -> GoalCondition | None:
@@ -636,6 +665,10 @@ def _shelter_text(state: Any) -> str:
     return " ".join(lines)
 
 
+def _is_threat(alert: str) -> bool:
+    return alert.startswith("threat:")
+
+
 def _threat_text(threats: Sequence[dict[str, Any]]) -> str:
     return ", ".join(f"{mob['type']} at offset {mob['offset']}" for mob in threats)
 
@@ -818,8 +851,10 @@ class SubgoalPlanner:
     def _alerts(self, state: Any) -> dict[str, str]:
         """Return the alert conditions that hold now, with their details.
 
-        Keys are vital names, ``"threat"`` and ``"night"``, in the order
-        their triggers take precedence.
+        Keys are vital names, ``"threat:<mob>"`` for each kind of close
+        hostile mob and ``"night"``, in the order their triggers take
+        precedence. Keyed by kind, a zombie arriving while a skeleton is
+        close is still a fresh threat.
         """
 
         readings = vitals(state)
@@ -829,8 +864,10 @@ class SubgoalPlanner:
             if readings[vital] <= threshold
         }
         threats = self._threats(state)
-        if threats:
-            active["threat"] = _threat_text(threats)
+        for kind in dict.fromkeys(mob["type"] for mob in threats):
+            active[f"threat:{kind}"] = _threat_text(
+                [mob for mob in threats if mob["type"] == kind]
+            )
         if self.replan_at_night and readings["night"]:
             active["night"] = ""
         return active
@@ -886,7 +923,8 @@ class SubgoalPlanner:
         active = self._alerts(state)
         plan = replace(plan, alerts=tuple(a for a in plan.alerts if a in active))
         fresh = {key: text for key, text in active.items() if key not in plan.alerts}
-        fresh_vitals = [key for key in fresh if key not in ("threat", "night")]
+        fresh_threats = [text for key, text in fresh.items() if _is_threat(key)]
+        fresh_vitals = [key for key in fresh if not _is_threat(key) and key != "night"]
         failed = (
             self.replan_on_failure
             and bool(context.history)
@@ -921,8 +959,8 @@ class SubgoalPlanner:
         elif fresh_vitals:
             detail = " and ".join(fresh_vitals)
             trigger = ReplanTrigger.LOW_VITALS
-        elif "threat" in fresh:
-            detail = fresh["threat"]
+        elif fresh_threats:
+            detail = ", ".join(fresh_threats)
             trigger = ReplanTrigger.THREAT
         elif "night" in fresh:
             trigger = ReplanTrigger.NIGHT
@@ -1022,12 +1060,32 @@ class SubgoalPlanner:
         reasons: list[str] = []
         held: list[str] = []
         source = "fallback" if fallback else ""
+        night = self.shelter_at_night and is_night(pending.state)
         # The latest answer while a mob is close decides the fight.
-        fighting = (
-            self.choose_fights
-            and parsed.fight
-            and self._defence(pending.state) is not None
-        )
+        fight_offered = self.choose_fights and self._defence(pending.state) is not None
+        fighting = fight_offered and parsed.fight
+        choices = []
+        if night:
+            choices.append(
+                SubgoalChoice(
+                    plan.decision_index,
+                    "shelter",
+                    parsed.shelter,
+                    shelter_blocker(pending.state) is None,
+                    fallback,
+                )
+            )
+        if fight_offered:
+            choices.append(
+                SubgoalChoice(
+                    plan.decision_index,
+                    "fight",
+                    "true" if parsed.fight else "false",
+                    True,
+                    fallback,
+                )
+            )
+        plan = replace(plan, choices=(*plan.choices, *choices))
         if fighting:
             plan = plan.with_event("fight", "proposed", source)
         # Sub-goals an earlier round of this decision already reported as
@@ -1071,9 +1129,7 @@ class SubgoalPlanner:
         # choice is moot. A shelter after the sub-goals is checked once they
         # are reached, since they may be what it lacks now, such as drink,
         # and with none accepted it starts now.
-        shelter = "no"
-        if self.shelter_at_night and is_night(pending.state):
-            shelter = parsed.shelter
+        shelter = parsed.shelter if night else "no"
         if shelter == "after" and not accepted:
             shelter = "now"
         if shelter == "now":

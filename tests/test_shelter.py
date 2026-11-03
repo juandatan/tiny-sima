@@ -181,14 +181,16 @@ def test_the_vlm_chooses_to_shelter_at_night() -> None:
 
 def test_the_planner_keeps_working_unless_the_vlm_shelters() -> None:
     state, _ = _sealed()
-    for planner, world in (
-        (_night_planner(shelter="no")[0], state),
-        (_night_planner()[0], _at(state, 0)),
-        (_night_planner(shelter_at_night=False)[0], state),
+    # A choice is recorded only where it was offered: at night, with the option.
+    for planner, world, offered in (
+        (_night_planner(shelter="no")[0], state, 1),
+        (_night_planner()[0], _at(state, 0), 0),
+        (_night_planner(shelter_at_night=False)[0], state, 0),
     ):
         selection = _select(planner, world, PlannerContext(OBJECTIVE))
         assert selection.decision.skill_id is SkillId.COLLECT_WOOD
         assert selection.plan_state.shelter == "no"
+        assert len(selection.plan_state.choices) == offered
     # Without the option the prompt is unchanged.
     planner, backend = _night_planner(shelter_at_night=False)
     _select(planner, state, PlannerContext(OBJECTIVE))
@@ -202,6 +204,9 @@ def test_a_shelter_the_player_cannot_build_is_turned_down() -> None:
         planner, _with_inventory(state, wood_pickaxe=0), PlannerContext(OBJECTIVE)
     )
     assert selection.decision.skill_id is SkillId.COLLECT_WOOD
+    # The report sees the answer, and that the shelter could not start.
+    (choice,) = selection.plan_state.choices
+    assert (choice.kind, choice.answer, choice.possible) == ("shelter", "now", False)
     assert "Shelter: not possible now: it needs a wood pickaxe. " in (
         backend.requests[0].user_prompt
     )
