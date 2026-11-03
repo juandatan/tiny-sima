@@ -43,6 +43,7 @@ from tiny_sima.evaluation.chains import (
 )
 from tiny_sima.goals import STONE_PICKAXE_SKILL_IDS, SkillId
 from tiny_sima.planner.competence import CompetencePrior
+from tiny_sima.planner.fight_odds import FightOdds
 from tiny_sima.planner.goal_selector import SURVIVAL_VITAL_RULES, ScriptedGoalSelector
 from tiny_sima.planner.observation import ObservationConfig
 from tiny_sima.planner.saycan import (
@@ -219,13 +220,27 @@ def curriculum_choice(choice: Mapping[str, Any]) -> str:
     return "now" if choice["possible"] else "no"
 
 
+# Bands of the measured win rate a fight answer was given, as (label, low).
+FIGHT_ODDS_BANDS: tuple[tuple[str, float], ...] = (
+    ("won under 25%", 0.0),
+    ("won 25-75%", 0.25),
+    ("won 75% or more", 0.75),
+)
+
+
+def _odds_band(win_rate: float) -> str:
+    return [label for label, low in FIGHT_ODDS_BANDS if win_rate >= low][-1]
+
+
 def summarize_choices(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Set the goal source's own shelter and fight answers against the curriculum.
 
     For each kind it pools the answers over episodes, leaving out the
     fallback's, which are the curriculum's own. ``counts`` breaks them down by
     whether the shelter could start and by answer, and ``differ`` counts the
-    answers the curriculum would not have given in the same state.
+    answers the curriculum would not have given in the same state. Fight
+    answers given with odds are also counted by answer in each band of
+    :data:`FIGHT_ODDS_BANDS`, as ``by_odds``.
     """
 
     summary: dict[str, Any] = {}
@@ -250,6 +265,14 @@ def summarize_choices(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "differ_rate": differ / len(answers) if answers else None,
             "counts": counts,
         }
+        if kind == "fight":
+            by_odds: dict[str, dict[str, int]] = {}
+            for choice in answers:
+                if choice.get("win_rate") is None:
+                    continue
+                by_answer = by_odds.setdefault(_odds_band(choice["win_rate"]), {})
+                by_answer[choice["answer"]] = by_answer.get(choice["answer"], 0) + 1
+            summary[kind]["by_odds"] = by_odds
     return summary
 
 
@@ -398,6 +421,7 @@ def open_ended_planners(
     threat_radius: int = DEFAULT_THREAT_RADIUS,
     shelter_at_night: bool = True,
     choose_fights: bool = True,
+    fight_odds: FightOdds | None = None,
 ) -> dict[str, SkillPlanner]:
     """Return the three designs, built as notebook 06 builds its planners.
 
@@ -410,7 +434,8 @@ def open_ended_planners(
     ``shelter_at_night`` it chooses whether to wall the player in with stone
     for the night, now or after its sub-goals. The VLM decides both from
     what the prompt says; the curriculum always fights and shelters
-    whenever it can.
+    whenever it can. ``fight_odds``, the executor's measured fight odds,
+    are shown to the VLM with the close threats.
     """
 
     feasibility = prior if prior is not None else reachability_feasibility
@@ -453,6 +478,8 @@ def open_ended_planners(
             feasibility_scorer=feasibility,
             candidate_skills=candidate_skills,
         ),
-        "subgoal_vlm": subgoal_planner(backend, fallback=curriculum()),
+        "subgoal_vlm": subgoal_planner(
+            backend, fallback=curriculum(), fight_odds=fight_odds
+        ),
         "subgoal_scripted": subgoal_planner(curriculum()),
     }

@@ -68,6 +68,7 @@ from tiny_sima.evaluation.fights import (
     fight_cells,
     fight_rollout_rows,
     fight_worlds,
+    fit_fight_odds,
     summarize_fights,
 )
 from tiny_sima.evaluation.goal_conditioned import (
@@ -192,6 +193,7 @@ __all__ = [
     "fight_cells",
     "fight_rollout_rows",
     "fight_worlds",
+    "fit_fight_odds",
     "summarize_fights",
     "NvidiaSmiMonitor",
     "PlannerBoundaryTrace",

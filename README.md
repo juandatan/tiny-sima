@@ -146,7 +146,11 @@ and a sound external checker verifies and gives feedback.
     is fought at once. With `choose_fights`, each answer carries `fight`,
     true or false, and the prompt lists the close threats with the
     player's health, so the goal source decides, for example to drink or
-    walk on rather than fight at low health. A fight holds while the mob
+    walk on rather than fight at low health. Given `fight_odds`, a
+    `FightOdds` table fitted by `fit_fight_odds` from the staged fights,
+    the prompt also gives how often the executor won, and died, at that
+    health, sword and creature count, and each fight answer records the
+    win rate it was shown. A fight holds while the mob
     stays close; the latest answer decides. The open-ended VLM design
     makes this choice, and the curriculum always fights.
   - **Night falls**, if `replan_at_night` is set. Off by default.
@@ -387,7 +391,10 @@ achievements as you can."
      The report gives their share of all answers. It also gives how often
      the VLM's own shelter and fight answers differ from what the
      curriculum would answer in the same state, where it shelters whenever
-     it can and always fights.
+     it can and always fights. The VLM is shown the executor's measured
+     zombie-fight odds, which notebook 08 stages once per executor and
+     saves beside it, and the report counts its fight answers by the odds
+     shown (`by_odds`).
   3. `subgoal_scripted`: the same sub-goal planner with
      `ScriptedGoalSelector` in place of the VLM. The selector gives survival
      first, drink and food at 5 with no sleep rule, then a fixed tech-tree

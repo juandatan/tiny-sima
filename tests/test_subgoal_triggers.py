@@ -19,6 +19,7 @@ from tiny_sima.memory import EpisodeMemory
 from tiny_sima.planner import (
     OPEN_ENDED_SUBGOAL_FIELDS,
     TEXT_ONLY,
+    FightOdds,
     SubgoalRequest,
     build_subgoal_system_prompt,
 )
@@ -354,3 +355,52 @@ def test_the_vlm_chooses_whether_to_fight_a_close_zombie() -> None:
     assert ("fight", "ended") in {
         (event.subgoal, event.status) for event in gone.plan_state.events
     }
+
+
+def test_the_vlm_is_shown_the_measured_odds_of_the_fight() -> None:
+    skills = (SkillId.COLLECT_WOOD, SkillId.DEFEAT_ZOMBIE)
+    state = _grass_world(tree=[(0, 2)])
+    two = _with_mobs(state, "zombies", (1, 1), (0, -2))
+    two = two.replace(
+        player_health=4,
+        inventory=two.inventory.replace(wood_sword=1),
+    )
+    odds = FightOdds(
+        {
+            ("zombie", 4, "wood", 1): (0.6, 0.4, 300),
+            ("zombie", 4, "wood", 2): (0.45, 0.55, 300),
+        }
+    )
+    backend = ScriptedBackend(_answer(("inventory.wood", 1), fight=False))
+    planner = SubgoalPlanner(
+        backend,
+        candidate_skills=skills,
+        threat_radius=2,
+        defend_against=("zombie",),
+        choose_fights=True,
+        fight_odds=odds,
+    )
+
+    selection = _select(planner, two, PlannerContext(OBJECTIVE))
+
+    (request,) = backend.requests
+    assert "The close threats line gives the odds" in request.system_prompt
+    assert (
+        "health is 4. Fight odds at health 4, a wood sword and 2 zombies: "
+        "won 45%, died 55%." in request.user_prompt
+    )
+    (choice,) = selection.plan_state.choices
+    assert (choice.answer, choice.win_rate) == ("false", 0.45)
+    assert choice.to_dict()["win_rate"] == 0.45
+    # Without odds the prompt is as before.
+    plain = SubgoalPlanner(
+        ScriptedBackend(_answer(("inventory.wood", 1))),
+        candidate_skills=skills,
+        threat_radius=2,
+        defend_against=("zombie",),
+        choose_fights=True,
+    )
+    _select(plain, two, PlannerContext(OBJECTIVE))
+    (request,) = plain.backend.requests
+    assert "Fight odds" not in request.user_prompt
+    assert "gives the odds" not in request.system_prompt

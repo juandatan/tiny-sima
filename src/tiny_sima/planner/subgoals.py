@@ -50,6 +50,7 @@ from tiny_sima.goals import (
     achievement_field,
     get_skill_spec,
 )
+from tiny_sima.planner.fight_odds import FightOdds, FightRate
 from tiny_sima.planner.observation import (
     ObservationConfig,
     mobs_in_view,
@@ -251,6 +252,8 @@ class SubgoalChoice:
     ``possible`` says whether the shelter could start when the answer came;
     a fight is only offered while one could start. With it a report can set
     the answer against the curriculum's rule in the same state.
+    ``win_rate`` is the measured chance of winning the fight the prompt
+    gave, when it gave one.
     """
 
     decision_index: int
@@ -260,6 +263,7 @@ class SubgoalChoice:
     answer: str
     possible: bool
     fallback: bool = False
+    win_rate: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -268,6 +272,7 @@ class SubgoalChoice:
             "answer": self.answer,
             "possible": self.possible,
             "fallback": self.fallback,
+            "win_rate": self.win_rate,
         }
 
 
@@ -534,6 +539,12 @@ _FIGHT_NOTE = (
     "while a zombie is close."
 )
 
+_FIGHT_ODDS_NOTE = (
+    "The close threats line gives the odds: how often this player won, and "
+    "how often it died, in staged fights at that health, with that sword and "
+    "that many zombies. Walking away was not measured."
+)
+
 
 def build_subgoal_system_prompt(
     candidate_skills: Sequence[SkillId] = STONE_PICKAXE_SKILL_IDS,
@@ -542,13 +553,15 @@ def build_subgoal_system_prompt(
     observation: ObservationConfig | None = None,
     shelter: bool = False,
     fight: bool = False,
+    fight_odds: bool = False,
 ) -> str:
     """Return the sub-goal planner's role, documentation and output format.
 
     The achievement note, the shelter and fight choices and the observation
     legend appear only when the fields include achievements, ``shelter`` or
     ``fight`` is set or the observation has text, so the default prompt is
-    unchanged.
+    unchanged. With ``fight`` and ``fight_odds`` it says what the fight odds
+    in the user prompt mean.
     """
 
     has_achievements = any(name.startswith("achievement.") for name in fields)
@@ -561,6 +574,8 @@ def build_subgoal_system_prompt(
         instructions += " " + _SHELTER_NOTE.format(floor=SHELTER_NEED_FLOOR)
     if fight:
         instructions += " " + _FIGHT_NOTE
+        if fight_odds:
+            instructions += " " + _FIGHT_ODDS_NOTE
     prompt = instructions + "\n" + _mechanics_line(candidate_skills)
     if observation is not None:
         observation_text = observation_system_text(observation)
@@ -595,13 +610,16 @@ def build_subgoal_prompt(
     observation: ObservationConfig | None = None,
     shelter: bool = False,
     threats: Sequence[dict[str, Any]] | None = None,
+    fight_rate: FightRate | None = None,
+    fight_mob: str = "zombie",
 ) -> str:
     """Return the user prompt for one sub-goal request.
 
     With ``shelter`` it says whether the shelter could start now, and why
     not, with whether its room has water and how long the night has left.
     With ``threats``, the close hostile mobs, it lists them with the
-    player's health for the fight choice.
+    player's health for the fight choice, and with ``fight_rate`` the
+    measured odds of fighting the close ``fight_mob``.
     """
 
     lines = [
@@ -637,10 +655,13 @@ def build_subgoal_prompt(
     if shelter:
         lines.append(_shelter_text(state))
     if threats is not None:
-        lines.append(
+        line = (
             f"Close threats: {_threat_text(threats) or 'none'}; "
             f"health is {vitals(state)['health']}."
         )
+        if fight_rate is not None:
+            line += " " + _fight_rate_text(fight_rate, fight_mob)
+        lines.append(line)
     if feedback:
         lines.append("Planner rejected your last answer: " + " ".join(feedback))
     if observation is None or observation.image:
@@ -663,6 +684,15 @@ def _shelter_text(state: Any) -> str:
         lines.append(f"The nearest room {water} water beside it.")
     lines.append(f"Morning is in {steps_until_morning(state)} steps.")
     return " ".join(lines)
+
+
+def _fight_rate_text(rate: FightRate, mob: str) -> str:
+    sword = "no sword" if rate.sword == "none" else f"a {rate.sword} sword"
+    mobs = f"{rate.mobs} {mob}{'s' if rate.mobs > 1 else ''}"
+    return (
+        f"Fight odds at health {rate.health}, {sword} and {mobs}: "
+        f"won {rate.win_rate:.0%}, died {rate.death_rate:.0%}."
+    )
 
 
 def _is_threat(alert: str) -> bool:
@@ -760,7 +790,10 @@ class SubgoalPlanner:
     skill, when that is a candidate, before the plan goes on: at once, or
     with ``choose_fights`` only once the goal source's answer says to fight,
     which holds while the mob stays close. The prompt then lists the close
-    threats with the player's health.
+    threats with the player's health, and with ``fight_odds`` the measured
+    odds of the fight: the executor's win and death rates in staged fights
+    at the player's health, best sword and number of close mobs of that
+    kind.
     With ``shelter_at_night`` the goal source is offered the scripted
     ``shelter`` skill (see :mod:`tiny_sima.planner.shelter`): its answer says
     whether to wall the player in now, after reaching its sub-goals, such as
@@ -797,6 +830,7 @@ class SubgoalPlanner:
     defend_against: tuple[str, ...] = ()
     shelter_at_night: bool = False
     choose_fights: bool = False
+    fight_odds: FightOdds | None = None
     fallback: SubgoalSource | None = None
     _cache: dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
@@ -839,14 +873,29 @@ class SubgoalPlanner:
             and max(abs(offset) for offset in mob["offset"]) <= self.threat_radius
         ]
 
-    def _defence(self, state: Any) -> SkillId | None:
-        """Return the hunting skill for the nearest mob to fight off, if any."""
+    def _defended_mob(self, state: Any) -> str | None:
+        """Return the kind of the nearest mob to fight off, if any."""
 
         for mob in self._threats(state):
             skill_id = _HUNTING_SKILLS.get(mob["type"])
             if mob["type"] in self.defend_against and skill_id in self.candidate_skills:
-                return skill_id
+                return mob["type"]
         return None
+
+    def _defence(self, state: Any) -> SkillId | None:
+        """Return the hunting skill for the nearest mob to fight off, if any."""
+
+        mob = self._defended_mob(state)
+        return None if mob is None else _HUNTING_SKILLS[mob]
+
+    def _fight_rate(self, state: Any) -> FightRate | None:
+        """Return the measured odds of the fight on offer, if any."""
+
+        mob = self._defended_mob(state)
+        if self.fight_odds is None or not self.choose_fights or mob is None:
+            return None
+        close = sum(threat["type"] == mob for threat in self._threats(state))
+        return self.fight_odds.for_state(state, mob, close)
 
     def _alerts(self, state: Any) -> dict[str, str]:
         """Return the alert conditions that hold now, with their details.
@@ -992,7 +1041,9 @@ class SubgoalPlanner:
             observation=self.observation,
             shelter=self.shelter_at_night,
             fight=self.choose_fights,
+            fight_odds=self.fight_odds is not None,
         )
+        fight_mob = self._defended_mob(pending.state)
         user_prompt = build_subgoal_prompt(
             pending.state,
             pending.context,
@@ -1004,6 +1055,8 @@ class SubgoalPlanner:
             observation=self.observation,
             shelter=self.shelter_at_night,
             threats=self._threats(pending.state) if self.choose_fights else None,
+            fight_rate=self._fight_rate(pending.state),
+            fight_mob=fight_mob or "zombie",
         )
         cache_key = sha256(
             system_prompt.encode("utf-8")
@@ -1076,6 +1129,7 @@ class SubgoalPlanner:
                 )
             )
         if fight_offered:
+            rate = self._fight_rate(pending.state)
             choices.append(
                 SubgoalChoice(
                     plan.decision_index,
@@ -1083,6 +1137,7 @@ class SubgoalPlanner:
                     "true" if parsed.fight else "false",
                     True,
                     fallback,
+                    None if rate is None else rate.win_rate,
                 )
             )
         plan = replace(plan, choices=(*plan.choices, *choices))

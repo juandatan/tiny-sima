@@ -13,7 +13,9 @@ the creatures before the first step and after every step.
 outcome, the health it cost, and what the player did while next to the
 creature -- whether it faced it, swung at nothing, or walked away.
 :func:`summarize_fights` groups rows by any cell fields; grouped by health
-and sword it is the win-rate table a feasibility term for fights needs.
+and sword it is the win-rate table a feasibility term for fights needs,
+and :func:`fit_fight_odds` turns the executor's rows into the
+:class:`~tiny_sima.planner.fight_odds.FightOdds` its goal source is shown.
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ from tiny_sima.goals import (
     skill_index,
     target_mob_slots,
 )
+from tiny_sima.planner.fight_odds import SWORDS, FightOdds
 from tiny_sima.planner.observation import NIGHT_LIGHT_THRESHOLD
 from tiny_sima.planner.saycan import SkillOutcome
 
@@ -55,7 +58,6 @@ FIGHT_SKILLS: tuple[SkillId, ...] = (
     SkillId.DEFEAT_SKELETON,
     SkillId.EAT_COW,
 )
-SWORDS: tuple[str, ...] = ("none", "wood", "stone")
 FIGHT_BENCHMARK_SEED = 211
 # Creatures start at most this many steps from the player.
 MAX_DISTANCE = 4
@@ -497,3 +499,25 @@ def summarize_fights(
             }
         )
     return summaries
+
+
+def fit_fight_odds(
+    rows: Sequence[dict[str, Any]], *, policy: str = "executor"
+) -> FightOdds:
+    """Return one policy's win and death rates by health, sword and count."""
+
+    return FightOdds.from_rows(
+        {
+            "mob": SKILL_MOBS[SkillId(row["skill_id"])],
+            "health": row["health"],
+            "sword": row["sword"],
+            "mobs": row["mobs"],
+            "win_rate": row["win_rate"],
+            "death_rate": row["death_rate"],
+            "rollouts": row["count"],
+        }
+        for row in summarize_fights(
+            [row for row in rows if row["policy"] == policy],
+            by=("skill_id", "health", "sword", "mobs"),
+        )
+    )

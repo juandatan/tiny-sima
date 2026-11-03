@@ -30,6 +30,7 @@ from tiny_sima.memory import EpisodeMemory
 from tiny_sima.planner import (
     NOTHING_TO_DO,
     TECH_TREE_ORDER,
+    FightOdds,
     PlannerContext,
     PlannerSelectionStatus,
     SayCanPlanner,
@@ -536,13 +537,14 @@ def test_summary_aggregates_records() -> None:
 
 
 def test_summary_sets_choices_against_the_curriculum() -> None:
-    def choice(kind, answer, possible=True, fallback=False):
+    def choice(kind, answer, possible=True, fallback=False, win_rate=None):
         return {
             "decision_index": 0,
             "kind": kind,
             "answer": answer,
             "possible": possible,
             "fallback": fallback,
+            "win_rate": win_rate,
         }
 
     record = {
@@ -561,6 +563,9 @@ def test_summary_sets_choices_against_the_curriculum() -> None:
             choice("shelter", "no", fallback=True),
             choice("fight", "true"),
             choice("fight", "false"),
+            choice("fight", "false", win_rate=0.1),
+            choice("fight", "true", win_rate=0.6),
+            choice("fight", "true", win_rate=0.75),
         ],
     }
     summary = summarize_open_ended([record])
@@ -572,7 +577,13 @@ def test_summary_sets_choices_against_the_curriculum() -> None:
         "not possible": {"no": 1, "now": 1},
     }
     fight = summary["choices"]["fight"]
-    assert (fight["answers"], fight["differ"], fight["differ_rate"]) == (2, 1, 0.5)
+    assert (fight["answers"], fight["differ"], fight["differ_rate"]) == (5, 2, 0.4)
+    # Answers shown no odds are left out of the bands.
+    assert fight["by_odds"] == {
+        "won under 25%": {"false": 1},
+        "won 25-75%": {"true": 1},
+        "won 75% or more": {"true": 1},
+    }
 
 
 def test_design_factory_builds_the_three_designs() -> None:
@@ -603,6 +614,20 @@ def test_design_factory_builds_the_three_designs() -> None:
         assert planner.defend_against == ("zombie",)
     for selector in (vlm.fallback, scripted.backend):
         assert selector.vital_rules == SURVIVAL_VITAL_RULES
+    # Only the VLM is shown the fight odds; the curriculum always fights.
+    assert vlm.fight_odds is None
+    odds = FightOdds({("zombie", 9, "none", 1): (0.98, 0.02, 50)})
+    planners = open_ended_planners(
+        ALL_SKILL_IDS,
+        Backend(),
+        VLMPlannerConfig(),
+        None,
+        None,
+        choose_fights=True,
+        fight_odds=odds,
+    )
+    assert planners["subgoal_vlm"].fight_odds is odds
+    assert planners["subgoal_scripted"].fight_odds is None
 
     # The scripted design answers without the VLM.
     selection = scripted.select_many(

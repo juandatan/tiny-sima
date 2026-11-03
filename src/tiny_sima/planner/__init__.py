@@ -21,6 +21,12 @@ from tiny_sima.planner.competence import (
     fit_competence_prior,
     num_distance_cells,
 )
+from tiny_sima.planner.fight_odds import (
+    SWORDS,
+    FightOdds,
+    FightRate,
+    held_sword,
+)
 from tiny_sima.planner.goal_selector import (
     NOTHING_TO_DO,
     TECH_TREE_ORDER,
@@ -191,6 +197,9 @@ __all__ = [
     "BatchedUtilityScorer",
     "BatchedVisionLanguageBackend",
     "CompetencePrior",
+    "FightOdds",
+    "FightRate",
+    "SWORDS",
     "CriticAffordanceScorer",
     "GoalCondition",
     "IsotonicCalibration",
@@ -244,6 +253,7 @@ __all__ = [
     "distance_cell",
     "expected_calibration_error",
     "fit_competence_prior",
+    "held_sword",
     "fit_isotonic_calibration",
     "generate_all",
     "make_critic_affordance_scorer",
