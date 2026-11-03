@@ -1775,14 +1775,19 @@ class BatchedProbeCarry(NamedTuple):
     positions: jax.Array
     directions: jax.Array
     actions: jax.Array
+    health: jax.Array
+    mob_positions: jax.Array
+    mob_mask: jax.Array
 
 
 class BatchedProbeOutput(NamedTuple):
     """Per-entry probe results: how it ended and how long it took.
 
-    ``positions``, ``directions`` and ``actions`` are time-major traces of
-    shape ``(skill_horizon, batch)``; row ``t`` describes the state after
-    step ``t``. Rows at or beyond an entry's ``steps`` are padding.
+    ``positions``, ``directions``, ``actions`` and ``health`` are time-major
+    traces of shape ``(skill_horizon, batch)``; row ``t`` describes the state
+    after step ``t``. Rows at or beyond an entry's ``steps`` are padding.
+    ``mob_positions`` and ``mob_mask`` add a slot axis after the batch axis:
+    the mobs a hunting skill attacks, from :func:`target_mob_slots`.
     """
 
     outcome: jax.Array
@@ -1790,6 +1795,9 @@ class BatchedProbeOutput(NamedTuple):
     positions: jax.Array
     directions: jax.Array
     actions: jax.Array
+    health: jax.Array
+    mob_positions: jax.Array
+    mob_mask: jax.Array
 
 
 @dataclass(frozen=True)
@@ -1839,6 +1847,51 @@ def _stack_states(states: Sequence[Any]) -> Any:
 
 
 BatchedProbe = Callable[[Any, Any, jax.Array, jax.Array], BatchedProbeOutput]
+# Actions for a batch from its skill indices and states, in place of the
+# network's; it must be a module-level function, since it keys the cache.
+BatchedSkillPolicy = Callable[[jax.Array, Any], jax.Array]
+
+# Craftax Classic keeps at most three mobs of any kind.
+TRACED_MOB_SLOTS = 3
+_MOB_KINDS = tuple(dict.fromkeys(SKILL_MOBS.values()))
+# Per skill index, 1 + the index of the mob kind it attacks, or 0.
+_SKILL_MOB_KIND = np.asarray(
+    [
+        _MOB_KINDS.index(SKILL_MOBS[skill_id]) + 1 if skill_id in SKILL_MOBS else 0
+        for skill_id in ALL_SKILL_IDS
+    ],
+    dtype=np.int32,
+)
+
+
+def target_mob_slots(skill_id: jax.Array, state: Any) -> tuple[jax.Array, jax.Array]:
+    """Return the positions and live mask of the mobs a skill attacks.
+
+    ``skill_id`` is a traced skill index. Slots are padded to
+    ``TRACED_MOB_SLOTS``, and every slot is dead for a skill that attacks
+    no mob.
+    """
+
+    def slots(mob: str | None) -> Callable[[Any], tuple[jax.Array, jax.Array]]:
+        def read(state: Any) -> tuple[jax.Array, jax.Array]:
+            if mob is None:
+                return (
+                    jnp.zeros((TRACED_MOB_SLOTS, 2), dtype=jnp.int32),
+                    jnp.zeros((TRACED_MOB_SLOTS,), dtype=bool),
+                )
+            mobs = mob_instances(mob, state)
+            padding = TRACED_MOB_SLOTS - mobs.mask.shape[0]
+            return (
+                jnp.pad(
+                    jnp.asarray(mobs.position, dtype=jnp.int32), ((0, padding), (0, 0))
+                ),
+                jnp.pad(jnp.asarray(mobs.mask, dtype=bool), (0, padding)),
+            )
+
+        return read
+
+    branches = tuple(slots(mob) for mob in (None, *_MOB_KINDS))
+    return jax.lax.switch(jnp.asarray(_SKILL_MOB_KIND)[skill_id], branches, state)
 
 
 @lru_cache(maxsize=16)
@@ -1851,6 +1904,7 @@ def _make_batched_skill_probe(
     skill_embedding_size: int,
     deterministic: bool,
     num_skills: int = len(SKILL_IDS),
+    policy: BatchedSkillPolicy | None = None,
 ) -> BatchedProbe:
     """Build and cache one compiled probe for a static batch shape.
 
@@ -1859,6 +1913,8 @@ def _make_batched_skill_probe(
     a probe sweep spends most of its time on device synchronisation rather
     than on rollout. Running the whole batch inside one ``jax.lax.while_loop``
     removes every per-step round trip; only the final outcome codes come back.
+    A ``policy`` replaces the network, so a scripted reference runs through
+    the same loop and outcome rules.
     """
 
     environment = make_skill_chain_environment(distractor_count=distractor_count)
@@ -1893,6 +1949,13 @@ def _make_batched_skill_probe(
             positions=jnp.zeros((skill_horizon, batch_size, 2), dtype=jnp.int32),
             directions=jnp.zeros((skill_horizon, batch_size), dtype=jnp.int32),
             actions=jnp.zeros((skill_horizon, batch_size), dtype=jnp.int32),
+            health=jnp.zeros((skill_horizon, batch_size), dtype=jnp.int32),
+            mob_positions=jnp.zeros(
+                (skill_horizon, batch_size, TRACED_MOB_SLOTS, 2), dtype=jnp.int32
+            ),
+            mob_mask=jnp.zeros(
+                (skill_horizon, batch_size, TRACED_MOB_SLOTS), dtype=bool
+            ),
         )
 
         def continue_probing(
@@ -1908,21 +1971,26 @@ def _make_batched_skill_probe(
             rng, action_rng, environment_rng = jax.random.split(carry.rng, 3)
             active = ~carry.finished
 
-            model_output = apply_goal_conditioned_actor_critic(
-                model,
-                params,
-                carry.hidden,
-                (
-                    carry.observation[None, ...],
-                    skill_ids[None, ...],
-                    (carry.steps == 0)[None, ...],
-                ),
-            )
-            action = select_action(
-                model_output.logits[0],
-                action_rng,
-                deterministic=deterministic,
-            )
+            if policy is None:
+                model_output = apply_goal_conditioned_actor_critic(
+                    model,
+                    params,
+                    carry.hidden,
+                    (
+                        carry.observation[None, ...],
+                        skill_ids[None, ...],
+                        (carry.steps == 0)[None, ...],
+                    ),
+                )
+                hidden = model_output.hidden
+                action = select_action(
+                    model_output.logits[0],
+                    action_rng,
+                    deterministic=deterministic,
+                )
+            else:
+                hidden = carry.hidden
+                action = jnp.asarray(policy(skill_ids, carry.state), dtype=jnp.int32)
             action = jnp.where(active, action, Action.NOOP.value)
             environment_step = step_batch(
                 environment.bundle,
@@ -1958,12 +2026,13 @@ def _make_batched_skill_probe(
             )
             outcome = jnp.where(precondition_lost, precondition_lost_code, outcome)
             outcome = jnp.where(success, success_code, outcome)
+            mob_positions, mob_mask = jax.vmap(target_mob_slots)(skill_ids, state)
 
             next_carry = BatchedProbeCarry(
                 rng=rng,
                 state=state,
                 observation=observation,
-                hidden=model_output.hidden,
+                hidden=hidden,
                 steps=steps,
                 initial_metric=carry.initial_metric,
                 finished=carry.finished | ended,
@@ -1975,6 +2044,11 @@ def _make_batched_skill_probe(
                     jnp.asarray(state.player_direction, dtype=jnp.int32)
                 ),
                 actions=carry.actions.at[iteration].set(action),
+                health=carry.health.at[iteration].set(
+                    jnp.asarray(state.player_health, dtype=jnp.int32)
+                ),
+                mob_positions=carry.mob_positions.at[iteration].set(mob_positions),
+                mob_mask=carry.mob_mask.at[iteration].set(mob_mask),
             )
             return iteration + 1, next_carry
 
@@ -1989,6 +2063,9 @@ def _make_batched_skill_probe(
             positions=final_carry.positions,
             directions=final_carry.directions,
             actions=final_carry.actions,
+            health=final_carry.health,
+            mob_positions=final_carry.mob_positions,
+            mob_mask=final_carry.mob_mask,
         )
 
     return jax.jit(probe)
@@ -2024,6 +2101,49 @@ def probe_skills_batched(
     )
 
 
+def run_skill_probe(
+    executor: LearnedSkillExecutor,
+    states: Any,
+    skill_ids: Sequence[SkillId],
+    rng: jax.Array,
+    *,
+    skill_horizon: int = 64,
+    distractor_count: int = 3,
+    policy: BatchedSkillPolicy | None = None,
+) -> BatchedProbeOutput:
+    """Probe already-stacked ``states`` and return the host-side traces.
+
+    ``states`` is one batched pytree with ``len(skill_ids)`` entries. With a
+    ``policy`` the executor's network is never run; its configuration only
+    fixes the compiled shapes.
+    """
+
+    if skill_horizon < 1:
+        raise ValueError("skill_horizon must be positive.")
+    if policy is None:
+        executor.require_skills(skill_ids)
+    probe = _make_batched_skill_probe(
+        batch_size=len(skill_ids),
+        skill_horizon=skill_horizon,
+        distractor_count=distractor_count,
+        hidden_size=executor.config.hidden_size,
+        skill_embedding_size=executor.config.skill_embedding_size,
+        deterministic=executor.deterministic,
+        num_skills=executor.config.num_skills,
+        policy=policy,
+    )
+    output = probe(
+        executor.params,
+        states,
+        jnp.asarray(
+            [skill_index(skill_id) for skill_id in skill_ids],
+            dtype=jnp.int32,
+        ),
+        rng,
+    )
+    return BatchedProbeOutput(*(np.asarray(leaf) for leaf in jax.device_get(output)))
+
+
 def trace_skills_batched(
     executor: LearnedSkillExecutor,
     states: Sequence[Any],
@@ -2043,29 +2163,13 @@ def trace_skills_batched(
         raise ValueError("States and skill IDs must describe the same pairs.")
     if not states:
         return ()
-    if skill_horizon < 1:
-        raise ValueError("skill_horizon must be positive.")
-    executor.require_skills(skill_ids)
-
-    probe = _make_batched_skill_probe(
-        batch_size=len(states),
+    output = run_skill_probe(
+        executor,
+        _stack_states(states),
+        skill_ids,
+        rng,
         skill_horizon=skill_horizon,
         distractor_count=distractor_count,
-        hidden_size=executor.config.hidden_size,
-        skill_embedding_size=executor.config.skill_embedding_size,
-        deterministic=executor.deterministic,
-        num_skills=executor.config.num_skills,
-    )
-    output = jax.device_get(
-        probe(
-            executor.params,
-            _stack_states(states),
-            jnp.asarray(
-                [skill_index(skill_id) for skill_id in skill_ids],
-                dtype=jnp.int32,
-            ),
-            rng,
-        )
     )
     outcomes = np.asarray(output.outcome)
     steps = np.asarray(output.steps)

@@ -59,6 +59,17 @@ from tiny_sima.evaluation.executor_diagnostics import (
     success_table,
     summarize_rollout_features,
 )
+from tiny_sima.evaluation.fights import (
+    FIGHT_BENCHMARK_SEED,
+    FIGHT_SKILLS,
+    FightCell,
+    benchmark_fights,
+    chase_policy,
+    fight_cells,
+    fight_rollout_rows,
+    fight_worlds,
+    summarize_fights,
+)
 from tiny_sima.evaluation.goal_conditioned import (
     diagnose_goal_conditioned_checkpoint,
     diagnose_goal_conditioned_policy,
@@ -173,6 +184,15 @@ __all__ = [
     "CounterfactualEdit",
     "DecisionKind",
     "EXECUTOR_BENCHMARK_SEED",
+    "FIGHT_BENCHMARK_SEED",
+    "FIGHT_SKILLS",
+    "FightCell",
+    "benchmark_fights",
+    "chase_policy",
+    "fight_cells",
+    "fight_rollout_rows",
+    "fight_worlds",
+    "summarize_fights",
     "NvidiaSmiMonitor",
     "PlannerBoundaryTrace",
     "PrefixBoundary",
