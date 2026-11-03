@@ -309,9 +309,10 @@ def fight_rollout_rows(
     stands on the tile the player faces. A *hit* is a DO while facing; a
     *miss* a DO while not; a *retreat* a step from beside a creature to a
     tile beside none. Health lost is start minus end, so regeneration
-    offsets it; ``damage_taken`` sums only the drops. A creature is
-    unreachable from a dead player, so the probe calls a death a lost
-    precondition; the row's outcome says ``died``.
+    offsets it; ``damage_taken`` sums only the drops. ``outcome`` is the
+    probe's, so a death reads as a lost precondition, since every skill
+    needs the player alive; ``died`` says so, as a failed skill's cause
+    would, and a kill that costs the last health still counts as a win.
     """
 
     count = len(entries)
@@ -336,15 +337,14 @@ def fight_rollout_rows(
     drops = np.maximum(record.health[:-1] - record.health[1:], 0) * valid
 
     final_health = record.health[steps, np.arange(count)]
-    outcomes = [PROBE_OUTCOMES[int(code)] for code in output.outcome[:count]]
-    died = [
-        health <= 0 and outcome is not SkillOutcome.SUCCESS
-        for health, outcome in zip(final_health.tolist(), outcomes, strict=True)
-    ]
+    outcomes = output.outcome[:count]
+    died = (final_health <= 0) & (
+        outcomes != PROBE_OUTCOMES.index(SkillOutcome.SUCCESS)
+    )
     columns = zip(
         entries,
-        outcomes,
-        died,
+        outcomes.tolist(),
+        died.tolist(),
         steps.tolist(),
         final_health.tolist(),
         drops.sum(axis=0).tolist(),
@@ -360,7 +360,7 @@ def fight_rollout_rows(
         {
             **cell.as_row(),
             "policy": policy,
-            "outcome": "died" if death else outcome.value,
+            "outcome": PROBE_OUTCOMES[outcome].value,
             "steps": rollout_steps,
             "final_health": health,
             "died": death,

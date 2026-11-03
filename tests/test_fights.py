@@ -229,7 +229,8 @@ def test_a_hopeless_fight_is_counted_as_a_death(
     output = _probe(executor, entries, states, horizon=8)
     rows = fight_rollout_rows(entries, output, policy="chase")
 
-    assert [row["outcome"] for row in rows] == ["died", "died"]
+    # The probe calls it a lost precondition; the row says why.
+    assert [row["outcome"] for row in rows] == ["precondition_lost"] * 2
     assert all(row["died"] and row["damage_taken"] >= 2 for row in rows)
 
 
@@ -345,13 +346,13 @@ def test_benchmark_pairs_both_policies_on_every_cell(
 
 
 def test_summary_rates_and_per_win_costs() -> None:
-    def row(outcome, health_lost, sword):
+    def row(outcome, health_lost, sword, died=False):
         return {
             "skill_id": "defeat_zombie",
             "policy": "chase",
             "sword": sword,
             "outcome": outcome,
-            "died": outcome == "died",
+            "died": died,
             "steps": 10,
             "health_lost": health_lost,
             "damage_taken": max(health_lost, 0),
@@ -366,7 +367,7 @@ def test_summary_rates_and_per_win_costs() -> None:
     rows = [
         row("success", 2, "none"),
         row("success", 4, "none"),
-        row("died", 9, "none"),
+        row("precondition_lost", 9, "none", died=True),
         row("timeout", 0, "none"),
         row("success", 2, "stone"),
     ]
@@ -380,7 +381,7 @@ def test_summary_rates_and_per_win_costs() -> None:
     assert none["win_rate"] == 0.5
     assert none["death_rate"] == 0.25
     assert none["win_health_lost"] == 3.0
-    assert none["outcomes"] == {"success": 2, "died": 1, "timeout": 1}
+    assert none["outcomes"] == {"success": 2, "precondition_lost": 1, "timeout": 1}
     assert none["adjacent_share"] == 0.4
     assert none["facing_when_adjacent"] == 0.5
     assert none["first_hit_step"] == 3.0
