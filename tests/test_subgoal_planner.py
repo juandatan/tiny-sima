@@ -1,5 +1,6 @@
 import json
 from collections.abc import Sequence
+from typing import Any
 
 import jax
 import pytest
@@ -34,13 +35,16 @@ def _with_inventory(state, **counts):
     return state.replace(inventory=state.inventory.replace(**counts))
 
 
-def _answer(*subgoals: tuple[str, int], assessment: str = "") -> str:
+def _answer(*subgoals: tuple[str, int], assessment: str = "", **choices: Any) -> str:
+    """A sub-goal answer, with any of the answer's choices, such as fight."""
+
     return json.dumps(
         {
             "assessment": assessment,
             "subgoals": [
                 {"field": field, "at_least": value} for field, value in subgoals
             ],
+            **choices,
         }
     )
 

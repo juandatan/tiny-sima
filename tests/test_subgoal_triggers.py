@@ -1,4 +1,3 @@
-import json
 from collections.abc import Sequence
 
 import jax.numpy as jnp
@@ -279,10 +278,6 @@ def test_a_subgoal_source_replaces_the_vlm() -> None:
     assert selection.decision is None
 
 
-def _fight_answer(fight: bool) -> str:
-    return json.dumps({"fight": fight, **json.loads(_answer(("inventory.wood", 1)))})
-
-
 def test_the_vlm_chooses_whether_to_fight_a_close_zombie() -> None:
     skills = (SkillId.COLLECT_WOOD, SkillId.DEFEAT_ZOMBIE)
     state = _grass_world(tree=[(0, 2)])
@@ -291,7 +286,7 @@ def test_the_vlm_chooses_whether_to_fight_a_close_zombie() -> None:
         (True, SkillId.DEFEAT_ZOMBIE),
         (False, SkillId.COLLECT_WOOD),
     ):
-        backend = ScriptedBackend(_fight_answer(fight))
+        backend = ScriptedBackend(_answer(("inventory.wood", 1), fight=fight))
         planner = SubgoalPlanner(
             backend,
             candidate_skills=skills,
@@ -309,7 +304,7 @@ def test_the_vlm_chooses_whether_to_fight_a_close_zombie() -> None:
         )
 
     # The fight lasts while the zombie stays close, and lapses once it goes.
-    backend = ScriptedBackend(_fight_answer(True))
+    backend = ScriptedBackend(_answer(("inventory.wood", 1), fight=True))
     planner = SubgoalPlanner(
         backend,
         candidate_skills=skills,
@@ -329,3 +324,6 @@ def test_the_vlm_chooses_whether_to_fight_a_close_zombie() -> None:
     gone = _select(planner, state, context)
     assert gone.decision.skill_id is SkillId.COLLECT_WOOD
     assert not gone.plan_state.fighting
+    assert ("fight", "ended") in {
+        (event.subgoal, event.status) for event in gone.plan_state.events
+    }

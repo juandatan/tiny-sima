@@ -149,13 +149,8 @@ def test_a_water_wall_is_drunk_from_instead_of_leaving() -> None:
     assert int(result.state.player_drink) > 2
 
 
-def _shelter_answer(shelter: str, *subgoals: tuple[str, int]) -> str:
-    answer = json.loads(_answer(*(subgoals or (("inventory.wood", 1),))))
-    return json.dumps({"shelter": shelter, **answer})
-
-
 def _night_planner(shelter: str = "now", **options):
-    backend = ScriptedBackend(_shelter_answer(shelter))
+    backend = ScriptedBackend(_answer(("inventory.wood", 1), shelter=shelter))
     options.setdefault("shelter_at_night", True)
     planner = SubgoalPlanner(
         backend, candidate_skills=(SkillId.COLLECT_WOOD,), **options
@@ -170,7 +165,7 @@ def test_the_vlm_chooses_to_shelter_at_night() -> None:
 
     assert selection.decision.skill_id is SkillId.SHELTER
     assert selection.plan_state.defending
-    assert selection.plan_state.sheltering
+    assert selection.plan_state.shelter == "now"
     assert SkillId.SHELTER in {score.skill_id for score in selection.decision.scores}
     # The sub-goals wait for the morning.
     assert [render_subgoal(goal) for goal in selection.plan_state.pending] == [
@@ -193,7 +188,7 @@ def test_the_planner_keeps_working_unless_the_vlm_shelters() -> None:
     ):
         selection = _select(planner, world, PlannerContext(OBJECTIVE))
         assert selection.decision.skill_id is SkillId.COLLECT_WOOD
-        assert not selection.plan_state.sheltering
+        assert selection.plan_state.shelter == "no"
     # Without the option the prompt is unchanged.
     planner, backend = _night_planner(shelter_at_night=False)
     _select(planner, state, PlannerContext(OBJECTIVE))
@@ -228,13 +223,13 @@ def test_the_shelter_lapses_at_dawn() -> None:
     assert again.decision.skill_id is SkillId.SHELTER
     morning = _select(planner, _at(state, 0), context)
     assert morning.decision.skill_id is SkillId.COLLECT_WOOD
-    assert not morning.plan_state.sheltering
+    assert morning.plan_state.shelter == "no"
 
 
 def test_the_vlm_can_drink_first_and_shelter_after() -> None:
     state, _ = _sealed()
     thirsty = state.replace(player_drink=jnp.int32(2))
-    backend = ScriptedBackend(_shelter_answer("after", ("survival.drink", 6)))
+    backend = ScriptedBackend(_answer(("survival.drink", 6), shelter="after"))
     planner = SubgoalPlanner(
         backend,
         candidate_skills=(SkillId.COLLECT_WOOD, SkillId.DRINK_WATER),
@@ -246,14 +241,13 @@ def test_the_vlm_can_drink_first_and_shelter_after() -> None:
         backend.requests[0].user_prompt
     )
     assert first.decision.skill_id is SkillId.DRINK_WATER
-    assert first.plan_state.shelter_after
-    assert not first.plan_state.sheltering
+    assert first.plan_state.shelter == "after"
 
     # Once drink is up, the shelter starts without asking again.
     context = PlannerContext(OBJECTIVE, plan_state=first.plan_state)
     then = _select(planner, state.replace(player_drink=jnp.int32(6)), context)
     assert then.decision.skill_id is SkillId.SHELTER
-    assert then.plan_state.sheltering
+    assert then.plan_state.shelter == "now"
     assert ("shelter", "started") in {
         (event.subgoal, event.status) for event in then.plan_state.events
     }
@@ -261,7 +255,31 @@ def test_the_vlm_can_drink_first_and_shelter_after() -> None:
 
     # By day the choice lapses.
     morning = _select(planner, _at(thirsty, 0), context)
-    assert not morning.plan_state.shelter_after
+    assert morning.plan_state.shelter == "no"
+
+
+def test_a_shelter_after_nothing_starts_now_and_alerts_still_ask() -> None:
+    state, _ = _sealed()
+    # 0 wood is always true, so nothing comes before the shelter.
+    backend = ScriptedBackend(_answer(("inventory.wood", 0), shelter="after"))
+    planner = SubgoalPlanner(
+        backend,
+        candidate_skills=(SkillId.COLLECT_WOOD,),
+        shelter_at_night=True,
+        vital_thresholds=(("health", 3),),
+    )
+    first = _select(planner, state, PlannerContext(OBJECTIVE))
+    assert first.decision.skill_id is SkillId.SHELTER
+    assert first.plan_state.shelter == "now"
+    assert first.plan_state.pending == ()
+
+    # The shelter alone asks nothing more, but low health still does.
+    context = PlannerContext(OBJECTIVE, plan_state=first.plan_state)
+    again = _select(planner, state, context)
+    assert again.decision.skill_id is SkillId.SHELTER
+    assert len(backend.requests) == 1
+    _select(planner, state.replace(player_health=jnp.int32(3)), context)
+    assert len(backend.requests) == 2
 
 
 def test_the_curriculum_shelters_whenever_it_can_and_always_fights() -> None:

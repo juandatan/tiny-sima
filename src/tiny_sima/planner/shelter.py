@@ -32,6 +32,7 @@ from craftax.craftax_classic.constants import (
     BlockType,
 )
 from craftax.craftax_classic.envs.craftax_state import EnvParams
+from craftax.craftax_classic.game_logic import calculate_light_level
 
 from tiny_sima.goals import MOB_TYPES, mob_instances
 from tiny_sima.planner.observation import NIGHT_LIGHT_THRESHOLD
@@ -121,9 +122,10 @@ def is_night(state: Any) -> bool:
 def steps_until_morning(state: Any, day_length: int = EnvParams().day_length) -> int:
     """Steps until the light comes back, as Craftax computes it; 0 by day."""
 
-    steps = np.arange(day_length)
-    progress = ((int(np.asarray(state.timestep)) + steps) / day_length) % 1 + 0.3
-    light = 1 - np.abs(np.cos(np.pi * progress)) ** 3
+    timesteps = int(np.asarray(state.timestep)) + np.arange(day_length)
+    light = np.asarray(
+        calculate_light_level(timesteps, EnvParams(day_length=day_length))
+    )
     day = np.flatnonzero(light >= NIGHT_LIGHT_THRESHOLD)
     return int(day[0]) if day.size else day_length
 
@@ -241,33 +243,39 @@ def _use_wall(state: Any, walls: list[tuple[Position, int]]) -> int:
 def shelter_blocker(state: Any) -> str | None:
     """Why the shelter cannot start now, or ``None`` when it can."""
 
+    return shelter_status(state)[0]
+
+
+def shelter_status(state: Any) -> tuple[str | None, Room | None]:
+    """:func:`shelter_blocker` with the room the shelter would use, if any.
+
+    The room is looked for at night only.
+    """
+
     if not is_night(state):
-        return "it is day"
-    if _food(state) <= SHELTER_NEED_FLOOR:
-        return "food is too low to stay in"
-    if int(np.asarray(state.inventory.wood_pickaxe)) < 1:
-        return "it needs a wood pickaxe"
+        return "it is day", None
     room = choose_room(state)
+    if _food(state) <= SHELTER_NEED_FLOOR:
+        return "food is too low to stay in", room
+    if int(np.asarray(state.inventory.wood_pickaxe)) < 1:
+        return "it needs a wood pickaxe", room
     if room is None:
-        return "there is no room to wall in nearby"
+        return "there is no room to wall in nearby", None
     world_map = np.asarray(state.map)
     # Low drink is fine in a room the player can drink inside.
-    if needs_low(state) and not _walls_of(room, world_map, BlockType.WATER):
-        return "drink is too low to stay in"
+    if needs_low(state) and not room_has_water(state, room):
+        return "drink is too low to stay in", room
     if _stone(state) < len(room.open_walls(world_map)) and (
         _mine_stone(state, world_map, _player(state), _walls(room)) is None
     ):
-        return "there is too little stone and none to mine nearby"
-    return None
+        return "there is too little stone and none to mine nearby", room
+    return None, room
 
 
-def shelter_has_water(state: Any) -> bool:
-    """Whether the room the shelter would use has water to drink from."""
+def room_has_water(state: Any, room: Room) -> bool:
+    """Whether ``room`` has water beside it to drink from."""
 
-    room = choose_room(state)
-    return room is not None and bool(
-        _walls_of(room, np.asarray(state.map), BlockType.WATER)
-    )
+    return bool(_walls_of(room, np.asarray(state.map), BlockType.WATER))
 
 
 def shelter_feasible(state: Any) -> bool:

@@ -72,8 +72,9 @@ from tiny_sima.planner.saycan import (
 from tiny_sima.planner.shelter import (
     SHELTER_NEED_FLOOR,
     is_night,
+    room_has_water,
     shelter_blocker,
-    shelter_has_water,
+    shelter_status,
     steps_until_morning,
 )
 from tiny_sima.planner.symbolic import (
@@ -272,10 +273,9 @@ class SubgoalPlan:
     # current sub-goal, so it neither spends the sub-goal's budget nor counts
     # as the sub-goal's failure.
     defending: bool = False
-    # Whether the goal source chose to shelter for the rest of this night,
-    # or to shelter once the pending sub-goals are reached.
-    sheltering: bool = False
-    shelter_after: bool = False
+    # The goal source's shelter for this night, one of SHELTER_CHOICES:
+    # sheltering "now", "after" the pending sub-goals are reached, or "no".
+    shelter: str = "no"
     # Whether the goal source chose to fight off the zombie that is close.
     fighting: bool = False
 
@@ -330,8 +330,7 @@ class SubgoalPlan:
             "skills_on_current": self.skills_on_current,
             "current_budget": self.current_budget,
             "defending": self.defending,
-            "sheltering": self.sheltering,
-            "shelter_after": self.shelter_after,
+            "shelter": self.shelter,
             "fighting": self.fighting,
         }
 
@@ -380,22 +379,15 @@ def parse_subgoal_response(
             return invalid(f"{field_name}: at_least was not an integer")
         subgoals.append((StateRequirement(field_name, "at_least", value),))
     assessment = payload.get("assessment", "")
+    shelter = payload.get("shelter")
     return ParsedSubgoals(
         subgoals=tuple(subgoals),
         assessment=assessment if isinstance(assessment, str) else "",
         raw_response=text,
         valid=True,
-        shelter=_shelter_choice(payload.get("shelter")),
+        shelter=shelter if shelter in SHELTER_CHOICES else "no",
         fight=payload.get("fight") is True,
     )
-
-
-def _shelter_choice(value: Any) -> str:
-    """One of :data:`SHELTER_CHOICES`; ``true`` reads as ``"now"``."""
-
-    if value is True:
-        return "now"
-    return value if value in SHELTER_CHOICES else "no"
 
 
 def subgoal_output_type(
@@ -616,9 +608,9 @@ def build_subgoal_prompt(
     if shelter:
         lines.append(_shelter_text(state))
     if threats is not None:
-        close = ", ".join(f"{mob['type']} at offset {mob['offset']}" for mob in threats)
         lines.append(
-            f"Close threats: {close or 'none'}; health is {vitals(state)['health']}."
+            f"Close threats: {_threat_text(threats) or 'none'}; "
+            f"health is {vitals(state)['health']}."
         )
     if feedback:
         lines.append("Planner rejected your last answer: " + " ".join(feedback))
@@ -632,15 +624,31 @@ def build_subgoal_prompt(
 def _shelter_text(state: Any) -> str:
     """Whether the shelter could start now, and what the night holds."""
 
-    blocker = shelter_blocker(state)
-    if blocker == "it is day":
+    if not is_night(state):
         return "Shelter: not possible now: it is day."
+    blocker, room = shelter_status(state)
     text = "possible now" if blocker is None else f"not possible now: {blocker}"
-    water = "has" if shelter_has_water(state) else "has no"
-    return (
-        f"Shelter: {text}. The nearest room {water} water beside it. "
-        f"Morning is in {steps_until_morning(state)} steps."
-    )
+    lines = [f"Shelter: {text}."]
+    if room is not None:
+        water = "has" if room_has_water(state, room) else "has no"
+        lines.append(f"The nearest room {water} water beside it.")
+    lines.append(f"Morning is in {steps_until_morning(state)} steps.")
+    return " ".join(lines)
+
+
+def _threat_text(threats: Sequence[dict[str, Any]]) -> str:
+    return ", ".join(f"{mob['type']} at offset {mob['offset']}" for mob in threats)
+
+
+def _start_shelter(
+    plan: SubgoalPlan, state: Any, status: str, reason: str = ""
+) -> tuple[SubgoalPlan, str | None]:
+    """Record whether the shelter starts now; return why not, if it cannot."""
+
+    blocker = shelter_blocker(state)
+    if blocker is None:
+        return plan.with_event("shelter", status, reason), None
+    return plan.with_event("shelter", "rejected", blocker), blocker
 
 
 def _failure_text(context: PlannerContext) -> str:
@@ -822,9 +830,7 @@ class SubgoalPlanner:
         }
         threats = self._threats(state)
         if threats:
-            active["threat"] = ", ".join(
-                f"{mob['type']} at offset {mob['offset']}" for mob in threats
-            )
+            active["threat"] = _threat_text(threats)
         if self.replan_at_night and readings["night"]:
             active["night"] = ""
         return active
@@ -855,29 +861,28 @@ class SubgoalPlanner:
             raw_response=None,
             skills_on_current=plan.skills_on_current + spent,
             defending=False,
-            # A fight lasts while its mob stays close, and a shelter chosen
-            # for one night lapses at dawn.
-            fighting=plan.fighting and self._defence(state) is not None,
-            shelter_after=plan.shelter_after and is_night(state),
         )
-        if plan.sheltering:
+        # A fight lasts while its mob stays close, and a shelter until it
+        # cannot go on, by dawn at the latest; the goal source is then asked
+        # again if nothing else is pending.
+        if plan.fighting and self._defence(state) is None:
+            plan = replace(plan, fighting=False).with_event("fight", "ended")
+        if plan.shelter == "now":
             blocker = shelter_blocker(state)
             if blocker is not None:
-                plan = replace(plan, sheltering=False).with_event(
+                plan = replace(plan, shelter="no").with_event(
                     "shelter", "ended", blocker
                 )
+        elif plan.shelter == "after" and not is_night(state):
+            plan = replace(plan, shelter="no")
         if plan.vlm_calls == 0:
             trigger = ReplanTrigger.START
         while plan.current is not None and _holds(state, plan.current):
             plan = plan.advanced("achieved")
-        if plan.shelter_after and plan.current is None:
+        if plan.shelter == "after" and plan.current is None:
             # The goal source asked for the shelter once these were reached.
-            blocker = shelter_blocker(state)
-            plan = replace(plan, shelter_after=False)
-            if blocker is None:
-                plan = replace(plan, sheltering=True).with_event("shelter", "started")
-            else:
-                plan = plan.with_event("shelter", "rejected", blocker)
+            plan, blocker = _start_shelter(plan, state, "started")
+            plan = replace(plan, shelter="now" if blocker is None else "no")
         active = self._alerts(state)
         plan = replace(plan, alerts=tuple(a for a in plan.alerts if a in active))
         fresh = {key: text for key, text in active.items() if key not in plan.alerts}
@@ -888,14 +893,16 @@ class SubgoalPlanner:
             and not context.history[-1].succeeded
             and not defended
         )
+        # A shelter or a fight with no sub-goals after it is a plan of its
+        # own, which the alerts below may still interrupt.
+        standing = plan.shelter == "now" or plan.fighting
         if trigger is not None:
             pass
-        elif plan.current is None:
-            # A shelter with nothing after it runs until it ends.
-            if not plan.sheltering:
-                trigger = ReplanTrigger.SUBGOALS_DONE
+        elif plan.current is None and not standing:
+            trigger = ReplanTrigger.SUBGOALS_DONE
         elif (
-            plan.current_budget is not None
+            plan.current is not None
+            and plan.current_budget is not None
             and plan.skills_on_current >= plan.current_budget
         ):
             detail = (
@@ -907,7 +914,7 @@ class SubgoalPlanner:
                 f"(budget {plan.current_budget})",
             )
             trigger = ReplanTrigger.TIMED_OUT
-        elif failed:
+        elif failed and plan.current is not None:
             detail = _failure_text(context)
             plan = plan.with_event(render_subgoal(plan.current), "skill_failed", detail)
             trigger = ReplanTrigger.SKILL_FAILED
@@ -919,7 +926,7 @@ class SubgoalPlanner:
             trigger = ReplanTrigger.THREAT
         elif "night" in fresh:
             trigger = ReplanTrigger.NIGHT
-        else:
+        elif plan.current is not None:
             check = self._check(state, context, plan.current)
             if not check.reachable:
                 plan = plan.advanced("abandoned", check.reason)
@@ -1015,26 +1022,13 @@ class SubgoalPlanner:
         reasons: list[str] = []
         held: list[str] = []
         source = "fallback" if fallback else ""
-        sheltering = shelter_after = fighting = False
-        # The latest answer at night decides; by day the choice is moot. A
-        # shelter after the sub-goals is checked once they are reached, since
-        # they may be what it lacks now, such as drink.
-        night = self.shelter_at_night and is_night(pending.state)
-        if night and parsed.shelter == "now":
-            blocker = shelter_blocker(pending.state)
-            if blocker is None:
-                sheltering = True
-                plan = plan.with_event("shelter", "proposed", source)
-            else:
-                reasons.append(f"shelter: {blocker}")
-                plan = plan.with_event("shelter", "rejected", blocker)
-        # Likewise the latest answer while a mob is close decides the fight.
-        if (
+        # The latest answer while a mob is close decides the fight.
+        fighting = (
             self.choose_fights
             and parsed.fight
             and self._defence(pending.state) is not None
-        ):
-            fighting = True
+        )
+        if fighting:
             plan = plan.with_event("fight", "proposed", source)
         # Sub-goals an earlier round of this decision already reported as
         # held; the 2B model repeats them until its rounds run out.
@@ -1073,15 +1067,30 @@ class SubgoalPlanner:
         # events with their reasons, which the next request shows. Turning
         # the whole answer down for one unreachable sub-goal ended episodes
         # where the VLM kept asking for food with no cow left.
-        if (sheltering or fighting) and not accepted:
+        # Likewise the latest answer at night decides the shelter; by day the
+        # choice is moot. A shelter after the sub-goals is checked once they
+        # are reached, since they may be what it lacks now, such as drink,
+        # and with none accepted it starts now.
+        shelter = "no"
+        if self.shelter_at_night and is_night(pending.state):
+            shelter = parsed.shelter
+        if shelter == "after" and not accepted:
+            shelter = "now"
+        if shelter == "now":
+            plan, blocker = _start_shelter(plan, pending.state, "proposed", source)
+            if blocker is not None:
+                shelter = "no"
+                reasons.append(f"shelter: {blocker}")
+        elif shelter == "after":
+            plan = plan.with_event("shelter", "proposed", source or "after sub-goals")
+        if (shelter == "now" or fighting) and not accepted:
             # The night's shelter or the fight alone is a plan; the
             # sub-goals wait.
             return replace(
                 plan,
                 pending=pending.plan.pending,
                 assessment=parsed.assessment,
-                sheltering=sheltering,
-                shelter_after=False,
+                shelter=shelter,
                 fighting=fighting,
             )
         if not accepted:
@@ -1096,17 +1105,13 @@ class SubgoalPlanner:
             return None
         for subgoal in accepted:
             plan = plan.with_event(render_subgoal(subgoal), "proposed", source)
-        if night and parsed.shelter == "after":
-            shelter_after = True
-            plan = plan.with_event("shelter", "proposed", source or "after sub-goals")
         return replace(
             plan,
             pending=tuple(accepted),
             assessment=parsed.assessment,
             skills_on_current=0,
             current_budget=None,
-            sheltering=sheltering,
-            shelter_after=shelter_after,
+            shelter=shelter,
             fighting=fighting,
         )
 
@@ -1123,7 +1128,7 @@ class SubgoalPlanner:
             return self._selected(
                 state, context, replace(plan, defending=True), {defence}
             )
-        if plan.sheltering:
+        if plan.shelter == "now":
             return self._selected(
                 state, context, replace(plan, defending=True), {SkillId.SHELTER}
             )
