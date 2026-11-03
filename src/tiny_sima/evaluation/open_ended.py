@@ -336,17 +336,20 @@ def open_ended_planners(
     model: SkillModel | None = None,
     threat_radius: int = DEFAULT_THREAT_RADIUS,
     shelter_at_night: bool = True,
+    choose_fights: bool = True,
 ) -> dict[str, SkillPlanner]:
     """Return the three designs, built as notebook 06 builds its planners.
 
     Without a prior, the SayCan Can term and the sub-goal tie-break fall
     back to reachability, as in notebook 06. Both sub-goal planners share
     every setting but the goal source, and ``subgoal_vlm`` falls back on the
-    curriculum ``subgoal_scripted`` follows. Both fight off a zombie within
-    ``threat_radius`` before going on with their plan. With
-    ``shelter_at_night`` their goal source chooses whether to wall the
-    player in with stone for the night: the VLM decides, and the curriculum
-    shelters whenever it can.
+    curriculum ``subgoal_scripted`` follows. Both can fight off a zombie
+    within ``threat_radius`` before going on with their plan; with
+    ``choose_fights`` their goal source chooses whether to. With
+    ``shelter_at_night`` it chooses whether to wall the player in with stone
+    for the night, now or after its sub-goals. The VLM decides both from
+    what the prompt says; the curriculum always fights and shelters
+    whenever it can.
     """
 
     feasibility = prior if prior is not None else reachability_feasibility
@@ -357,6 +360,7 @@ def open_ended_planners(
             model=model,
             vital_rules=SURVIVAL_VITAL_RULES,
             shelter_at_night=shelter_at_night,
+            choose_fights=choose_fights,
         )
 
     def subgoal_planner(source: Any, **options: Any) -> SubgoalPlanner:
@@ -373,6 +377,7 @@ def open_ended_planners(
             replan_at_night=True,
             defend_against=("zombie",),
             shelter_at_night=shelter_at_night,
+            choose_fights=choose_fights,
             **options,
         )
 

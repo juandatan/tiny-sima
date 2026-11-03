@@ -31,6 +31,7 @@ from craftax.craftax_classic.constants import (
     Action,
     BlockType,
 )
+from craftax.craftax_classic.envs.craftax_state import EnvParams
 
 from tiny_sima.goals import MOB_TYPES, mob_instances
 from tiny_sima.planner.observation import NIGHT_LIGHT_THRESHOLD
@@ -115,6 +116,16 @@ def _player(state: Any) -> Position:
 
 def is_night(state: Any) -> bool:
     return float(np.asarray(state.light_level)) < NIGHT_LIGHT_THRESHOLD
+
+
+def steps_until_morning(state: Any, day_length: int = EnvParams().day_length) -> int:
+    """Steps until the light comes back, as Craftax computes it; 0 by day."""
+
+    steps = np.arange(day_length)
+    progress = ((int(np.asarray(state.timestep)) + steps) / day_length) % 1 + 0.3
+    light = 1 - np.abs(np.cos(np.pi * progress)) ** 3
+    day = np.flatnonzero(light >= NIGHT_LIGHT_THRESHOLD)
+    return int(day[0]) if day.size else day_length
 
 
 def needs_low(state: Any) -> bool:
@@ -248,6 +259,15 @@ def shelter_blocker(state: Any) -> str | None:
     ):
         return "there is too little stone and none to mine nearby"
     return None
+
+
+def shelter_has_water(state: Any) -> bool:
+    """Whether the room the shelter would use has water to drink from."""
+
+    room = choose_room(state)
+    return room is not None and bool(
+        _walls_of(room, np.asarray(state.map), BlockType.WATER)
+    )
 
 
 def shelter_feasible(state: Any) -> bool:

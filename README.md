@@ -140,8 +140,14 @@ and a sound external checker verifies and gives feedback.
     and energy at 3, since sleeping in the open is when zombies hit hardest.
   - **A hostile creature comes close**, within `threat_radius`. Off by
     default. A mob in `defend_against` within that radius is also fought
-    at once with its hunting skill, outside the plan: the fight neither
-    spends the sub-goal's budget nor counts as its failure.
+    with its hunting skill, outside the plan: the fight neither spends the
+    sub-goal's budget nor counts as its failure. By default every such mob
+    is fought at once. With `choose_fights`, each answer carries `fight`,
+    true or false, and the prompt lists the close threats with the
+    player's health, so the goal source decides, for example to drink or
+    walk on rather than fight at low health. A fight holds while the mob
+    stays close; the latest answer decides. The open-ended VLM design
+    makes this choice, and the curriculum always fights.
   - **Night falls**, if `replan_at_night` is set. Off by default.
   - **The current sub-goal becomes unreachable.**
 
@@ -339,12 +345,16 @@ achievements as you can."
 - **Shelter at night:** with `shelter_at_night`, the sub-goal designs'
   goal source decides whether to wall the player in with stone for the
   night. Zombies cannot walk through stone, and sleeping in the open was
-  when they hit hardest. Each answer carries `shelter`, true or false; the
-  prompt says whether the shelter could start now and, if not, why. The
-  VLM chooses, so when to hide is part of what the comparison measures,
-  while the curriculum shelters whenever it can. An accepted choice holds
-  for the rest of the night and lapses at dawn; the sub-goals wait until
-  the player is out. `shelter` is a scripted macro in
+  when they hit hardest. Each answer carries `shelter`: `now`, `after` or
+  `no`. `now` shelters at once and the sub-goals wait until the player is
+  out. `after` reaches the answer's sub-goals first, such as drinking up
+  before a room with no water, and then shelters without asking again.
+  The prompt says whether the shelter could start now and, if not, why,
+  whether the room it would use has water beside it, and how many steps
+  are left until morning. The VLM chooses, so when to hide, and what to do
+  first, is part of what the comparison measures, while the curriculum
+  shelters now whenever it can. A shelter holds for the rest of the night
+  while it can run, and lapses at dawn. `shelter` is a scripted macro in
   [planner/shelter.py](src/tiny_sima/planner/shelter.py), not a learned
   skill, so the executor needs no retraining. It fights off an adjacent
   zombie, mines stone if it has too little, builds a 2x2 room, preferring

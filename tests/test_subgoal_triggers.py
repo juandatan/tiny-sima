@@ -1,3 +1,4 @@
+import json
 from collections.abc import Sequence
 
 import jax.numpy as jnp
@@ -276,3 +277,55 @@ def test_a_subgoal_source_replaces_the_vlm() -> None:
     assert source.seen[1].feedback
     assert selection.plan_state.rejections == 2
     assert selection.decision is None
+
+
+def _fight_answer(fight: bool) -> str:
+    return json.dumps({"fight": fight, **json.loads(_answer(("inventory.wood", 1)))})
+
+
+def test_the_vlm_chooses_whether_to_fight_a_close_zombie() -> None:
+    skills = (SkillId.COLLECT_WOOD, SkillId.DEFEAT_ZOMBIE)
+    state = _grass_world(tree=[(0, 2)])
+    close = _with_mobs(state, "zombies", (1, 1))
+    for fight, skill_id in (
+        (True, SkillId.DEFEAT_ZOMBIE),
+        (False, SkillId.COLLECT_WOOD),
+    ):
+        backend = ScriptedBackend(_fight_answer(fight))
+        planner = SubgoalPlanner(
+            backend,
+            candidate_skills=skills,
+            threat_radius=2,
+            defend_against=("zombie",),
+            choose_fights=True,
+        )
+        selection = _select(planner, close, PlannerContext(OBJECTIVE))
+        assert selection.decision.skill_id is skill_id
+        assert selection.plan_state.fighting is fight
+        (request,) = backend.requests
+        assert "Also return fight" in request.system_prompt
+        assert "Close threats: zombie at offset [1, 1]; health is 9." in (
+            request.user_prompt
+        )
+
+    # The fight lasts while the zombie stays close, and lapses once it goes.
+    backend = ScriptedBackend(_fight_answer(True))
+    planner = SubgoalPlanner(
+        backend,
+        candidate_skills=skills,
+        threat_radius=2,
+        defend_against=("zombie",),
+        choose_fights=True,
+    )
+    plan = _select(planner, close, PlannerContext(OBJECTIVE)).plan_state
+    attempts = [_attempt(SkillId.DEFEAT_ZOMBIE, SkillOutcome.TIMEOUT)]
+    context = PlannerContext(OBJECTIVE, history=tuple(attempts), plan_state=plan)
+    again = _select(planner, close, context)
+    assert again.decision.skill_id is SkillId.DEFEAT_ZOMBIE
+    assert len(backend.requests) == 1
+    context = PlannerContext(
+        OBJECTIVE, history=tuple(attempts) * 2, plan_state=again.plan_state
+    )
+    gone = _select(planner, state, context)
+    assert gone.decision.skill_id is SkillId.COLLECT_WOOD
+    assert not gone.plan_state.fighting
