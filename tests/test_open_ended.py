@@ -616,7 +616,7 @@ def test_design_factory_builds_the_three_designs() -> None:
         assert selector.vital_rules == SURVIVAL_VITAL_RULES
     # Only the VLM is shown the fight odds; the curriculum always fights.
     assert vlm.fight_odds is None
-    odds = FightOdds({("zombie", 9, "none", 1): (0.98, 0.02, 50)})
+    odds = FightOdds({("defeat_zombie", "zombie", 9, "none", 1): (0.98, 0.02, 50)})
     planners = open_ended_planners(
         ALL_SKILL_IDS,
         Backend(),

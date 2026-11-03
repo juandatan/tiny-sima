@@ -16,6 +16,12 @@ creature -- whether it faced it, swung at nothing, or walked away.
 and sword it is the win-rate table a feasibility term for fights needs,
 and :func:`fit_fight_odds` turns the executor's rows into the
 :class:`~tiny_sima.planner.fight_odds.FightOdds` its goal source is shown.
+
+Declining a fight is not free either: the planner has no way to walk away,
+only its other skills, and a zombie follows the player. So an *errand*
+cell stages one of :data:`ERRAND_SKILLS` in the same arena, its target
+block a few steps off and the zombies placed as for a fight; its win is
+the errand done.
 """
 
 from __future__ import annotations
@@ -47,6 +53,7 @@ from tiny_sima.goals import (
     SKILL_MOBS,
     SkillId,
     skill_index,
+    skill_target_block,
     target_mob_slots,
 )
 from tiny_sima.planner.fight_odds import SWORDS, FightOdds
@@ -58,6 +65,13 @@ FIGHT_SKILLS: tuple[SkillId, ...] = (
     SkillId.DEFEAT_SKELETON,
     SkillId.EAT_COW,
 )
+# What the open-ended goal source runs instead of a fight it declines,
+# staged with zombies close: the deaths of a run that declined fights came
+# while drinking.
+ERRAND_SKILLS: tuple[SkillId, ...] = (SkillId.DRINK_WATER, SkillId.COLLECT_WOOD)
+ERRAND_MOB = "zombie"
+# An errand's target block stands this many steps from the player.
+ERRAND_TARGET_DISTANCE = 3
 FIGHT_BENCHMARK_SEED = 211
 # Creatures start at most this many steps from the player.
 MAX_DISTANCE = 4
@@ -92,9 +106,15 @@ _OFFSETS = np.asarray(
 )
 
 
+def staged_mob(skill_id: SkillId) -> str:
+    """Return the creature a cell of ``skill_id`` stages: its prey, or zombies."""
+
+    return SKILL_MOBS.get(skill_id, ERRAND_MOB)
+
+
 @dataclass(frozen=True)
 class FightCell:
-    """One controlled fight setting."""
+    """One controlled fight setting, or an errand's with the creatures close."""
 
     skill_id: SkillId
     distance: int
@@ -122,8 +142,8 @@ def fight_cells(
     distances, healths, swords = tuple(distances), tuple(healths), tuple(swords)
     mob_counts, nights = tuple(mob_counts), tuple(nights)
     for skill_id in skill_ids:
-        if skill_id not in SKILL_MOBS:
-            raise ValueError(f"{skill_id.value} attacks no creature.")
+        if skill_id not in SKILL_MOBS and skill_id not in ERRAND_SKILLS:
+            raise ValueError(f"{skill_id.value} is neither a fight nor an errand.")
     for distance in distances:
         if not 1 <= distance <= MAX_DISTANCE:
             raise ValueError(f"Distance {distance} is outside the arena.")
@@ -158,11 +178,12 @@ def _fight_world(
     """Stage one fight in ``state``: carve the arena, then place the creatures.
 
     Food, drink and energy start as in the skill's training scenario, so
-    eating is possible but nothing runs low; by day the light is full, as
-    in training.
+    eating or drinking is possible but nothing runs low; by day the light is
+    full, as in training. An errand's target block goes on a free tile
+    :data:`ERRAND_TARGET_DISTANCE` steps away.
     """
 
-    mob = SKILL_MOBS[skill_id]
+    mob = staged_mob(skill_id)
     food, drink, energy = scenario_vitals(skill_id)
 
     side = 2 * ARENA_RADIUS + 1
@@ -187,6 +208,19 @@ def _fight_world(
         & (jnp.arange(offsets.shape[0]) != first)
     )
     second = jax.random.choice(second_rng, offsets.shape[0], p=others / jnp.sum(others))
+    target_block = None if skill_id in SKILL_MOBS else skill_target_block(skill_id)
+    if target_block is not None:
+        index = jnp.arange(offsets.shape[0])
+        free = (
+            (steps_away == ERRAND_TARGET_DISTANCE)
+            & (index != first)
+            & ((index != second) | (mob_count < 2))
+        )
+        target = jax.random.choice(
+            jax.random.fold_in(rng, 1), offsets.shape[0], p=free / jnp.sum(free)
+        )
+        tile = position + offsets[target]
+        world = world.at[tile[0], tile[1]].set(target_block.value)
 
     state = clear_mobs(state.replace(map=world))
     state = add_mob(state, mob, position + offsets[first])
@@ -280,9 +314,16 @@ class FightSnapshot(NamedTuple):
 
 
 def fight_snapshot(skill_ids: jax.Array, states: Any) -> FightSnapshot:
-    """Read a batch of fights: the probe recorder the benchmark runs with."""
+    """Read a batch of fights: the probe recorder the benchmark runs with.
 
-    mob_positions, mob_mask = jax.vmap(target_mob_slots)(skill_ids, states)
+    An errand's creatures are read as the zombie fight's targets.
+    """
+
+    errands = jnp.asarray([skill_index(skill_id) for skill_id in ERRAND_SKILLS])
+    hunted = jnp.where(
+        jnp.isin(skill_ids, errands), skill_index(SkillId.DEFEAT_ZOMBIE), skill_ids
+    )
+    mob_positions, mob_mask = jax.vmap(target_mob_slots)(hunted, states)
     return FightSnapshot(
         position=jnp.asarray(states.player_position, dtype=jnp.int32),
         direction=jnp.asarray(states.player_direction, dtype=jnp.int32),
@@ -401,7 +442,7 @@ def benchmark_fights(
     skill_horizon: int = 96,
     batch_size: int = 1024,
 ) -> list[dict[str, Any]]:
-    """Run the executor and the chase reference on every cell's worlds.
+    """Run the executor, and for a fight the chase reference, on every cell.
 
     Worlds are staged, run and summarized ``batch_size`` at a time, so
     memory stays flat however many cells there are; the last chunk is padded
@@ -432,7 +473,10 @@ def benchmark_fights(
         for chunk, start in enumerate(range(0, len(entries), size)):
             index = np.minimum(np.arange(start, start + size), len(entries) - 1)
             states = fight_worlds([entries[i] for i in index], keys[index])
-            for name, policy in (("executor", None), ("chase", chase_policy)):
+            policies = [("executor", None)]
+            if skill_id in SKILL_MOBS:
+                policies.append(("chase", chase_policy))
+            for name, policy in policies:
                 output = run_skill_probe(
                     executor,
                     states,
@@ -508,7 +552,8 @@ def fit_fight_odds(
 
     return FightOdds.from_rows(
         {
-            "mob": SKILL_MOBS[SkillId(row["skill_id"])],
+            "skill": row["skill_id"],
+            "mob": staged_mob(SkillId(row["skill_id"])),
             "health": row["health"],
             "sword": row["sword"],
             "mobs": row["mobs"],

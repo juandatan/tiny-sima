@@ -15,6 +15,7 @@ from tiny_sima.evaluation.chains import (
 )
 from tiny_sima.evaluation.fights import (
     ARENA_RADIUS,
+    ERRAND_TARGET_DISTANCE,
     MAX_DISTANCE,
     SECOND_MOB_MAX_DISTANCE,
     FightCell,
@@ -107,8 +108,11 @@ def test_cells_cover_the_grid_and_reject_settings_outside_it() -> None:
     )
 
     assert len(cells) == 2 * 2 * 3 * 2
-    with pytest.raises(ValueError, match="attacks no creature"):
-        fight_cells((SkillId.COLLECT_WOOD,))
+    with pytest.raises(ValueError, match="neither a fight nor an errand"):
+        fight_cells((SkillId.PLACE_TABLE,))
+    assert {cell.skill_id for cell in fight_cells((SkillId.DRINK_WATER,))} == {
+        SkillId.DRINK_WATER
+    }
     with pytest.raises(ValueError, match="outside the arena"):
         fight_cells(distances=(MAX_DISTANCE + 1,))
     with pytest.raises(ValueError, match="sword"):
@@ -166,6 +170,37 @@ def test_worlds_stage_the_cell_they_belong_to() -> None:
     assert not np.array_equal(
         np.asarray(_entry(states, 0).map), np.asarray(_entry(states, 1).map)
     )
+
+
+def test_an_errand_is_staged_with_its_target_and_zombies_close() -> None:
+    for cell, block in (
+        (_cell(skill_id=SkillId.DRINK_WATER, distance=3, mobs=2), BlockType.WATER),
+        (_cell(skill_id=SkillId.COLLECT_WOOD, distance=1), BlockType.TREE),
+    ):
+        entries = [cell] * 6
+        states = _stage(entries, 2)
+        for index in range(len(entries)):
+            state = _entry(states, index)
+            player = np.asarray(state.player_position)
+            arena = np.asarray(state.map)[
+                player[0] - ARENA_RADIUS : player[0] + ARENA_RADIUS + 1,
+                player[1] - ARENA_RADIUS : player[1] + ARENA_RADIUS + 1,
+            ]
+            (target,) = np.argwhere(arena == block.value) - ARENA_RADIUS
+            assert np.abs(target).sum() == ERRAND_TARGET_DISTANCE
+            assert np.sum(arena != BlockType.GRASS.value) == 1
+            zombies = np.asarray(state.zombies.position)[np.asarray(state.zombies.mask)]
+            assert len(zombies) == cell.mobs
+            assert not any(
+                np.array_equal(zombie - player, target) for zombie in zombies
+            )
+            # The drink starts below full, so drinking can succeed.
+            assert (int(state.player_drink) < 9) == (block is BlockType.WATER)
+        # The probe reads an errand's zombies as the fight's targets.
+        record = fight_snapshot(
+            jnp.full(len(entries), skill_index(cell.skill_id)), states
+        )
+        assert np.asarray(record.mob_mask).sum(axis=1).tolist() == [cell.mobs] * 6
 
 
 def test_probe_records_the_fight_before_and_after_every_step(
@@ -343,6 +378,19 @@ def test_benchmark_pairs_both_policies_on_every_cell(
     assert all(
         row["outcome"] != "infeasible" for row in rows if row["skill_id"] == "eat_cow"
     )
+    # An errand has no chase reference to set against.
+    errand = fight_cells(
+        (SkillId.DRINK_WATER,),
+        distances=(2,),
+        healths=(9,),
+        swords=("none",),
+        mob_counts=(1,),
+        nights=(False,),
+    )
+    rows = benchmark_fights(executor, errand, rollouts_per_cell=2, skill_horizon=8)
+    assert [(row["skill_id"], row["policy"]) for row in rows] == [
+        ("drink_water", "executor")
+    ] * 2
 
 
 def test_summary_rates_and_per_win_costs() -> None:

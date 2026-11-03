@@ -60,6 +60,7 @@ from tiny_sima.evaluation.executor_diagnostics import (
     summarize_rollout_features,
 )
 from tiny_sima.evaluation.fights import (
+    ERRAND_SKILLS,
     FIGHT_BENCHMARK_SEED,
     FIGHT_SKILLS,
     FightCell,
@@ -186,6 +187,7 @@ __all__ = [
     "DecisionKind",
     "EXECUTOR_BENCHMARK_SEED",
     "FIGHT_BENCHMARK_SEED",
+    "ERRAND_SKILLS",
     "FIGHT_SKILLS",
     "FightCell",
     "benchmark_fights",

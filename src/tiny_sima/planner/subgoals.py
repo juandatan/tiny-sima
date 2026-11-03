@@ -542,7 +542,8 @@ _FIGHT_NOTE = (
 _FIGHT_ODDS_NOTE = (
     "The close threats line gives the odds: how often this player won, and "
     "how often it died, in staged fights at that health, with that sword and "
-    "that many zombies. Walking away was not measured."
+    "that many zombies; and, not fighting, how often it got an errand done, "
+    "and died, going on with it while they stayed close."
 )
 
 
@@ -610,7 +611,7 @@ def build_subgoal_prompt(
     observation: ObservationConfig | None = None,
     shelter: bool = False,
     threats: Sequence[dict[str, Any]] | None = None,
-    fight_rate: FightRate | None = None,
+    fight_rates: Sequence[FightRate] = (),
     fight_mob: str = "zombie",
 ) -> str:
     """Return the user prompt for one sub-goal request.
@@ -618,8 +619,9 @@ def build_subgoal_prompt(
     With ``shelter`` it says whether the shelter could start now, and why
     not, with whether its room has water and how long the night has left.
     With ``threats``, the close hostile mobs, it lists them with the
-    player's health for the fight choice, and with ``fight_rate`` the
-    measured odds of fighting the close ``fight_mob``.
+    player's health for the fight choice, and with ``fight_rates`` the
+    measured odds of fighting the close ``fight_mob``, and of the errands
+    staged with it close.
     """
 
     lines = [
@@ -659,8 +661,8 @@ def build_subgoal_prompt(
             f"Close threats: {_threat_text(threats) or 'none'}; "
             f"health is {vitals(state)['health']}."
         )
-        if fight_rate is not None:
-            line += " " + _fight_rate_text(fight_rate, fight_mob)
+        if fight_rates:
+            line += " " + _fight_rates_text(fight_rates, fight_mob)
         lines.append(line)
     if feedback:
         lines.append("Planner rejected your last answer: " + " ".join(feedback))
@@ -686,13 +688,31 @@ def _shelter_text(state: Any) -> str:
     return " ".join(lines)
 
 
-def _fight_rate_text(rate: FightRate, mob: str) -> str:
-    sword = "no sword" if rate.sword == "none" else f"a {rate.sword} sword"
-    mobs = f"{rate.mobs} {mob}{'s' if rate.mobs > 1 else ''}"
-    return (
-        f"Fight odds at health {rate.health}, {sword} and {mobs}: "
-        f"won {rate.win_rate:.0%}, died {rate.death_rate:.0%}."
-    )
+def _fight_rates_text(rates: Sequence[FightRate], mob: str) -> str:
+    """The odds of fighting ``mob``, then of each errand with it close."""
+
+    hunting = _HUNTING_SKILLS[mob].value
+    first = rates[0]
+    sword = "no sword" if first.sword == "none" else f"a {first.sword} sword"
+    mobs = f"{first.mobs} {mob}{'s' if first.mobs > 1 else ''}"
+    parts = [f"Odds at health {first.health}, {sword} and {mobs}:"]
+    fight = [rate for rate in rates if rate.skill == hunting]
+    errands = [rate for rate in rates if rate.skill != hunting]
+    if fight:
+        parts.append(
+            f"fighting won {fight[0].win_rate:.0%}, died {fight[0].death_rate:.0%}."
+        )
+    if errands:
+        parts.append(
+            "Not fighting, going on with it close: "
+            + "; ".join(
+                f"{rate.skill.replace('_', ' ')} done {rate.win_rate:.0%}, "
+                f"died {rate.death_rate:.0%}"
+                for rate in errands
+            )
+            + "."
+        )
+    return " ".join(parts)
 
 
 def _is_threat(alert: str) -> bool:
@@ -888,14 +908,19 @@ class SubgoalPlanner:
         mob = self._defended_mob(state)
         return None if mob is None else _HUNTING_SKILLS[mob]
 
-    def _fight_rate(self, state: Any) -> FightRate | None:
-        """Return the measured odds of the fight on offer, if any."""
+    def _fight_rates(self, state: Any) -> tuple[FightRate, ...]:
+        """Return the measured odds of the fight on offer, then the errands'."""
 
         mob = self._defended_mob(state)
         if self.fight_odds is None or not self.choose_fights or mob is None:
-            return None
+            return ()
         close = sum(threat["type"] == mob for threat in self._threats(state))
-        return self.fight_odds.for_state(state, mob, close)
+        hunting = _HUNTING_SKILLS[mob].value
+        skills = sorted(self.fight_odds.skills(mob), key=lambda skill: skill != hunting)
+        rates = (
+            self.fight_odds.for_state(state, skill, mob, close) for skill in skills
+        )
+        return tuple(rate for rate in rates if rate is not None)
 
     def _alerts(self, state: Any) -> dict[str, str]:
         """Return the alert conditions that hold now, with their details.
@@ -1055,7 +1080,7 @@ class SubgoalPlanner:
             observation=self.observation,
             shelter=self.shelter_at_night,
             threats=self._threats(pending.state) if self.choose_fights else None,
-            fight_rate=self._fight_rate(pending.state),
+            fight_rates=self._fight_rates(pending.state),
             fight_mob=fight_mob or "zombie",
         )
         cache_key = sha256(
@@ -1129,7 +1154,15 @@ class SubgoalPlanner:
                 )
             )
         if fight_offered:
-            rate = self._fight_rate(pending.state)
+            hunting = {skill.value for skill in _HUNTING_SKILLS.values()}
+            rate = next(
+                (
+                    rate
+                    for rate in self._fight_rates(pending.state)
+                    if rate.skill in hunting
+                ),
+                None,
+            )
             choices.append(
                 SubgoalChoice(
                     plan.decision_index,

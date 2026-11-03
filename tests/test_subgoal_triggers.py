@@ -367,8 +367,10 @@ def test_the_vlm_is_shown_the_measured_odds_of_the_fight() -> None:
     )
     odds = FightOdds(
         {
-            ("zombie", 4, "wood", 1): (0.6, 0.4, 300),
-            ("zombie", 4, "wood", 2): (0.45, 0.55, 300),
+            ("defeat_zombie", "zombie", 4, "wood", 1): (0.6, 0.4, 300),
+            ("defeat_zombie", "zombie", 4, "wood", 2): (0.45, 0.55, 300),
+            ("drink_water", "zombie", 4, "wood", 2): (0.3, 0.5, 300),
+            ("collect_wood", "zombie", 4, "wood", 2): (0.6, 0.3, 300),
         }
     )
     backend = ScriptedBackend(_answer(("inventory.wood", 1), fight=False))
@@ -386,8 +388,9 @@ def test_the_vlm_is_shown_the_measured_odds_of_the_fight() -> None:
     (request,) = backend.requests
     assert "The close threats line gives the odds" in request.system_prompt
     assert (
-        "health is 4. Fight odds at health 4, a wood sword and 2 zombies: "
-        "won 45%, died 55%." in request.user_prompt
+        "health is 4. Odds at health 4, a wood sword and 2 zombies: fighting won "
+        "45%, died 55%. Not fighting, going on with it close: collect wood done "
+        "60%, died 30%; drink water done 30%, died 50%." in request.user_prompt
     )
     (choice,) = selection.plan_state.choices
     assert (choice.answer, choice.win_rate) == ("false", 0.45)
@@ -402,5 +405,5 @@ def test_the_vlm_is_shown_the_measured_odds_of_the_fight() -> None:
     )
     _select(plain, two, PlannerContext(OBJECTIVE))
     (request,) = plain.backend.requests
-    assert "Fight odds" not in request.user_prompt
+    assert "Odds at" not in request.user_prompt
     assert "gives the odds" not in request.system_prompt

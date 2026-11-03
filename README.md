@@ -149,7 +149,9 @@ and a sound external checker verifies and gives feedback.
     walk on rather than fight at low health. Given `fight_odds`, a
     `FightOdds` table fitted by `fit_fight_odds` from the staged fights,
     the prompt also gives how often the executor won, and died, at that
-    health, sword and creature count, and each fight answer records the
+    health, sword and creature count, and of not fighting: how often each
+    errand in the table, such as drinking, got done, and the player died,
+    staged with the same creatures close. Each fight answer records the
     win rate it was shown. A fight holds while the mob
     stays close; the latest answer decides. The open-ended VLM design
     makes this choice, and the curriculum always fights.
@@ -392,8 +394,9 @@ achievements as you can."
      the VLM's own shelter and fight answers differ from what the
      curriculum would answer in the same state, where it shelters whenever
      it can and always fights. The VLM is shown the executor's measured
-     zombie-fight odds, which notebook 08 stages once per executor and
-     saves beside it, and the report counts its fight answers by the odds
+     zombie-fight odds, and those of `drink_water` and `collect_wood` run
+     with the zombies close (`ERRAND_SKILLS`), which notebook 08 stages
+     once per executor and saves beside it, and the report counts its fight answers by the odds
      shown (`by_odds`).
   3. `subgoal_scripted`: the same sub-goal planner with
      `ScriptedGoalSelector` in place of the VLM. The selector gives survival

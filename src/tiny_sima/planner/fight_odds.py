@@ -6,7 +6,9 @@ and that what decides the fight is the player's health and sword: at health
 2 it is always lost, and from 5 up mostly won. Whether to fight is then the
 goal source's call. This table gives it the measured odds of the fight in
 front of it, looked up from what the player can see: its health, its best
-sword and how many of the creature are close.
+sword and how many of the creature are close. Declining is not free: the
+creature follows, so the table also holds the odds of an errand, such as
+drinking, run with the same creatures close.
 """
 
 from __future__ import annotations
@@ -32,8 +34,9 @@ def held_sword(state: Any) -> str:
 
 
 class FightRate(NamedTuple):
-    """The measured cell a fight was looked up in, with its rates."""
+    """The measured cell a fight or errand was looked up in, with its rates."""
 
+    skill: str
     health: int
     sword: str
     mobs: int
@@ -42,18 +45,30 @@ class FightRate(NamedTuple):
     rollouts: int
 
 
+Key = tuple[str, str, int, str, int]
+
+
 @dataclass(frozen=True)
 class FightOdds:
-    """Win and death rates of the executor's fights, by setting.
+    """Success and death rates of the executor's staged skills, by setting.
 
-    ``rates`` maps ``(mob, health, sword, mobs)`` to ``(win_rate,
+    ``rates`` maps ``(skill, mob, health, sword, mobs)`` to ``(win_rate,
     death_rate, rollouts)``, pooled over the staged distances and times of
-    day, which barely moved them.
+    day, which barely moved them. ``skill`` is a skill id's value: the
+    hunting skill for ``mob``, whose win is the kill, or an errand run with
+    ``mobs`` of them close, whose win is the errand done.
     """
 
-    rates: Mapping[tuple[str, int, str, int], tuple[float, float, int]]
+    rates: Mapping[Key, tuple[float, float, int]]
 
-    def lookup(self, mob: str, health: int, sword: str, mobs: int) -> FightRate | None:
+    def skills(self, mob: str) -> tuple[str, ...]:
+        """Return the skills staged with ``mob`` close, in sorted order."""
+
+        return tuple(sorted({key[0] for key in self.rates if key[1] == mob}))
+
+    def lookup(
+        self, skill: str, mob: str, health: int, sword: str, mobs: int
+    ) -> FightRate | None:
         """Return the rates of the nearest measured cell, or None for none.
 
         Health and the creature count are clamped to the measured range, so
@@ -61,12 +76,15 @@ class FightOdds:
         odds.
         """
 
-        cells = [key for key in self.rates if key[0] == mob and key[2] == sword]
+        cells = [
+            key for key in self.rates if key[:2] == (skill, mob) and key[3] == sword
+        ]
         if not cells:
             return None
-        healths = sorted({key[1] for key in cells})
-        counts = sorted({key[3] for key in cells})
+        healths = sorted({key[2] for key in cells})
+        counts = sorted({key[4] for key in cells})
         key = (
+            skill,
             mob,
             min(max(health, healths[0]), healths[-1]),
             sword,
@@ -74,13 +92,15 @@ class FightOdds:
         )
         if key not in self.rates:
             return None
-        return FightRate(key[1], sword, key[3], *self.rates[key])
+        return FightRate(skill, key[2], sword, key[4], *self.rates[key])
 
-    def for_state(self, state: Any, mob: str, mobs: int) -> FightRate | None:
-        """Return the rates for fighting ``mobs`` close ``mob`` in ``state``."""
+    def for_state(
+        self, state: Any, skill: str, mob: str, mobs: int
+    ) -> FightRate | None:
+        """Return the rates for running ``skill`` with ``mobs`` ``mob`` close."""
 
         health = int(np.asarray(state.player_health))
-        return self.lookup(mob, health, held_sword(state), mobs)
+        return self.lookup(skill, mob, health, held_sword(state), mobs)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable view of the table."""
@@ -88,6 +108,7 @@ class FightOdds:
         return {
             "rates": [
                 {
+                    "skill": skill,
                     "mob": mob,
                     "health": health,
                     "sword": sword,
@@ -96,7 +117,7 @@ class FightOdds:
                     "death_rate": death_rate,
                     "rollouts": rollouts,
                 }
-                for (mob, health, sword, mobs), (
+                for (skill, mob, health, sword, mobs), (
                     win_rate,
                     death_rate,
                     rollouts,
@@ -108,11 +129,18 @@ class FightOdds:
     def from_rows(cls, rows: Iterable[Mapping[str, Any]]) -> FightOdds:
         """Build a table from rows of the shape :meth:`to_dict` writes."""
 
-        rates: dict[tuple[str, int, str, int], tuple[float, float, int]] = {}
+        rates: dict[Key, tuple[float, float, int]] = {}
         for row in rows:
             if row["sword"] not in SWORDS:
                 raise ValueError(f"Unknown sword {row['sword']!r}.")
-            rates[(row["mob"], int(row["health"]), row["sword"], int(row["mobs"]))] = (
+            key = (
+                row["skill"],
+                row["mob"],
+                int(row["health"]),
+                row["sword"],
+                int(row["mobs"]),
+            )
+            rates[key] = (
                 float(row["win_rate"]),
                 float(row["death_rate"]),
                 int(row["rollouts"]),
