@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from craftax.craftax_classic.constants import Achievement, Action, BlockType
 
 
@@ -589,6 +590,50 @@ def skill_mobs(skill_id: SkillId | str, state: Any) -> Any:
     """Return the Craftax mobs a hunting skill attacks."""
 
     return mob_instances(SKILL_MOBS[SkillId(skill_id)], state)
+
+
+# Craftax Classic keeps at most three mobs of any kind.
+MOB_SLOTS = 3
+_MOB_KINDS = tuple(dict.fromkeys(SKILL_MOBS.values()))
+# Per skill index, 1 + the index of the mob kind it attacks, or 0.
+_SKILL_MOB_KIND = np.asarray(
+    [
+        _MOB_KINDS.index(SKILL_MOBS[skill_id]) + 1 if skill_id in SKILL_MOBS else 0
+        for skill_id in ALL_SKILL_IDS
+    ],
+    dtype=np.int32,
+)
+
+
+def target_mob_slots(skill_id: jax.Array, state: Any) -> tuple[jax.Array, jax.Array]:
+    """Return the positions and live mask of the mobs a skill attacks.
+
+    The traced counterpart of :func:`skill_mobs`: ``skill_id`` is a skill
+    index, slots are padded to ``MOB_SLOTS``, and every slot is dead for a
+    skill that attacks no mob.
+    """
+
+    def slots(mob: str | None) -> Callable[[Any], tuple[jax.Array, jax.Array]]:
+        def read(state: Any) -> tuple[jax.Array, jax.Array]:
+            if mob is None:
+                return (
+                    jnp.zeros((MOB_SLOTS, 2), dtype=jnp.int32),
+                    jnp.zeros((MOB_SLOTS,), dtype=bool),
+                )
+            mobs = mob_instances(mob, state)
+            padding = MOB_SLOTS - mobs.mask.shape[0]
+            return (
+                jnp.pad(
+                    jnp.asarray(mobs.position, dtype=jnp.int32), ((0, padding), (0, 0))
+                ),
+                jnp.pad(jnp.asarray(mobs.mask, dtype=bool), (0, padding)),
+            )
+
+        return read
+
+    branches = tuple(slots(mob) for mob in (None, *_MOB_KINDS))
+    return jax.lax.switch(jnp.asarray(_SKILL_MOB_KIND)[skill_id], branches, state)
+
 
 
 def achievement_field(achievement: Achievement) -> str:

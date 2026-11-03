@@ -1141,10 +1141,10 @@ class LearnedSkillExecutor:
                     lambda leaf, index=index: leaf[index],
                     output.state,
                 ),
-                outcome=_PROBE_OUTCOMES[int(output.outcome[index])],
+                outcome=PROBE_OUTCOMES[int(output.outcome[index])],
                 steps=int(output.steps[index]),
                 skill_return=float(
-                    _PROBE_OUTCOMES[int(output.outcome[index])]
+                    PROBE_OUTCOMES[int(output.outcome[index])]
                     is SkillOutcome.SUCCESS
                 ),
                 native_return=float(output.native_return[index]),
@@ -1285,11 +1285,11 @@ def _make_batched_chain_rollout(
 ) -> BatchedRollout:
     """Build and cache one compiled evaluator for a static execution shape."""
 
-    success_outcome = _PROBE_OUTCOMES.index(SkillOutcome.SUCCESS)
-    timeout_outcome = _PROBE_OUTCOMES.index(SkillOutcome.TIMEOUT)
-    terminated_outcome = _PROBE_OUTCOMES.index(SkillOutcome.ENVIRONMENT_TERMINATED)
-    lost_outcome = _PROBE_OUTCOMES.index(SkillOutcome.PRECONDITION_LOST)
-    infeasible_outcome = _PROBE_OUTCOMES.index(SkillOutcome.INFEASIBLE)
+    success_outcome = PROBE_OUTCOMES.index(SkillOutcome.SUCCESS)
+    timeout_outcome = PROBE_OUTCOMES.index(SkillOutcome.TIMEOUT)
+    terminated_outcome = PROBE_OUTCOMES.index(SkillOutcome.ENVIRONMENT_TERMINATED)
+    lost_outcome = PROBE_OUTCOMES.index(SkillOutcome.PRECONDITION_LOST)
+    infeasible_outcome = PROBE_OUTCOMES.index(SkillOutcome.INFEASIBLE)
     environment = make_skill_chain_environment(
         distractor_count=distractor_count,
         tree_count=tree_count,
@@ -1746,7 +1746,7 @@ def evaluate_learned_skill_chain_batched(
         ],
         "first_attempt_outcomes": [
             [
-                None if code < 0 else _PROBE_OUTCOMES[int(code)].value
+                None if code < 0 else PROBE_OUTCOMES[int(code)].value
                 for code in row
             ]
             for row in first_outcomes
@@ -1775,19 +1775,18 @@ class BatchedProbeCarry(NamedTuple):
     positions: jax.Array
     directions: jax.Array
     actions: jax.Array
-    health: jax.Array
-    mob_positions: jax.Array
-    mob_mask: jax.Array
+    record: Any
 
 
 class BatchedProbeOutput(NamedTuple):
     """Per-entry probe results: how it ended and how long it took.
 
-    ``positions``, ``directions``, ``actions`` and ``health`` are time-major
-    traces of shape ``(skill_horizon, batch)``; row ``t`` describes the state
-    after step ``t``. Rows at or beyond an entry's ``steps`` are padding.
-    ``mob_positions`` and ``mob_mask`` add a slot axis after the batch axis:
-    the mobs a hunting skill attacks, from :func:`target_mob_slots`.
+    ``positions``, ``directions`` and ``actions`` are time-major traces of
+    shape ``(skill_horizon, batch)``; row ``t`` describes the state after
+    step ``t``. Rows at or beyond an entry's ``steps`` are padding.
+    ``record`` holds what a probe's recorder read, or ``None`` without one:
+    each leaf has ``skill_horizon + 1`` rows, row 0 read before the first
+    step and row ``t + 1`` after step ``t``, so row ``steps`` is the end.
     """
 
     outcome: jax.Array
@@ -1795,9 +1794,7 @@ class BatchedProbeOutput(NamedTuple):
     positions: jax.Array
     directions: jax.Array
     actions: jax.Array
-    health: jax.Array
-    mob_positions: jax.Array
-    mob_mask: jax.Array
+    record: Any = None
 
 
 @dataclass(frozen=True)
@@ -1832,7 +1829,7 @@ class SkillRolloutTrace:
     actions: np.ndarray
 
 
-_PROBE_OUTCOMES = tuple(SkillOutcome)
+PROBE_OUTCOMES = tuple(SkillOutcome)
 
 
 def _stack_states(states: Sequence[Any]) -> Any:
@@ -1850,49 +1847,9 @@ BatchedProbe = Callable[[Any, Any, jax.Array, jax.Array], BatchedProbeOutput]
 # Actions for a batch from its skill indices and states, in place of the
 # network's; it must be a module-level function, since it keys the cache.
 BatchedSkillPolicy = Callable[[jax.Array, Any], jax.Array]
-
-# Craftax Classic keeps at most three mobs of any kind.
-TRACED_MOB_SLOTS = 3
-_MOB_KINDS = tuple(dict.fromkeys(SKILL_MOBS.values()))
-# Per skill index, 1 + the index of the mob kind it attacks, or 0.
-_SKILL_MOB_KIND = np.asarray(
-    [
-        _MOB_KINDS.index(SKILL_MOBS[skill_id]) + 1 if skill_id in SKILL_MOBS else 0
-        for skill_id in ALL_SKILL_IDS
-    ],
-    dtype=np.int32,
-)
-
-
-def target_mob_slots(skill_id: jax.Array, state: Any) -> tuple[jax.Array, jax.Array]:
-    """Return the positions and live mask of the mobs a skill attacks.
-
-    ``skill_id`` is a traced skill index. Slots are padded to
-    ``TRACED_MOB_SLOTS``, and every slot is dead for a skill that attacks
-    no mob.
-    """
-
-    def slots(mob: str | None) -> Callable[[Any], tuple[jax.Array, jax.Array]]:
-        def read(state: Any) -> tuple[jax.Array, jax.Array]:
-            if mob is None:
-                return (
-                    jnp.zeros((TRACED_MOB_SLOTS, 2), dtype=jnp.int32),
-                    jnp.zeros((TRACED_MOB_SLOTS,), dtype=bool),
-                )
-            mobs = mob_instances(mob, state)
-            padding = TRACED_MOB_SLOTS - mobs.mask.shape[0]
-            return (
-                jnp.pad(
-                    jnp.asarray(mobs.position, dtype=jnp.int32), ((0, padding), (0, 0))
-                ),
-                jnp.pad(jnp.asarray(mobs.mask, dtype=bool), (0, padding)),
-            )
-
-        return read
-
-    branches = tuple(slots(mob) for mob in (None, *_MOB_KINDS))
-    return jax.lax.switch(jnp.asarray(_SKILL_MOB_KIND)[skill_id], branches, state)
-
+# What to read from each state, batched, from skill indices and states;
+# module-level for the same reason.
+BatchedProbeRecorder = Callable[[jax.Array, Any], Any]
 
 @lru_cache(maxsize=16)
 def _make_batched_skill_probe(
@@ -1905,6 +1862,7 @@ def _make_batched_skill_probe(
     deterministic: bool,
     num_skills: int = len(SKILL_IDS),
     policy: BatchedSkillPolicy | None = None,
+    recorder: BatchedProbeRecorder | None = None,
 ) -> BatchedProbe:
     """Build and cache one compiled probe for a static batch shape.
 
@@ -1914,7 +1872,8 @@ def _make_batched_skill_probe(
     than on rollout. Running the whole batch inside one ``jax.lax.while_loop``
     removes every per-step round trip; only the final outcome codes come back.
     A ``policy`` replaces the network, so a scripted reference runs through
-    the same loop and outcome rules.
+    the same loop and outcome rules. A ``recorder`` adds its own trace, read
+    before the first step and after every step.
     """
 
     environment = make_skill_chain_environment(distractor_count=distractor_count)
@@ -1924,11 +1883,11 @@ def _make_batched_skill_probe(
         hidden_size=hidden_size,
         skill_embedding_size=skill_embedding_size,
     )
-    success_code = _PROBE_OUTCOMES.index(SkillOutcome.SUCCESS)
-    timeout_code = _PROBE_OUTCOMES.index(SkillOutcome.TIMEOUT)
-    precondition_lost_code = _PROBE_OUTCOMES.index(SkillOutcome.PRECONDITION_LOST)
-    terminated_code = _PROBE_OUTCOMES.index(SkillOutcome.ENVIRONMENT_TERMINATED)
-    infeasible_code = _PROBE_OUTCOMES.index(SkillOutcome.INFEASIBLE)
+    success_code = PROBE_OUTCOMES.index(SkillOutcome.SUCCESS)
+    timeout_code = PROBE_OUTCOMES.index(SkillOutcome.TIMEOUT)
+    precondition_lost_code = PROBE_OUTCOMES.index(SkillOutcome.PRECONDITION_LOST)
+    terminated_code = PROBE_OUTCOMES.index(SkillOutcome.ENVIRONMENT_TERMINATED)
+    infeasible_code = PROBE_OUTCOMES.index(SkillOutcome.INFEASIBLE)
 
     def probe(
         params: Any,
@@ -1937,6 +1896,16 @@ def _make_batched_skill_probe(
         rng: jax.Array,
     ) -> BatchedProbeOutput:
         precondition = _batched_skill_precondition(skill_ids, states)
+        record = None
+        if recorder is not None:
+            record = jax.tree_util.tree_map(
+                lambda first: jnp.zeros(
+                    (skill_horizon + 1, *first.shape), dtype=first.dtype
+                )
+                .at[0]
+                .set(first),
+                recorder(skill_ids, states),
+            )
         initial_carry = BatchedProbeCarry(
             rng=rng,
             state=states,
@@ -1949,13 +1918,7 @@ def _make_batched_skill_probe(
             positions=jnp.zeros((skill_horizon, batch_size, 2), dtype=jnp.int32),
             directions=jnp.zeros((skill_horizon, batch_size), dtype=jnp.int32),
             actions=jnp.zeros((skill_horizon, batch_size), dtype=jnp.int32),
-            health=jnp.zeros((skill_horizon, batch_size), dtype=jnp.int32),
-            mob_positions=jnp.zeros(
-                (skill_horizon, batch_size, TRACED_MOB_SLOTS, 2), dtype=jnp.int32
-            ),
-            mob_mask=jnp.zeros(
-                (skill_horizon, batch_size, TRACED_MOB_SLOTS), dtype=bool
-            ),
+            record=record,
         )
 
         def continue_probing(
@@ -2026,7 +1989,13 @@ def _make_batched_skill_probe(
             )
             outcome = jnp.where(precondition_lost, precondition_lost_code, outcome)
             outcome = jnp.where(success, success_code, outcome)
-            mob_positions, mob_mask = jax.vmap(target_mob_slots)(skill_ids, state)
+            record = carry.record
+            if recorder is not None:
+                record = jax.tree_util.tree_map(
+                    lambda trace, value: trace.at[iteration + 1].set(value),
+                    record,
+                    recorder(skill_ids, state),
+                )
 
             next_carry = BatchedProbeCarry(
                 rng=rng,
@@ -2044,11 +2013,7 @@ def _make_batched_skill_probe(
                     jnp.asarray(state.player_direction, dtype=jnp.int32)
                 ),
                 actions=carry.actions.at[iteration].set(action),
-                health=carry.health.at[iteration].set(
-                    jnp.asarray(state.player_health, dtype=jnp.int32)
-                ),
-                mob_positions=carry.mob_positions.at[iteration].set(mob_positions),
-                mob_mask=carry.mob_mask.at[iteration].set(mob_mask),
+                record=record,
             )
             return iteration + 1, next_carry
 
@@ -2063,9 +2028,7 @@ def _make_batched_skill_probe(
             positions=final_carry.positions,
             directions=final_carry.directions,
             actions=final_carry.actions,
-            health=final_carry.health,
-            mob_positions=final_carry.mob_positions,
-            mob_mask=final_carry.mob_mask,
+            record=final_carry.record,
         )
 
     return jax.jit(probe)
@@ -2110,6 +2073,7 @@ def run_skill_probe(
     skill_horizon: int = 64,
     distractor_count: int = 3,
     policy: BatchedSkillPolicy | None = None,
+    recorder: BatchedProbeRecorder | None = None,
 ) -> BatchedProbeOutput:
     """Probe already-stacked ``states`` and return the host-side traces.
 
@@ -2131,6 +2095,7 @@ def run_skill_probe(
         deterministic=executor.deterministic,
         num_skills=executor.config.num_skills,
         policy=policy,
+        recorder=recorder,
     )
     output = probe(
         executor.params,
@@ -2141,7 +2106,7 @@ def run_skill_probe(
         ),
         rng,
     )
-    return BatchedProbeOutput(*(np.asarray(leaf) for leaf in jax.device_get(output)))
+    return jax.tree_util.tree_map(np.asarray, jax.device_get(output))
 
 
 def trace_skills_batched(
@@ -2171,21 +2136,16 @@ def trace_skills_batched(
         skill_horizon=skill_horizon,
         distractor_count=distractor_count,
     )
-    outcomes = np.asarray(output.outcome)
-    steps = np.asarray(output.steps)
-    positions = np.asarray(output.positions)
-    directions = np.asarray(output.directions)
-    actions = np.asarray(output.actions)
     return tuple(
         SkillRolloutTrace(
             probe=SkillProbe(
                 skill_id=skill_id,
-                outcome=_PROBE_OUTCOMES[int(outcomes[index])],
-                steps=int(steps[index]),
+                outcome=PROBE_OUTCOMES[int(output.outcome[index])],
+                steps=int(output.steps[index]),
             ),
-            positions=positions[:, index],
-            directions=directions[:, index],
-            actions=actions[:, index],
+            positions=output.positions[:, index],
+            directions=output.directions[:, index],
+            actions=output.actions[:, index],
         )
         for index, skill_id in enumerate(skill_ids)
     )
@@ -2289,12 +2249,12 @@ def _batched_skill_execution(
         hidden_size=hidden_size,
         skill_embedding_size=skill_embedding_size,
     )
-    success_code = _PROBE_OUTCOMES.index(SkillOutcome.SUCCESS)
-    timeout_code = _PROBE_OUTCOMES.index(SkillOutcome.TIMEOUT)
-    precondition_lost_code = _PROBE_OUTCOMES.index(SkillOutcome.PRECONDITION_LOST)
-    terminated_code = _PROBE_OUTCOMES.index(SkillOutcome.ENVIRONMENT_TERMINATED)
-    infeasible_code = _PROBE_OUTCOMES.index(SkillOutcome.INFEASIBLE)
-    interrupted_code = _PROBE_OUTCOMES.index(SkillOutcome.INTERRUPTED)
+    success_code = PROBE_OUTCOMES.index(SkillOutcome.SUCCESS)
+    timeout_code = PROBE_OUTCOMES.index(SkillOutcome.TIMEOUT)
+    precondition_lost_code = PROBE_OUTCOMES.index(SkillOutcome.PRECONDITION_LOST)
+    terminated_code = PROBE_OUTCOMES.index(SkillOutcome.ENVIRONMENT_TERMINATED)
+    infeasible_code = PROBE_OUTCOMES.index(SkillOutcome.INFEASIBLE)
+    interrupted_code = PROBE_OUTCOMES.index(SkillOutcome.INTERRUPTED)
     # Indexed by executor skill index.
     exempt = jnp.asarray(
         [

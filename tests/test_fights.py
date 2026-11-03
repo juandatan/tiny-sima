@@ -2,24 +2,28 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from craftax.craftax_classic.constants import BlockType
+from craftax.craftax_classic.constants import Action, BlockType
 
 from tiny_sima.config import SkillPPOConfig
-from tiny_sima.envs.chains import make_skill_chain_environment
+from tiny_sima.envs.chains import clear_mobs, make_skill_chain_environment
+from tiny_sima.envs.skills import add_mob
 from tiny_sima.evaluation.chains import (
-    TRACED_MOB_SLOTS,
+    PROBE_OUTCOMES,
+    BatchedProbeOutput,
     LearnedSkillExecutor,
     run_skill_probe,
-    target_mob_slots,
 )
 from tiny_sima.evaluation.fights import (
     ARENA_RADIUS,
+    MAX_DISTANCE,
     SECOND_MOB_MAX_DISTANCE,
     FightCell,
+    FightSnapshot,
     benchmark_fights,
     chase_policy,
     fight_cells,
     fight_rollout_rows,
+    fight_snapshot,
     fight_worlds,
     summarize_fights,
 )
@@ -27,7 +31,14 @@ from tiny_sima.executor.model import (
     initialize_goal_conditioned_parameters,
     make_goal_conditioned_actor_critic,
 )
-from tiny_sima.goals import ALL_SKILL_IDS, SkillId, skill_index
+from tiny_sima.goals import (
+    ALL_SKILL_IDS,
+    MOB_SLOTS,
+    SkillId,
+    skill_index,
+    target_mob_slots,
+)
+from tiny_sima.planner.saycan import SkillOutcome
 from tiny_sima.planner.shelter import NIGHT_LIGHT_THRESHOLD
 
 
@@ -72,6 +83,24 @@ def _entry(states, index: int):
     return jax.tree_util.tree_map(lambda leaf: leaf[index], states)
 
 
+def _stage(entries, seed: int):
+    return fight_worlds(
+        entries, jax.random.split(jax.random.PRNGKey(seed), len(entries))
+    )
+
+
+def _probe(executor, entries, states, *, horizon: int, policy=chase_policy):
+    return run_skill_probe(
+        executor,
+        states,
+        [entry.skill_id for entry in entries],
+        jax.random.PRNGKey(0),
+        skill_horizon=horizon,
+        policy=policy,
+        recorder=fight_snapshot,
+    )
+
+
 def test_cells_cover_the_grid_and_reject_settings_outside_it() -> None:
     cells = fight_cells(
         (SkillId.DEFEAT_ZOMBIE,), distances=(1, 3), healths=(2, 9), nights=(False,)
@@ -81,19 +110,21 @@ def test_cells_cover_the_grid_and_reject_settings_outside_it() -> None:
     with pytest.raises(ValueError, match="attacks no creature"):
         fight_cells((SkillId.COLLECT_WOOD,))
     with pytest.raises(ValueError, match="outside the arena"):
-        fight_cells(distances=(ARENA_RADIUS + 1,))
+        fight_cells(distances=(MAX_DISTANCE + 1,))
     with pytest.raises(ValueError, match="sword"):
         fight_cells(swords=("iron",))
+    with pytest.raises(ValueError, match="one creature or two"):
+        fight_cells(mob_counts=(3,))
 
 
 def test_target_slots_pad_every_kind_and_are_dead_for_other_skills() -> None:
     cells = (_cell(skill_id=SkillId.DEFEAT_SKELETON, mobs=2),)
-    state = _entry(fight_worlds(cells, jax.random.PRNGKey(0)), 0)
+    state = _entry(_stage(cells, 0), 0)
 
     positions, mask = target_mob_slots(
         jnp.asarray(skill_index(SkillId.DEFEAT_SKELETON)), state
     )
-    assert positions.shape == (TRACED_MOB_SLOTS, 2)
+    assert positions.shape == (MOB_SLOTS, 2)
     # Craftax keeps two skeleton slots; the third is padding.
     assert mask.tolist() == [True, True, False]
     _, mask = target_mob_slots(jnp.asarray(skill_index(SkillId.COLLECT_WOOD)), state)
@@ -106,7 +137,7 @@ def test_worlds_stage_the_cell_they_belong_to() -> None:
         _cell(distance=3, health=7, sword="wood"),
     )
     entries = [cell for cell in cells for _ in range(4)]
-    states = fight_worlds(entries, jax.random.PRNGKey(1))
+    states = _stage(entries, 1)
 
     for index, cell in enumerate(entries):
         state = _entry(states, index)
@@ -114,13 +145,18 @@ def test_worlds_stage_the_cell_they_belong_to() -> None:
         zombies = np.asarray(state.zombies.position)[np.asarray(state.zombies.mask)]
         assert len(zombies) == cell.mobs
         assert np.abs(zombies[0] - player).sum() == cell.distance
-        assert np.all(np.abs(zombies - player).sum(axis=1) <= SECOND_MOB_MAX_DISTANCE)
+        apart = np.abs(zombies - player).sum(axis=1)
+        assert np.all(apart >= cell.distance)
+        assert np.all(apart <= max(cell.distance, SECOND_MOB_MAX_DISTANCE))
         assert len({tuple(zombie) for zombie in zombies}) == cell.mobs
         assert int(np.asarray(state.mob_map).sum()) == cell.mobs
         assert int(state.player_health) == cell.health
         assert int(state.inventory.wood_sword) == (cell.sword == "wood")
         assert int(state.inventory.stone_sword) == (cell.sword == "stone")
         assert (float(state.light_level) < NIGHT_LIGHT_THRESHOLD) == cell.night
+        if not cell.night:
+            # Training scenarios fight in full light.
+            assert float(state.light_level) == 1.0
         arena = np.asarray(state.map)[
             player[0] - ARENA_RADIUS : player[0] + ARENA_RADIUS + 1,
             player[1] - ARENA_RADIUS : player[1] + ARENA_RADIUS + 1,
@@ -132,31 +168,31 @@ def test_worlds_stage_the_cell_they_belong_to() -> None:
     )
 
 
-def test_probe_traces_health_and_the_target_creatures(
+def test_probe_records_the_fight_before_and_after_every_step(
     executor: LearnedSkillExecutor,
 ) -> None:
-    states = fight_worlds([_cell(distance=1, health=4)] * 3, jax.random.PRNGKey(2))
+    entries = [_cell(distance=1, health=4)] * 3
+    states = _stage(entries, 2)
 
-    output = run_skill_probe(
-        executor,
-        states,
-        [SkillId.DEFEAT_ZOMBIE] * 3,
-        jax.random.PRNGKey(0),
-        skill_horizon=24,
-    )
+    output = _probe(executor, entries, states, horizon=24, policy=None)
 
-    assert output.health.shape == (24, 3)
-    assert output.mob_positions.shape == (24, 3, TRACED_MOB_SLOTS, 2)
-    assert output.mob_mask.shape == (24, 3, TRACED_MOB_SLOTS)
+    record = output.record
+    assert record.health.shape == (25, 3)
+    assert record.position.shape == (25, 3, 2)
+    assert record.mob_positions.shape == (25, 3, MOB_SLOTS, 2)
+    assert record.mob_mask.shape == (25, 3, MOB_SLOTS)
     for index in range(3):
         state = _entry(states, index)
         assert int(output.steps[index]) >= 1
-        assert 0 <= int(output.health[0, index]) <= 4
-        # Row 0 is the world after the first step: the zombie is still in
-        # slot 0, at most one move from where it was staged.
-        assert output.mob_mask[0, index].tolist() == [True, False, False]
-        start = np.asarray(state.zombies.position[0])
-        assert np.abs(output.mob_positions[0, index, 0] - start).sum() <= 1
+        # Row 0 is the staged world, before the first step.
+        assert int(record.health[0, index]) == 4
+        assert record.mob_mask[0, index].tolist() == [True, False, False]
+        assert np.array_equal(
+            record.mob_positions[0, index, 0], np.asarray(state.zombies.position[0])
+        )
+        assert np.array_equal(
+            record.position[0, index], np.asarray(state.player_position)
+        )
 
 
 def test_chase_reference_wins_an_easy_fight_without_missing(
@@ -164,17 +200,10 @@ def test_chase_reference_wins_an_easy_fight_without_missing(
 ) -> None:
     cells = (_cell(distance=3, health=9, sword="stone"),)
     entries = list(cells) * 8
-    states = fight_worlds(entries, jax.random.PRNGKey(3))
+    states = _stage(entries, 3)
 
-    output = run_skill_probe(
-        executor,
-        states,
-        [SkillId.DEFEAT_ZOMBIE] * 8,
-        jax.random.PRNGKey(0),
-        skill_horizon=24,
-        policy=chase_policy,
-    )
-    rows = fight_rollout_rows(entries, states, output, policy="chase")
+    output = _probe(executor, entries, states, horizon=24)
+    rows = fight_rollout_rows(entries, output, policy="chase")
 
     assert len(rows) == 8
     for row in rows:
@@ -195,20 +224,86 @@ def test_a_hopeless_fight_is_counted_as_a_death(
     # Two health beside a zombie whose cooldown is spent: the first step kills.
     cells = (_cell(distance=1, health=2),)
     entries = list(cells) * 2
-    states = fight_worlds(entries, jax.random.PRNGKey(4))
+    states = _stage(entries, 4)
 
-    output = run_skill_probe(
-        executor,
-        states,
-        [SkillId.DEFEAT_ZOMBIE] * 2,
-        jax.random.PRNGKey(0),
-        skill_horizon=8,
-        policy=chase_policy,
-    )
-    rows = fight_rollout_rows(entries, states, output, policy="chase")
+    output = _probe(executor, entries, states, horizon=8)
+    rows = fight_rollout_rows(entries, output, policy="chase")
 
     assert [row["outcome"] for row in rows] == ["died", "died"]
     assert all(row["died"] and row["damage_taken"] >= 2 for row in rows)
+
+
+def _two_zombies_beside(state, direction: int):
+    """Put zombies left and right of the player, facing ``direction``."""
+
+    position = state.player_position
+    state = clear_mobs(state)
+    state = add_mob(state, "zombie", position + jnp.asarray([0, -1]))
+    state = add_mob(state, "zombie", position + jnp.asarray([0, 1]), slot=1)
+    return state.replace(player_direction=jnp.asarray(direction, dtype=jnp.int32))
+
+
+def test_chase_hits_whichever_adjacent_creature_it_faces() -> None:
+    entries = [_cell(distance=1)] * 2
+    states = _stage(entries, 5)
+    # Directions 1 and 2 face left and right, at columns -1 and +1.
+    faced = [
+        _two_zombies_beside(_entry(states, index), 1 + index) for index in range(2)
+    ]
+    stacked = jax.tree_util.tree_map(lambda *leaves: jnp.stack(leaves), *faced)
+
+    actions = chase_policy(jnp.full((2,), skill_index(SkillId.DEFEAT_ZOMBIE)), stacked)
+
+    assert actions.tolist() == [Action.DO.value] * 2
+
+
+def _snapshot(position, direction, health, mobs):
+    mob_positions = np.zeros((1, MOB_SLOTS, 2), dtype=np.int32)
+    mob_positions[0, : len(mobs)] = mobs
+    return FightSnapshot(
+        position=np.asarray([position], dtype=np.int32),
+        direction=np.asarray([direction], dtype=np.int32),
+        health=np.asarray([health], dtype=np.int32),
+        mob_positions=mob_positions,
+        mob_mask=np.arange(MOB_SLOTS)[None] < len(mobs),
+    )
+
+
+def _rows_for(snapshots, actions):
+    record = jax.tree_util.tree_map(lambda *rows: np.stack(rows), *snapshots)
+    output = BatchedProbeOutput(
+        outcome=np.asarray([PROBE_OUTCOMES.index(SkillOutcome.TIMEOUT)]),
+        steps=np.asarray([len(actions)]),
+        positions=record.position[1:],
+        directions=record.direction[1:],
+        actions=np.asarray(actions, dtype=np.int32)[:, None],
+        record=record,
+    )
+    return fight_rollout_rows([_cell()], output, policy="chase")
+
+
+def test_stepping_from_one_creature_to_another_is_not_a_retreat() -> None:
+    zombies = [(10, 10), (12, 11)]
+    # Beside the first, step down beside the second, then step away.
+    rows = _rows_for(
+        [
+            _snapshot((10, 11), 1, 9, zombies),
+            _snapshot((11, 11), 4, 9, zombies),
+            _snapshot((11, 12), 2, 9, zombies),
+        ],
+        [Action.DOWN.value, Action.RIGHT.value],
+    )
+
+    assert rows[0]["adjacent_steps"] == 2
+    assert rows[0]["retreats"] == 1
+
+
+def test_benchmark_rejects_empty_settings(executor: LearnedSkillExecutor) -> None:
+    cells = fight_cells((SkillId.EAT_COW,), distances=(1,), healths=(9,))
+    with pytest.raises(ValueError, match="rollouts_per_cell"):
+        benchmark_fights(executor, cells, rollouts_per_cell=0)
+    with pytest.raises(ValueError, match="batch_size"):
+        benchmark_fights(executor, cells, batch_size=0)
 
 
 def test_benchmark_pairs_both_policies_on_every_cell(

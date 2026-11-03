@@ -17,7 +17,7 @@ from craftax.craftax_classic.constants import (
 from craftax.craftax_classic.envs.craftax_state import EnvParams, Inventory
 from craftax.craftax_classic.game_logic import calculate_light_level
 
-from tiny_sima.envs.chains import clear_mobs
+from tiny_sima.envs.chains import clear_mobs, reset_player
 from tiny_sima.envs.craftax import (
     CraftaxBundle,
     EnvironmentSpec,
@@ -297,7 +297,7 @@ class SkillEnvironment:
         )
 
 
-# The ground each hunted mob stands on in a scenario; see :func:`_add_mob`.
+# The ground each hunted mob stands on in a scenario; see :func:`add_mob`.
 # Skeletons live in tunnels, whose floor is path.
 _MOB_GROUND: dict[str, BlockType] = {
     "cow": BlockType.GRASS,
@@ -382,7 +382,9 @@ def _local_offsets(config: SkillScenarioConfig) -> jax.Array:
     return jnp.asarray(offsets, dtype=jnp.int32)
 
 
-def _direction_to_target(offset: jax.Array) -> jax.Array:
+def direction_to_target(offset: jax.Array) -> jax.Array:
+    """Return the move toward ``offset``: the longer axis, columns on a tie."""
+
     row, column = offset[0], offset[1]
     use_horizontal = (column != 0) & (jnp.abs(column) >= jnp.abs(row))
     horizontal = jnp.where(column < 0, Action.LEFT.value, Action.RIGHT.value)
@@ -479,7 +481,7 @@ def _prepare_local_navigation_scenario(
     target_offset = offsets[
         jax.random.randint(target_rng, (), 0, offsets.shape[0])
     ]
-    target_direction = _direction_to_target(target_offset)
+    target_direction = direction_to_target(target_offset)
     target_position = player_position + target_offset
     approach_position = target_position - DIRECTIONS[target_direction]
 
@@ -688,7 +690,7 @@ def _prepare_randomized_scenario(
 
     offsets = _local_offsets(config)
     target_offset = offsets[jax.random.randint(target_rng, (), 0, offsets.shape[0])]
-    target_direction = _direction_to_target(target_offset)
+    target_direction = direction_to_target(target_offset)
     target_position = player_position + target_offset
     approach_position = target_position - DIRECTIONS[target_direction]
     route = _route_mask(world_map.shape, player_position, approach_position)
@@ -822,22 +824,33 @@ def _lowest_sleep_energy(goal: SkillGoal) -> int:
     return min(max(MAX_VITAL - affordable, 3), MAX_VITAL - 1)
 
 
-def _add_mob(state: Any, mob: str, position: jax.Array) -> Any:
-    """Put one full-health ``mob`` on ``position``."""
+def add_mob(
+    state: Any,
+    mob: str,
+    position: jax.Array,
+    *,
+    slot: int = 0,
+    live: Any = True,
+) -> Any:
+    """Put a full-health ``mob`` on ``position`` in ``slot``, if ``live``.
+
+    A slot that is not live gets no health, so Craftax never revives it.
+    """
 
     attribute = MOB_TYPES[mob]
     mobs = getattr(state, attribute)
     health = getattr(_DEFAULT_PARAMS, f"{mob}_health")
+    occupied = state.mob_map[position[0], position[1]]
     return state.replace(
         **{
             attribute: mobs.replace(
-                position=mobs.position.at[0].set(position),
-                health=mobs.health.at[0].set(health),
-                mask=mobs.mask.at[0].set(True),
-                attack_cooldown=mobs.attack_cooldown.at[0].set(0),
+                position=mobs.position.at[slot].set(position),
+                health=mobs.health.at[slot].set(jnp.where(live, health, 0)),
+                mask=mobs.mask.at[slot].set(live),
+                attack_cooldown=mobs.attack_cooldown.at[slot].set(0),
             )
         },
-        mob_map=state.mob_map.at[position[0], position[1]].set(True),
+        mob_map=state.mob_map.at[position[0], position[1]].set(occupied | live),
     )
 
 
@@ -921,22 +934,15 @@ def prepare_skill_scenario(
     player_food, player_drink, player_energy = scenario_vitals(goal.skill_id)
     prepared_state = clear_mobs(scenario.state)
     if goal.skill_id in SKILL_MOBS:
-        prepared_state = _add_mob(
+        prepared_state = add_mob(
             prepared_state, SKILL_MOBS[goal.skill_id], scenario.target_position
         )
-    prepared_state = prepared_state.replace(
-        player_health=9,
-        player_food=player_food,
-        player_drink=player_drink,
-        player_energy=player_energy,
-        is_sleeping=False,
-        player_recover=0.0,
-        player_hunger=0.0,
-        player_thirst=0.0,
-        player_fatigue=0.0,
-        achievements=jnp.zeros_like(state.achievements),
-        timestep=0,
-        light_level=1.0,
+    prepared_state = reset_player(
+        prepared_state,
+        health=9,
+        food=player_food,
+        drink=player_drink,
+        energy=player_energy,
     )
     if state_rng is not None and scenario_config.randomization is not None:
         prepared_state = _randomize_vitals_and_clock(

@@ -21,6 +21,7 @@ from tiny_sima.goals.skills import (
     ALL_SKILL_IDS,
     MACRO_REGISTRY,
     MAX_VITAL,
+    MOB_SLOTS,
     MOB_TYPES,
     SKILL_ACHIEVEMENTS,
     SKILL_IDS,
@@ -54,6 +55,7 @@ from tiny_sima.goals.skills import (
     skill_success_from_metric,
     skill_target_block,
     sparse_skill_reward,
+    target_mob_slots,
 )
 
 __all__ = [
@@ -62,6 +64,7 @@ __all__ = [
     "DEFAULT_REACHABILITY",
     "MACRO_REGISTRY",
     "MAX_VITAL",
+    "MOB_SLOTS",
     "MOB_TYPES",
     "OBSERVATION_RADIUS",
     "SKILL_ACHIEVEMENTS",
@@ -105,6 +108,7 @@ __all__ = [
     "skill_success_from_metric",
     "skill_target_block",
     "sparse_skill_reward",
+    "target_mob_slots",
     "travel_distance_map",
     "view_mask",
     "walkable_mask",

@@ -66,6 +66,34 @@ def clear_mobs(state: Any) -> Any:
     )
 
 
+def reset_player(
+    state: Any,
+    *,
+    health: Any,
+    food: Any,
+    drink: Any,
+    energy: Any,
+    timestep: Any = 0,
+    light_level: Any = 1.0,
+) -> Any:
+    """Set the player's vitals and the clock, and clear every timer and unlock."""
+
+    return state.replace(
+        player_health=health,
+        player_food=food,
+        player_drink=drink,
+        player_energy=energy,
+        is_sleeping=False,
+        player_recover=0.0,
+        player_hunger=0.0,
+        player_thirst=0.0,
+        player_fatigue=0.0,
+        achievements=jnp.zeros_like(state.achievements),
+        timestep=timestep,
+        light_level=light_level,
+    )
+
+
 def prepare_chain_scenario(
     state: Any,
     rng: jax.Array,
@@ -134,7 +162,7 @@ def prepare_chain_scenario(
         position = player_position + shuffled_offsets[index]
         clean_map = clean_map.at[position[0], position[1]].set(block.value)
 
-    state = clear_mobs(state)
+    state = reset_player(clear_mobs(state), health=9, food=9, drink=5, energy=9)
     return state.replace(
         map=clean_map,
         player_position=player_position,
@@ -145,19 +173,7 @@ def prepare_chain_scenario(
             maxval=Action.DOWN.value + 1,
             dtype=jnp.int32,
         ),
-        player_health=9,
-        player_food=9,
-        player_drink=5,
-        player_energy=9,
-        is_sleeping=False,
-        player_recover=0.0,
-        player_hunger=0.0,
-        player_thirst=0.0,
-        player_fatigue=0.0,
         inventory=Inventory(),
-        achievements=jnp.zeros_like(state.achievements),
-        timestep=0,
-        light_level=1.0,
     )
 
 
