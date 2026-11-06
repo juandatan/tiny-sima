@@ -80,6 +80,8 @@ COLLECT_RESOURCES: dict[SkillId, str] = {
     SkillId.COLLECT_STONE: "stone",
     SkillId.DRINK_WATER: "water",
     SkillId.COLLECT_COAL: "coal",
+    SkillId.COLLECT_IRON: "iron",
+    SkillId.COLLECT_DIAMOND: "diamond",
 }
 
 _WORLD_FACTS = {f"world.{block}_reachable": block for block in RESOURCE_BLOCKS}

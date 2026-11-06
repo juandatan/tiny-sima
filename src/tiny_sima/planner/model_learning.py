@@ -115,8 +115,8 @@ _ANALYSIS_MAX_LENGTH = 160
 MANUAL_PATH = Path(__file__).resolve().parents[3] / "docs" / "craftax_classic_manual.md"
 
 # The state at a Craftax-Classic reset, as the planner reads it: nothing held,
-# vitals full, trees, stone, coal, water, grass, mobs and free ground about,
-# and no table, furnace or ripe plant yet.
+# vitals full, trees, stone, coal, iron, a diamond, water, grass, mobs and
+# free ground about, and no table, furnace or ripe plant yet.
 EPISODE_START: tuple[tuple[str, int], ...] = tuple(
     (
         field,
@@ -131,6 +131,8 @@ EPISODE_START: tuple[tuple[str, int], ...] = tuple(
                 "world.placement_space_reachable",
                 "world.coal_reachable",
                 "world.grass_reachable",
+                "world.iron_reachable",
+                "world.diamond_reachable",
                 *map(mob_field, MOB_TYPES),
             }
         ),

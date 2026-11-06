@@ -39,6 +39,11 @@ class SkillId(str, Enum):
     # Combat, appended after the survival skills.
     DEFEAT_ZOMBIE = "defeat_zombie"
     DEFEAT_SKELETON = "defeat_skeleton"
+    # The iron and diamond stage, the last four achievements.
+    COLLECT_IRON = "collect_iron"
+    CRAFT_IRON_PICKAXE = "craft_iron_pickaxe"
+    CRAFT_IRON_SWORD = "craft_iron_sword"
+    COLLECT_DIAMOND = "collect_diamond"
     # A scripted macro, outside the registry and the executor's skills.
     SHELTER = "shelter"
 
@@ -496,6 +501,100 @@ SKILL_REGISTRY: dict[SkillId, SkillSpec] = {
         default_horizon=96,
         interaction_action=Action.DO,
     ),
+    SkillId.COLLECT_IRON: SkillSpec(
+        skill_id=SkillId.COLLECT_IRON,
+        instruction="Collect iron with a stone pickaxe.",
+        description="Mine iron using a stone pickaxe.",
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("inventory.stone_pickaxe", "at_least", 1),
+                StateRequirement("world.iron_reachable", "equals", True),
+            ),
+            effects=(
+                StateEffect("inventory.iron", "increase", 1),
+            ),
+        ),
+        default_horizon=96,
+        interaction_action=Action.DO,
+    ),
+    SkillId.CRAFT_IRON_PICKAXE: SkillSpec(
+        skill_id=SkillId.CRAFT_IRON_PICKAXE,
+        instruction="Craft an iron pickaxe at a crafting table and furnace.",
+        description=(
+            "Spend one wood, one stone, one iron and one coal standing next to "
+            "both a crafting table and a furnace to make an iron pickaxe."
+        ),
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("inventory.wood", "at_least", 1),
+                StateRequirement("inventory.stone", "at_least", 1),
+                StateRequirement("inventory.iron", "at_least", 1),
+                StateRequirement("inventory.coal", "at_least", 1),
+                StateRequirement(
+                    "world.crafting_table_reachable",
+                    "equals",
+                    True,
+                ),
+                StateRequirement("world.furnace_reachable", "equals", True),
+            ),
+            effects=(
+                StateEffect("inventory.wood", "decrease", 1),
+                StateEffect("inventory.stone", "decrease", 1),
+                StateEffect("inventory.iron", "decrease", 1),
+                StateEffect("inventory.coal", "decrease", 1),
+                StateEffect("inventory.iron_pickaxe", "increase", 1),
+            ),
+        ),
+        default_horizon=64,
+        interaction_action=Action.MAKE_IRON_PICKAXE,
+    ),
+    SkillId.CRAFT_IRON_SWORD: SkillSpec(
+        skill_id=SkillId.CRAFT_IRON_SWORD,
+        instruction="Craft an iron sword at a crafting table and furnace.",
+        description=(
+            "Spend one wood, one stone, one iron and one coal standing next to "
+            "both a crafting table and a furnace to make an iron sword."
+        ),
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("inventory.wood", "at_least", 1),
+                StateRequirement("inventory.stone", "at_least", 1),
+                StateRequirement("inventory.iron", "at_least", 1),
+                StateRequirement("inventory.coal", "at_least", 1),
+                StateRequirement(
+                    "world.crafting_table_reachable",
+                    "equals",
+                    True,
+                ),
+                StateRequirement("world.furnace_reachable", "equals", True),
+            ),
+            effects=(
+                StateEffect("inventory.wood", "decrease", 1),
+                StateEffect("inventory.stone", "decrease", 1),
+                StateEffect("inventory.iron", "decrease", 1),
+                StateEffect("inventory.coal", "decrease", 1),
+                StateEffect("inventory.iron_sword", "increase", 1),
+            ),
+        ),
+        default_horizon=64,
+        interaction_action=Action.MAKE_IRON_SWORD,
+    ),
+    SkillId.COLLECT_DIAMOND: SkillSpec(
+        skill_id=SkillId.COLLECT_DIAMOND,
+        instruction="Collect a diamond with an iron pickaxe.",
+        description="Mine a diamond using an iron pickaxe.",
+        mechanics=SkillMechanics(
+            requires=(
+                StateRequirement("inventory.iron_pickaxe", "at_least", 1),
+                StateRequirement("world.diamond_reachable", "equals", True),
+            ),
+            effects=(
+                StateEffect("inventory.diamond", "increase", 1),
+            ),
+        ),
+        default_horizon=96,
+        interaction_action=Action.DO,
+    ),
 }
 
 # Every skill the registry defines, in categorical index order.
@@ -557,6 +656,10 @@ SKILL_ACHIEVEMENTS: dict[SkillId, Achievement] = {
     SkillId.EAT_PLANT: Achievement.EAT_PLANT,
     SkillId.DEFEAT_ZOMBIE: Achievement.DEFEAT_ZOMBIE,
     SkillId.DEFEAT_SKELETON: Achievement.DEFEAT_SKELETON,
+    SkillId.COLLECT_IRON: Achievement.COLLECT_IRON,
+    SkillId.CRAFT_IRON_PICKAXE: Achievement.MAKE_IRON_PICKAXE,
+    SkillId.CRAFT_IRON_SWORD: Achievement.MAKE_IRON_SWORD,
+    SkillId.COLLECT_DIAMOND: Achievement.COLLECT_DIAMOND,
 }
 
 # Mob type to the Craftax state field holding its instances.
@@ -715,8 +818,9 @@ def planner_skill_catalog(
 def skill_target_block(skill_id: SkillId | str) -> BlockType | None:
     """Return the block a skill faces to act on, from its registry entry.
 
-    It is the block named by the skill's ``world.<block>_reachable``
-    requirement, so the crafting skills target the crafting table. ``None``
+    It is the block named by the skill's first ``world.<block>_reachable``
+    requirement, so the crafting skills target the crafting table, the iron
+    ones too, whose furnace is listed after it. ``None``
     for a skill without one: the placements, which need only free ground,
     sleep, and the hunting skills in :data:`SKILL_MOBS`, whose target is a mob.
     """
@@ -795,6 +899,14 @@ def skill_metric(skill_id: SkillId | str, state: Any) -> jax.Array:
             (jnp.asarray(state.player_energy) >= MAX_VITAL)
             & ~jnp.asarray(state.is_sleeping)
         ).astype(jnp.int32)
+    if skill_id is SkillId.COLLECT_IRON:
+        return jnp.asarray(state.inventory.iron)
+    if skill_id is SkillId.CRAFT_IRON_PICKAXE:
+        return jnp.asarray(state.inventory.iron_pickaxe)
+    if skill_id is SkillId.CRAFT_IRON_SWORD:
+        return jnp.asarray(state.inventory.iron_sword)
+    if skill_id is SkillId.COLLECT_DIAMOND:
+        return jnp.asarray(state.inventory.diamond)
     if skill_id in SKILL_MOBS:
         # Craftax keeps no kill count. A killed mob's slot is left masked off
         # with no health, while one that despawns keeps its health, so the
@@ -877,6 +989,29 @@ def skill_precondition(goal: SkillGoal, state: Any) -> jax.Array:
         )
     if skill_id in SKILL_MOBS:
         return alive & jnp.any(skill_mobs(skill_id, state).mask)
+    if skill_id is SkillId.COLLECT_IRON:
+        return (
+            alive
+            & (jnp.asarray(state.inventory.stone_pickaxe) > 0)
+            & _has_block(state, BlockType.IRON)
+        )
+    if skill_id in {SkillId.CRAFT_IRON_PICKAXE, SkillId.CRAFT_IRON_SWORD}:
+        inventory = state.inventory
+        return (
+            alive
+            & (jnp.asarray(inventory.wood) >= goal.quantity)
+            & (jnp.asarray(inventory.stone) >= goal.quantity)
+            & (jnp.asarray(inventory.iron) >= goal.quantity)
+            & (jnp.asarray(inventory.coal) >= goal.quantity)
+            & _has_block(state, BlockType.CRAFTING_TABLE)
+            & _has_block(state, BlockType.FURNACE)
+        )
+    if skill_id is SkillId.COLLECT_DIAMOND:
+        return (
+            alive
+            & (jnp.asarray(state.inventory.iron_pickaxe) > 0)
+            & _has_block(state, BlockType.DIAMOND)
+        )
     raise AssertionError(f"Unhandled skill: {skill_id}")
 
 

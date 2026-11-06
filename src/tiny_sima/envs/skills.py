@@ -38,6 +38,7 @@ from tiny_sima.goals.skills import (
     SkillGoal,
     SkillId,
     executor_skill_ids,
+    get_skill_spec,
     interacts_by_doing,
     is_crafting_skill,
     skill_index,
@@ -340,6 +341,45 @@ def skills_for_scenario(
     return skill_ids
 
 
+# The crafts that need a furnace as well as the table they target. Craftax
+# counts either as near within the eight surrounding tiles.
+IRON_CRAFTING_SKILLS: frozenset[SkillId] = frozenset(
+    skill_id
+    for skill_id in ALL_SKILL_IDS
+    if is_crafting_skill(skill_id)
+    and any(
+        requirement.field == "world.furnace_reachable"
+        for requirement in get_skill_spec(skill_id).mechanics.requires
+    )
+)
+
+
+def _add_furnace(
+    scenario: PreparedSkillScenario,
+    rng: jax.Array,
+) -> PreparedSkillScenario:
+    """Put a furnace beside the table, on either side across the approach.
+
+    It sits next to the table and diagonal to the tile the player walks up
+    to, so that tile is near both. It lies beyond the approach, off the route
+    to it, and never on the player.
+    """
+
+    direction = scenario.target_direction
+    # LEFT and RIGHT are 1 and 2, UP and DOWN 3 and 4.
+    sideways = jnp.where(
+        direction <= Action.RIGHT.value, Action.UP.value, Action.LEFT.value
+    )
+    side = sideways + jax.random.bernoulli(rng).astype(jnp.int32)
+    position = scenario.target_position + jnp.asarray(DIRECTIONS)[side]
+    state = scenario.state
+    return scenario._replace(
+        state=state.replace(
+            map=state.map.at[position[0], position[1]].set(BlockType.FURNACE.value)
+        )
+    )
+
+
 def _scenario_inventory(skill_id: SkillId) -> Inventory:
     inventory = Inventory()
     if skill_id is SkillId.COLLECT_STONE:
@@ -363,6 +403,22 @@ def _scenario_inventory(skill_id: SkillId) -> Inventory:
         return replace(inventory, stone=1, wood_pickaxe=1)
     if skill_id is SkillId.PLACE_PLANT:
         return replace(inventory, sapling=1)
+    # Iron can only have been mined with a stone pickaxe, and the iron tools
+    # need it and coal, which the wood pickaxe mines.
+    if skill_id is SkillId.COLLECT_IRON:
+        return replace(inventory, wood_pickaxe=1, stone_pickaxe=1)
+    if skill_id in IRON_CRAFTING_SKILLS:
+        return replace(
+            inventory,
+            wood=1,
+            stone=1,
+            iron=1,
+            coal=1,
+            wood_pickaxe=1,
+            stone_pickaxe=1,
+        )
+    if skill_id is SkillId.COLLECT_DIAMOND:
+        return replace(inventory, wood_pickaxe=1, stone_pickaxe=1, iron_pickaxe=1)
     return inventory
 
 
@@ -931,6 +987,9 @@ def prepare_skill_scenario(
             scenario_config,
         )
 
+    if goal.skill_id in IRON_CRAFTING_SKILLS:
+        # Folded rather than split, so no other skill's world changes.
+        scenario = _add_furnace(scenario, jax.random.fold_in(rng, 1))
     player_food, player_drink, player_energy = scenario_vitals(goal.skill_id)
     prepared_state = clear_mobs(scenario.state)
     if goal.skill_id in SKILL_MOBS:

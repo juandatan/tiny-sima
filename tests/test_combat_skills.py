@@ -33,8 +33,8 @@ from tiny_sima.planner.symbolic import PLANNER_FIELDS, read_field, shortest_plan
 COMBAT = {SkillId.DEFEAT_ZOMBIE: "zombie", SkillId.DEFEAT_SKELETON: "skeleton"}
 
 
-def test_combat_skills_append_last() -> None:
-    assert ALL_SKILL_IDS[-2:] == tuple(COMBAT)
+def test_combat_skills_follow_the_survival_skills() -> None:
+    assert ALL_SKILL_IDS[16:18] == tuple(COMBAT)
     for skill_id in COMBAT:
         assert skill_target_block(skill_id) is None
         assert skill_id in LOCAL_NAVIGATION_SKILLS

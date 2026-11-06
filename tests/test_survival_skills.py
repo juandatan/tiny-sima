@@ -67,11 +67,12 @@ DETERMINISTIC_SKILLS = tuple(
 
 
 def test_new_skills_append_after_the_stone_pickaxe_catalog() -> None:
-    assert len(ALL_SKILL_IDS) == 18
+    assert len(ALL_SKILL_IDS) == 22
     assert ALL_SKILL_IDS[:7] == STONE_PICKAXE_SKILL_IDS
     assert STONE_PICKAXE_SKILL_IDS[-1] is SkillId.CRAFT_STONE_PICKAXE
     assert executor_skill_ids(16)[-1] is SkillId.EAT_PLANT
-    assert executor_skill_ids(18) == ALL_SKILL_IDS
+    assert executor_skill_ids(18)[-1] is SkillId.DEFEAT_SKELETON
+    assert executor_skill_ids(22) == ALL_SKILL_IDS
     assert set(SKILL_ACHIEVEMENTS) == set(ALL_SKILL_IDS)
     # The evaluations still offer the catalog the recorded executors know.
     assert WOOD_TO_STONE_PICKAXE_CHAIN.skills == STONE_PICKAXE_SKILL_IDS

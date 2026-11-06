@@ -50,6 +50,10 @@ _TARGETS = {
     SkillId.EAT_PLANT: BlockType.RIPE_PLANT,
     SkillId.DEFEAT_ZOMBIE: BlockType.GRASS,
     SkillId.DEFEAT_SKELETON: BlockType.PATH,
+    SkillId.COLLECT_IRON: BlockType.IRON,
+    SkillId.CRAFT_IRON_PICKAXE: BlockType.CRAFTING_TABLE,
+    SkillId.CRAFT_IRON_SWORD: BlockType.CRAFTING_TABLE,
+    SkillId.COLLECT_DIAMOND: BlockType.DIAMOND,
 }
 
 

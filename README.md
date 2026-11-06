@@ -50,14 +50,15 @@ The comparisons that answer the question:
 
 ## Status
 
-As of October 31, 2026:
+As of November 6, 2026:
 
 - **Phases 1 to 3 are complete.** The environment, PPO baseline, skill
   benchmark, and goal-conditioned executor are done. The executor in use
   knows seven skills and completes the default scripted plan in 64 of 64
-  closed-loop episodes. The registry now has eighteen skills. The
-  sixteen-skill executor is trained, and the eighteen-skill one, which adds
-  the combat skills, is next.
+  closed-loop episodes. The registry now has twenty-two skills, one per
+  Craftax-Classic achievement. The sixteen- and eighteen-skill executors
+  were trained on a JupyterHub machine that is gone, so the next step is to
+  train the twenty-two-skill one, which adds the iron and diamond stage.
 - **Phase 4, the per-turn planner, is closed.** No per-turn VLM condition
   reached the collect-first scripted plan on the stone-pickaxe chain. The
   plan veto did, as an upper bound.
@@ -289,9 +290,14 @@ handles the first `num_skills` skills of the registry:
 - **Two combat skills, with `num_skills: 18`:** `defeat_zombie` and
   `defeat_skeleton`. Each scenario places one live mob of its kind, a
   skeleton on a tunnel path, and success is a kill, not a despawn.
+- **The iron and diamond stage, with `num_skills: 22`:** `collect_iron`,
+  `craft_iron_pickaxe`, `craft_iron_sword` and `collect_diamond`. Iron needs
+  a stone pickaxe and diamond an iron one. The iron tools need one wood,
+  stone, iron and coal, and both a crafting table and a furnace nearby, so
+  their scenarios put a furnace beside the table, diagonal to the tile the
+  player crafts from.
 
-  Together they unlock 18 of the 22 Craftax-Classic achievements. Only the
-  iron tier and diamond stay out of reach.
+  Together they unlock all 22 Craftax-Classic achievements.
 
 Each skill keeps its embedding index as the catalog grows, so smaller
 checkpoints, priors and prompts load unchanged. A larger catalog grows the
@@ -409,7 +415,8 @@ one achievement, so the skill set caps the score:
 
 - seven achievements with the seven-skill executor;
 - sixteen with the sixteen-skill one;
-- eighteen with the eighteen-skill one.
+- eighteen with the eighteen-skill one;
+- all twenty-two with the twenty-two-skill one.
 
 The designs differ in how reliably, cheaply and safely they reach that cap.
 Notebook 08 loads the executor that notebook 07 selected under
@@ -539,19 +546,23 @@ Most of these come from Phase 4. Its tables are in the archive:
 
 All of them are implemented and tested on CPU with stub backends.
 
-1. **Train the eighteen-skill executor.** In notebook 07, run
-   `PRESET = "eighteen_skill_smoke"` first. Then run `eighteen_skill`: three
-   seeds of 29M steps, with 288 environments, 16 per skill, as
-   `sixteen_skill` did for the sixteen-skill one. Run selection uses the
-   seven-skill chains, so check the two combat skills in the per-skill
-   training table before going on. Compare each against its scripted
-   baseline in notebook 03.
+1. **Train the twenty-two-skill executor.** In notebook 07, run
+   `PRESET = "twenty_two_skill_smoke"` first. Then run `twenty_two_skill`:
+   three seeds of 36M steps, with 352 environments, 16 per skill and 3,200
+   updates, as `eighteen_skill` had. On a machine without `runs/`, the
+   notebook first retrains the paired baseline from
+   `configs/skill_ppo_local_1m.yaml`. Run selection uses the seven-skill
+   chains, so check the combat and iron skills in the per-skill training
+   table before going on. Compare each against its scripted baseline in
+   notebook 03.
 2. **The open-ended task with sixteen skills.** Run notebook 08 with
    `EXECUTOR_PRESET = "sixteen_skill"` and Qwen3-VL-8B, on seed 51, then on
    seed 202. The cap rises from 7 to 16, which gives the VLM room to beat the
    curriculum. The competence prior is refitted over the whole catalog and
    saved under its own name. Then repeat with `EXECUTOR_PRESET =
-   "eighteen_skill"`, which raises the cap to 18.
+   "twenty_two_skill"`, which raises the cap to 22. Iron and diamond lie in
+   caves and mountains, usually out of view, so the cap may stay out of
+   reach for want of exploration rather than of skill.
 3. **The feasibility study.** Notebook 06, section "Can the VLM judge when a
    skill will succeed?", after the paired probes. It is
    the reverse of the Can term: the VLM rates every skill from 0 to 10 for
@@ -605,7 +616,7 @@ these.
 | --- | --- | --- |
 | 1. Environment and baseline | A reproducible Craftax PPO-RNN setup with throughput and memory measured | Complete |
 | 2. Skill benchmark | Skills with preconditions, success predicates, sparse rewards, and scripted and random baselines | Complete |
-| 3. Goal-conditioned executor | One policy for every skill, trained on `local_navigation`, then on the `randomized` scenario | Complete with seven and sixteen skills; the eighteen-skill executor is next |
+| 3. Goal-conditioned executor | One policy for every skill, trained on `local_navigation`, then on the `randomized` scenario | Complete with seven, sixteen and eighteen skills; the twenty-two-skill executor is next |
 | 4. Per-turn planner | A frozen VLM in a SayCan loop, with a grounded ablation ladder | Complete; no per-turn condition reaches the bar, and the plan veto is the upper bound |
 | 4b. Sub-goal planner | VLM sub-goals, a symbolic planner, memory, richer observation, the open-ended task, and a learned skill model | Chains at the upper bound on two seeds; open-ended task at the seven-skill cap; feasibility, model learning and the observation ablation pending |
 | 5. Memory and visual grounding | Structured episodic memory; symbolic against pixel inputs; frame history; paraphrased instructions | Memory and the image/text ablation built; the rest not started |
@@ -615,19 +626,10 @@ Next steps, in order:
 
 1. **Run Experiments 1 and 2:** train the sixteen-skill executor, then run
    the open-ended task with it.
-2. **Train the eighteen-skill executor** with notebook 07's
-   `eighteen_skill_smoke` and `eighteen_skill` presets, then run the
+2. **Train the twenty-two-skill executor** with notebook 07's
+   `twenty_two_skill_smoke` and `twenty_two_skill` presets, then run the
    open-ended task with it.
-3. **Add the remaining four achievements:**
-   - collect iron;
-   - make an iron pickaxe;
-   - make an iron sword;
-   - collect diamond.
-
-   The iron tools need a table and a furnace both nearby, plus coal and
-   iron. Diamond needs the iron pickaxe. Each skill needs registry entries,
-   scenario support and executor training.
-4. **Run Experiments 3 to 5**, the feasibility study, model learning and the
+3. **Run Experiments 3 to 5**, the feasibility study, model learning and the
    observation ablation.
 
 Deferred from the Phase 3 plan: learned skill termination (the open-ended
@@ -679,12 +681,18 @@ tiny-sima-train-skills --config configs/skill_ppo_16_skill_randomized_26m.yaml
 # 288 environments, about 29M steps.
 tiny-sima-train-skills --config configs/skill_ppo_18_skill_randomized_debug.yaml
 tiny-sima-train-skills --config configs/skill_ppo_18_skill_randomized_29m.yaml
+
+# Twenty-two skills: the eighteen above plus iron, the iron pickaxe and sword,
+# and diamond. 352 environments, about 36M steps.
+tiny-sima-train-skills --config configs/skill_ppo_22_skill_randomized_debug.yaml
+tiny-sima-train-skills --config configs/skill_ppo_22_skill_randomized_36m.yaml
 ```
 
 Notebook 07's `stone_pickaxe` preset trains three seeds of the seven-skill
 configuration and records the selected one; `sixteen_skill_smoke` and
 `sixteen_skill` do the same for the sixteen-skill catalog, and
-`eighteen_skill_smoke` and `eighteen_skill` for the eighteen-skill one. The chain
+`eighteen_skill_smoke` and `eighteen_skill` for the eighteen-skill one, and
+`twenty_two_skill_smoke` and `twenty_two_skill` for all twenty-two. The chain
 evaluations keep their seven-skill recipes; notebook 08's open-ended
 evaluation offers every skill the selected executor knows.
 
@@ -736,8 +744,8 @@ Notebooks 06 and 07 have presets:
 
 - Notebook 06: `smoke`, `full`, and `incremental`.
 - Notebook 07: `smoke`, `full`, `stone_pickaxe_smoke`, `stone_pickaxe`,
-  `sixteen_skill_smoke`, `sixteen_skill`, `eighteen_skill_smoke`, and
-  `eighteen_skill`.
+  `sixteen_skill_smoke`, `sixteen_skill`, `eighteen_skill_smoke`,
+  `eighteen_skill`, `twenty_two_skill_smoke`, and `twenty_two_skill`.
 
 Both reuse completed work rather than repeating it.
 
@@ -777,6 +785,19 @@ Two environment variables, set before the kernel starts, control it:
 
 Keep only one JAX kernel running during training. Closing a notebook tab does
 not always stop its kernel.
+
+### Runpod
+
+The same setup cell works in a Runpod Jupyter pod:
+
+- Use an image with Python 3.11 or 3.12 and a GPU with 40 to 48 GB, which
+  the 8B VLM in notebook 08 needs.
+- Clone the repository under `/workspace`, the persistent volume, so
+  `runs/` and the Hugging Face cache survive a pod restart.
+- Run notebook 07 before 08. A fresh pod has no `runs/`, so notebook 07
+  retrains the paired baseline, then trains and selects the executor that
+  notebook 08 loads. Notebook 08 then measures the competence prior and the
+  fight odds for that executor.
 
 ## Evaluation principles
 

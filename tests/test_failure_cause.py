@@ -52,6 +52,11 @@ def test_skill_targets_come_from_the_registry() -> None:
         SkillId.DEFEAT_ZOMBIE: None,
         SkillId.DEFEAT_SKELETON: None,
         SkillId.SHELTER: None,
+        SkillId.COLLECT_IRON: "iron",
+        # The iron crafts target the table; the furnace is a second requirement.
+        SkillId.CRAFT_IRON_PICKAXE: "crafting_table",
+        SkillId.CRAFT_IRON_SWORD: "crafting_table",
+        SkillId.COLLECT_DIAMOND: "diamond",
     }
 
 

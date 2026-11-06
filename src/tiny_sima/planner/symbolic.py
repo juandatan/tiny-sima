@@ -85,6 +85,9 @@ _LATER_BLOCKS = (
     BlockType.RIPE_PLANT,
     BlockType.GRASS,
 )
+# The iron and diamond stage's ores, after the mobs so earlier fields keep
+# their order.
+_ORE_BLOCKS = (BlockType.IRON, BlockType.DIAMOND)
 
 
 def _world_field(block: BlockType) -> str:
@@ -92,7 +95,8 @@ def _world_field(block: BlockType) -> str:
 
 
 _WORLD_BLOCKS = {
-    _world_field(block): block for block in (*_STONE_PICKAXE_BLOCKS, *_LATER_BLOCKS)
+    _world_field(block): block
+    for block in (*_STONE_PICKAXE_BLOCKS, *_LATER_BLOCKS, *_ORE_BLOCKS)
 }
 
 # The fields the seven stone-pickaxe-stage skills read and change. The
@@ -111,6 +115,7 @@ PLANNER_FIELDS: tuple[str, ...] = (
     "survival.energy",
     *map(_world_field, _LATER_BLOCKS),
     *map(mob_field, MOB_TYPES),
+    *map(_world_field, _ORE_BLOCKS),
 )
 _MOB_FIELDS = {mob_field(mob): mob for mob in MOB_TYPES}
 
