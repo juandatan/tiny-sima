@@ -9,6 +9,14 @@
 # its container disk and with it anything installed into the image's Python.
 set -euo pipefail
 
+# Runpod exports RUNPOD_POD_ID and the API key runpodctl needs through this
+# file, which only an interactive shell sources, so a launch over a plain
+# `ssh host command` would otherwise leave the pod running.
+if [[ -z "${RUNPOD_POD_ID:-}" && -r /etc/rp_environment ]]; then
+    # shellcheck disable=SC1091
+    source /etc/rp_environment
+fi
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 venv="${TINY_SIMA_VENV:-${repo_root}/../tiny-sima-venv}"
 
