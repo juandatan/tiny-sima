@@ -34,6 +34,7 @@ from tiny_sima.envs.chains import (
 )
 from tiny_sima.envs.craftax import step_batch
 from tiny_sima.envs.skills import (
+    IRON_CRAFTING_SKILLS,
     SkillEnvironment,
     SkillEpisodeState,
     SkillScenarioConfig,
@@ -671,7 +672,13 @@ def _skill_target_positions(state: Any, skill_id: SkillId) -> set[tuple[int, int
 def _nearest_navigation_target(
     state: Any,
     targets: set[tuple[int, int]],
+    can_stand: Callable[[tuple[int, int]], bool] | None = None,
 ) -> NavigationTarget | None:
+    """Return the first step towards the nearest tile beside a target.
+
+    ``can_stand``, when given, limits the tiles the player may stop on.
+    """
+
     map_array = np.asarray(state.map)
     player_position = np.asarray(state.player_position)
     start = (int(player_position[0]), int(player_position[1]))
@@ -688,7 +695,7 @@ def _nearest_navigation_target(
                 position[0] + int(direction[0]),
                 position[1] + int(direction[1]),
             )
-            if adjacent in targets:
+            if adjacent in targets and (can_stand is None or can_stand(position)):
                 return NavigationTarget(
                     movement_action=first_action,
                     target_direction=action.value,
@@ -741,7 +748,18 @@ def _scripted_action(state: Any, skill_id: SkillId) -> int:
     if not is_crafting_skill(skill_id) and (int(front[0]), int(front[1])) in targets:
         # Turning toward a walkable target such as grass would step onto it.
         return interaction.value
-    target = _nearest_navigation_target(state, targets)
+    can_stand: Callable[[tuple[int, int]], bool] | None = None
+    if skill_id in IRON_CRAFTING_SKILLS:
+        # The iron crafts need a furnace near the tile the player crafts from too.
+        furnaces = np.argwhere(np.asarray(state.map) == BlockType.FURNACE.value)
+
+        def near_furnace(position: tuple[int, int]) -> bool:
+            return bool(
+                np.any(np.max(np.abs(furnaces - np.asarray(position)), axis=-1) <= 1)
+            )
+
+        can_stand = near_furnace
+    target = _nearest_navigation_target(state, targets, can_stand)
     if target is None:
         return Action.NOOP.value
     if target.movement_action is not None:

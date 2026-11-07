@@ -631,6 +631,8 @@ _DEFAULT_PARAMS = EnvParams()
 
 
 def _randomized_distractor_blocks(target: BlockType | None) -> jax.Array:
+    # Iron and diamond appear around every skill, not only as their own
+    # skills' targets, so seeing ore does not give the skill away.
     candidates = (
         BlockType.TREE,
         BlockType.STONE,
@@ -639,6 +641,8 @@ def _randomized_distractor_blocks(target: BlockType | None) -> jax.Array:
         BlockType.SAND,
         BlockType.FURNACE,
         BlockType.PLANT,
+        BlockType.IRON,
+        BlockType.DIAMOND,
     )
     return jnp.asarray(
         [block.value for block in candidates if block is not target],

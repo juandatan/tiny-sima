@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from craftax.craftax_classic.constants import Action, BlockType
+from craftax.craftax_classic.constants import OBS_DIM, Action, BlockType
 
 from tiny_sima.config import load_skill_config
 from tiny_sima.envs.skills import (
@@ -115,6 +115,43 @@ def test_crafting_beside_the_table_and_furnace_makes_the_tool(skill_id) -> None:
     assert int(inventory.iron) == 0 and int(inventory.coal) == 0
     achievement = SKILL_ACHIEVEMENTS[skill_id]
     assert bool(result.state.env_state.achievements[achievement.value])
+
+
+@pytest.mark.parametrize(
+    "skill_id",
+    (SkillId.COLLECT_STONE, SkillId.CRAFT_WOOD_PICKAXE, SkillId.COLLECT_IRON),
+    ids=lambda skill: skill.value,
+)
+def test_randomized_worlds_scatter_ore_around_other_skills(skill_id) -> None:
+    environment = make_skill_environment(
+        skill_id,
+        horizon=64,
+        scenario="randomized",
+        min_distance=1,
+        max_distance=7,
+        randomization=ScenarioRandomization(),
+    )
+    seen = set()
+    for seed in range(32):
+        _, state = environment.reset(jax.random.PRNGKey(seed))
+        world_map = np.asarray(state.env_state.map).copy()
+        target = np.asarray(state.target_position)
+        # The skill's own target is not a distractor.
+        world_map[target[0], target[1]] = BlockType.GRASS.value
+        row, column = np.asarray(state.env_state.player_position)
+        rows, columns = OBS_DIM[0] // 2, OBS_DIM[1] // 2
+        other = world_map[
+            row - rows : row + rows + 1, column - columns : column + columns + 1
+        ]
+        seen.update(
+            ore for ore in (BlockType.IRON, BlockType.DIAMOND)
+            if np.any(other == ore.value)
+        )
+    expected = {BlockType.IRON, BlockType.DIAMOND}
+    # A skill's target is never among its own distractors.
+    if skill_id is SkillId.COLLECT_IRON:
+        expected = {BlockType.DIAMOND}
+    assert seen >= expected
 
 
 @pytest.mark.parametrize("skill_id", tuple(ORES), ids=lambda skill: skill.value)
