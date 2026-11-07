@@ -3,8 +3,9 @@
 Material moved out of [README.md](README.md) on October 21, 2026, when the
 README was reduced to the current findings and status; on October 22, when the
 executor-improvement phase finished; on October 28, when the README moved
-to the Phase 4b sub-goal setup; and on October 31, when Phase 4b was
-measured. Everything here was accurate when it
+to the Phase 4b sub-goal setup; on October 31, when Phase 4b was
+measured; and on November 7, when the eighteen-skill open-ended results
+replaced the seven-skill ones. Everything here was accurate when it
 was written. Later runs supersede some of it: condition names changed on
 October 20, the executor changed on October 22, and the README's tables hold
 the latest numbers.
@@ -32,6 +33,8 @@ Contents:
   the Phase 4 closing diagnosis and work items, as of October 26, 2026.
 - [README material moved on October 31, 2026](#readme-material-moved-on-october-31-2026):
   the Phase 4 baselines table and the Phase 4b plan as of October 28.
+- [README material moved on November 7, 2026](#readme-material-moved-on-november-7-2026):
+  the seven-skill open-ended results and the status as of November 6.
 - [Changelog](#changelog): dated status entries from October 8, 2026 onward.
 
 ## Phase 1 measurements
@@ -1348,6 +1351,93 @@ The next steps were, in order:
 The survival and stone-tier skills were then added in one step, so the
 executor trains once: see the October 31 changelog entry.
 
+## README material moved on November 7, 2026
+
+The README's open-ended results with the seven-skill executor, and its
+status as of November 6, 2026. They moved here when the eighteen-skill
+results replaced them. The sixteen- and eighteen-skill runs between are in
+the changelog entries from November 1 onward.
+
+### Status as of November 6, 2026
+
+- **Phases 1 to 3 are complete.** The environment, PPO baseline, skill
+  benchmark, and goal-conditioned executor are done. The executor in use
+  knows seven skills and completes the default scripted plan in 64 of 64
+  closed-loop episodes. The registry now has twenty-two skills, one per
+  Craftax-Classic achievement. The sixteen- and eighteen-skill executors
+  were trained on a JupyterHub machine that is gone, so the next step is to
+  train the twenty-two-skill one, which adds the iron and diamond stage.
+- **Phase 4, the per-turn planner, is closed.** No per-turn VLM condition
+  reached the collect-first scripted plan on the stone-pickaxe chain. The
+  plan veto did, as an upper bound.
+- **Phase 4b answers the research question on the chains.** With
+  Qwen3-VL-2B, VLM sub-goals over episode memory solve 64 of 64 episodes on
+  all three chains, on seeds 51 and 202. That matches the formal goal and does
+  at least as well as the plan veto, without either privileged input. See
+  [Phase 4b results](README.md#phase-4b-results).
+- **On the open-ended task, the seven skills cap the score.** The scripted
+  curriculum reaches about 7 of the 7 achievements its skills unlock.
+  Qwen3-VL-8B sub-goals come close but do not beat it. They do beat per-turn
+  skill choice when creatures are on.
+- **Not yet run:** the VLM feasibility study, skill-model learning, and the
+  observation ablation.
+- **Phase 5's structured memory is built**, as the Phase 4b episode memory.
+  Phase 6, full evaluation, has not started.
+
+### Open-ended achievements, seven skills
+
+Notebook 08 ran the seven-skill executor with the `image_and_state`
+observation, 16 episodes per design and setting, and an 80-skill budget.
+
+**Achievements per episode, creatures off / on.** The cap is 7.
+
+| Design | 2B, seed 51 | 8B, seed 51 | 8B, seed 202 |
+| --- | ---: | ---: | ---: |
+| `saycan_recipe_aware` | 5.06 / 3.94 | 6.88 / 5.75 | 6.94 / 5.62 |
+| `subgoal_vlm` | 6.38 / 6.44 | 7.00 / 6.88 | 6.69 / 6.50 |
+| `subgoal_scripted`, the bar | 6.88 / 6.94 | 6.88 / 6.94 | 7.06 / 6.88 |
+| VLM calls per episode, `subgoal_vlm` | 7.1 / 7.0 | 6.8 / 6.2 | 7.6 / 6.2 |
+| VLM calls per episode, `saycan_recipe_aware` | 38.9 / 20.8 | 41.2 / 23.2 | 37.0 / 17.9 |
+
+The 2B runs are at `d8e4d70`, the 8B runs at `5209982` (seed 51) and
+`7853c8d` (seed 202). The curriculum calls no VLM, and its seed-51 results
+are identical across the 2B and 8B runs.
+
+What they show:
+
+- **The 8B model helps both VLM designs.** On seed 51, SayCan gains 1.8
+  achievements per episode in both settings, and the sub-goal VLM gains 0.4
+  to 0.6.
+- **No VLM design beats the scripted curriculum.** Paired by world, the 8B
+  sub-goal VLM against the curriculum is:
+  - 2 better against 1 worse with creatures off, and 1 against 2 with them
+    on, on seed 51;
+  - 1 against 5 off and 1 against 4 on, on seed 202.
+
+  None is significant (p ≥ 0.22). Both sit at the cap, which leaves the VLM
+  no room to win.
+- **With creatures on, sub-goals beat per-turn choice.** The 8B sub-goal VLM
+  beats SayCan 11 against 1 on seed 51 (p = 0.006) and 11 against 2 on seed
+  202 (p = 0.022). SayCan loses to the curriculum 1 against 13 and 1 against
+  12 (p ≤ 0.003). With creatures off, no difference is significant.
+- **SayCan dies in every episode.** It spends its decisions on surplus wood,
+  stone and pickaxes: on seed 202 with creatures off, 277 of its 592
+  requests were `collect_wood`, and 16 were `drink_water`. With creatures
+  off it dies near step 340, and every episode's last skill ends on a lost
+  precondition.
+- **The sub-goal designs stop when nothing reachable is left.** The VLM's
+  last proposal is usually an iron sword or iron pickaxe, which the planner
+  rejects because no skill produces it: in 7 to 10 of 16 episodes per
+  setting. The curriculum stops when its list runs out.
+- **The Crafter score misleads at this cap.** Its geometric mean over 22
+  achievements rewards rare incidental unlocks: a sapling, a placed stone, a
+  furnace, coal or iron, picked up on the way to something else. SayCan's
+  longer episodes collect more of these, so it has the highest score with
+  creatures off (6.43 and 5.35). It does not have the most achievements per
+  episode. We report achievements per episode first.
+
+Results and manifests are in `runs/open-ended/seed<N>-<timestamp>/`.
+
 ## Changelog
 
 Verified locally on October 8, 2026:
@@ -1919,3 +2009,70 @@ Sixteen skills added on October 31, 2026 (`740103b`):
   fields to sixteen-skill models.
 - Notebook 03 benchmarks the new skills at horizon 16. Notebook 08 offers
   every skill the selected executor knows.
+
+Sixteen-skill executor run on the open-ended task, November 1, 2026:
+
+- Notebook 07 selected `sixteen_skill/randomized-seed1`. Notebook 08 on
+  seed 202 at `468b057`, with Qwen3-VL-8B and the sixteen-skill prior.
+  Achievements per episode against the seven-skill executor:
+
+  | Design | Creatures | Seven skills | Sixteen skills | Better / worse (p) |
+  | --- | --- | ---: | ---: | --- |
+  | `saycan_recipe_aware` | off | 6.94 | 10.50 | 15 / 0 (0.0001) |
+  | `subgoal_vlm` | off | 6.69 | 8.56 | 12 / 3 (0.035) |
+  | `subgoal_scripted` | off | 7.06 | 11.62 | 15 / 0 (0.0001) |
+  | `saycan_recipe_aware` | on | 5.62 | 6.81 | 9 / 4 (0.27) |
+  | `subgoal_vlm` | on | 6.50 | 7.31 | 8 / 7 (1.0) |
+  | `subgoal_scripted` | on | 6.88 | 8.50 | 11 / 5 (0.21) |
+
+- With creatures off, both sub-goal designs looped on `eat_cow` in a world
+  with no cows, 557 and 806 infeasible attempts, because memory counted cows
+  always obtainable. Memory now rules cows out after failed hunts
+  (`b7e7cbc`).
+
+Combat skills and the eighteen-skill executor, November 1 to 2, 2026:
+
+- Added `defeat_zombie` and `defeat_skeleton` (`efdbc67`). Clearing a
+  creature now zeroes its health too, since Craftax revived cleared ones.
+  Notebook 07 selected `eighteen_skill/randomized-seed0`; `defeat_skeleton`
+  succeeds about half the time.
+- Sub-goal answers keep their reachable sub-goals (`8c9895e`), unreachable
+  ones are ruled out before the plan search (`8b59b21`), and a design whose
+  every VLM answer is rejected falls back on the curriculum's next sub-goal
+  (`03562cb`).
+- On seeds 51 and 202, every creatures-on episode died, after about 165
+  steps on seed 202, mostly in the first night, walking to water or
+  sleeping in the open.
+
+Survival on the open-ended task, November 2 to 3, 2026:
+
+- The sub-goal designs fight a close zombie outside the plan, restock
+  health, food and drink at 5, and count a skeleton reachable only once one
+  has been seen (`d23eb88`, `dbed69e`). A skill hands back to the planner
+  when a zombie arrives or hits (`b3a975e`).
+- Sheltering at night in a 2x2 stone room (`f9373b0`), chosen by the goal
+  source (`e1096e0`), as are fights and shelter after the sub-goals
+  (`fd0bcfd`, `a072361`), with one alert per creature kind (`67a6de2`).
+  On seed 51 the shelter raised the sub-goal designs' Crafter scores with
+  creatures on from 20.71 and 18.55 to 23.76 and 23.88.
+
+Fight odds measured, November 3, 2026:
+
+- Notebook 08 stages fights by health, sword, distance and time of day and
+  scores the executor against a scripted chase (`5b1d18d`, `dcbd603`,
+  `11e8c0f`). The README's
+  [open-ended results](README.md#open-ended-achievements) have the result.
+- The VLM's prompt shows the measured fight odds (`648eca2`) and, after
+  the one run with them, the odds of drinking or collecting wood with
+  zombies close (`623f115`), which has not run.
+
+JupyterHub machine shut down and iron stage added, November 6 to 7, 2026:
+
+- The JupyterHub machine and its `runs/` are gone, including every trained
+  executor, competence prior and fight-odds table. The notebooks run on
+  Runpod; notebook 07 retrains the paired baseline when it is missing.
+- Added `collect_iron`, `craft_iron_pickaxe`, `craft_iron_sword` and
+  `collect_diamond` (`bfeefb4`), so every achievement has a skill, with the
+  `twenty_two_skill` presets. The randomized scenario scatters iron and
+  diamond among its distractors, so ore does not give a skill away, and
+  the scripted executor crafts iron tools only from a tile near a furnace.

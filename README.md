@@ -50,15 +50,14 @@ The comparisons that answer the question:
 
 ## Status
 
-As of November 6, 2026:
+As of November 7, 2026:
 
-- **Phases 1 to 3 are complete.** The environment, PPO baseline, skill
-  benchmark, and goal-conditioned executor are done. The executor in use
-  knows seven skills and completes the default scripted plan in 64 of 64
-  closed-loop episodes. The registry now has twenty-two skills, one per
-  Craftax-Classic achievement. The sixteen- and eighteen-skill executors
-  were trained on a JupyterHub machine that is gone, so the next step is to
-  train the twenty-two-skill one, which adds the iron and diamond stage.
+- **Phases 1 to 3 are complete, but the executors must be retrained.**
+  Executors with seven, sixteen and eighteen skills were trained and
+  evaluated on a JupyterHub machine that has since been shut down, and its
+  `runs/` went with it. The registry now has twenty-two skills, one per
+  Craftax-Classic achievement, so the next step is to train the
+  twenty-two-skill executor on Runpod (see [Runpod](#runpod)).
 - **Phase 4, the per-turn planner, is closed.** No per-turn VLM condition
   reached the collect-first scripted plan on the stone-pickaxe chain. The
   plan veto did, as an upper bound.
@@ -67,10 +66,19 @@ As of November 6, 2026:
   all three chains, on seeds 51 and 202. That matches the formal goal and does
   at least as well as the plan veto, without either privileged input. See
   [Phase 4b results](#phase-4b-results).
-- **On the open-ended task, the seven skills cap the score.** The scripted
-  curriculum reaches about 7 of the 7 achievements its skills unlock.
-  Qwen3-VL-8B sub-goals come close but do not beat it. They do beat per-turn
-  skill choice when creatures are on.
+- **On the open-ended task, sub-goals beat per-turn skill choice, and the
+  VLM ties the curriculum.** With the eighteen-skill executor and
+  Qwen3-VL-8B, both sub-goal designs reach about 13 achievements per episode
+  with creatures off, of the 15 possible without them, about 3 more than
+  SayCan on seeds 51 and 202. The VLM does not beat the scripted curriculum.
+- **With creatures on, survival limits the score.** Sheltering at night and
+  letting the goal source choose its fights raised the sub-goal designs
+  from about 10.5 to about 12 achievements on seed 51, but 13 to 16 of 16
+  episodes still die. Staged fights show the executor fights zombies as well
+  as a scripted chase, so the deaths come from fighting at low health.
+  Showing the VLM the measured fight odds did not change its choices in the
+  one run so far. The odds of not fighting were added after it and have not
+  run.
 - **Not yet run:** the VLM feasibility study, skill-model learning, and the
   observation ablation.
 - **Phase 5's structured memory is built**, as the Phase 4b episode memory.
@@ -275,8 +283,8 @@ handles the first `num_skills` skills of the registry:
 
 - **Six original skills:** `collect_wood`, `collect_stone`, `drink_water`,
   `place_table`, `craft_wood_pickaxe` and `craft_wood_sword`.
-- **`craft_stone_pickaxe`, with `num_skills: 7`.** This is the executor in
-  use.
+- **`craft_stone_pickaxe`, with `num_skills: 7`.** The executor of the
+  Phase 4b chain results.
 - **Nine more, with `num_skills: 16`:**
   - `craft_stone_sword`
   - `collect_coal`
@@ -308,11 +316,11 @@ Episodes pay one sparse reward on success. The executors are trained on the
 the cleared view, the single target, the minimal inventory and the dawn
 start. That closed the plan-order gap of the baseline executor,
 `runs/skill-ppo-local-1m`, from +0.359 to -0.016, and that executor is kept
-as the paired reference. The selected seven-skill executor is recorded in
-`runs/executor-improvement-stone_pickaxe/selected_executor.json` by notebook
-07. On its own skills it is not the ceiling: on the stone-pickaxe chain the
-scripted oracle succeeds in 62 of 64 episodes and the collect-first plan in
-64.
+as the paired reference. Notebook 07 records the executor it selects under
+each preset in `runs/executor-improvement-<preset>/selected_executor.json`,
+which notebook 08 loads. The seven-skill executor was not the ceiling on its
+own skills: on the stone-pickaxe chain the scripted oracle succeeded in 62
+of 64 episodes and the collect-first plan in 64.
 
 The chain worlds clear creatures and switch spawning off, so the executor was
 trained without them. Clearing zeroes each creature's health as well as its
@@ -466,57 +474,72 @@ discriminate. The open-ended task carries the comparison forward.
 
 ### Open-ended achievements
 
-Notebook 08 ran the seven-skill executor with the `image_and_state`
-observation, 16 episodes per design and setting, and an 80-skill budget.
+Notebook 08 ran the eighteen-skill executor (`eighteen_skill`,
+`randomized-seed0`) with Qwen3-VL-8B, the `image_and_state` observation, 16
+episodes per design and setting, and an 80-skill budget. The seven- and
+sixteen-skill results are in the
+[archive](ARCHIVE.md#readme-material-moved-on-november-7-2026).
 
-**Achievements per episode, creatures off / on.** The cap is 7.
+**Achievements per episode, creatures off / on.** With creatures off, 15 of
+the 18 achievements are possible.
 
-| Design | 2B, seed 51 | 8B, seed 51 | 8B, seed 202 |
-| --- | ---: | ---: | ---: |
-| `saycan_recipe_aware` | 5.06 / 3.94 | 6.88 / 5.75 | 6.94 / 5.62 |
-| `subgoal_vlm` | 6.38 / 6.44 | 7.00 / 6.88 | 6.69 / 6.50 |
-| `subgoal_scripted`, the bar | 6.88 / 6.94 | 6.88 / 6.94 | 7.06 / 6.88 |
-| VLM calls per episode, `subgoal_vlm` | 7.1 / 7.0 | 6.8 / 6.2 | 7.6 / 6.2 |
-| VLM calls per episode, `saycan_recipe_aware` | 38.9 / 20.8 | 41.2 / 23.2 | 37.0 / 17.9 |
+| Design | Seed 51 | Seed 202 |
+| --- | ---: | ---: |
+| `saycan_recipe_aware` | 10.12 / 8.00 | 10.12 / 7.81 |
+| `subgoal_vlm` | 12.94 / 12.06 | 13.06 / 8.12 |
+| `subgoal_scripted`, the bar | 13.19 / 11.38 | 13.19 / 8.75 |
+| Deaths with creatures on, of 16 (SayCan, VLM, curriculum) | 16, 16, 15 | 16, 16, 16 |
 
-The 2B runs are at `d8e4d70`, the 8B runs at `5209982` (seed 51) and
-`7853c8d` (seed 202). The curriculum calls no VLM, and its seed-51 results
-are identical across the 2B and 8B runs.
+Seed 202 ran at `efdbc67`, before the survival changes: the zombie defence,
+restocking at 5, sheltering at night and the goal source's fight and shelter
+choices. Seed 51's creatures-on runs are at `a072361`, with all of them, and
+its creatures-off sub-goal runs at `dbed69e`; those changes act only on
+creatures, apart from restocking. Seed 202 has not been rerun with them.
 
 What they show:
 
-- **The 8B model helps both VLM designs.** On seed 51, SayCan gains 1.8
-  achievements per episode in both settings, and the sub-goal VLM gains 0.4
-  to 0.6.
-- **No VLM design beats the scripted curriculum.** Paired by world, the 8B
-  sub-goal VLM against the curriculum is:
-  - 2 better against 1 worse with creatures off, and 1 against 2 with them
-    on, on seed 51;
-  - 1 against 5 off and 1 against 4 on, on seed 202.
+- **Sub-goals beat per-turn choice with creatures off.** Paired by world,
+  the sub-goal VLM gains +3.25 ± 0.71 achievements over SayCan on seed 51
+  and +2.94 ± 0.52 on seed 202, on the earlier code, winning 14 worlds
+  against 1 and 13 against 0. The curriculum gains about as much.
+- **The VLM ties the curriculum.** VLM minus curriculum is +0.44 ± 0.33 and
+  -0.12 ± 0.40 with creatures off. With creatures on at `a072361`, the VLM
+  is better in 8 worlds and worse in 4 (p = 0.39).
+- **Creatures on, the survival changes help the sub-goal designs.** On seed
+  51 the VLM rose from 10.44 achievements per episode before them to 12.06,
+  and the curriculum from 10.50 to 11.38. SayCan, which they do not touch,
+  beats neither: the VLM wins 13 worlds against 2 (p = 0.007).
+- **Shelter is where the VLM's choices differ.** On seed 51 its shelters
+  lasted the night in 12 of 14 nights, against the curriculum's 4 of 11. It
+  often sheltered straight after drinking, by water, so it could drink
+  inside. It never chose to drink first and shelter after, and it accepted
+  32 of 34 fights.
+- **Fights are where the player dies.** In the `a072361` run, 12 of the
+  curriculum's 16 deaths came during `defeat_zombie`, and 7 of the VLM's,
+  with 5 more thirsty at night.
+- **The executor fights as well as a scripted chase.** Notebook 08's staged
+  fights (`11e8c0f`, 50 rollouts per cell) put the player near a zombie at
+  set health, sword, distance and time of day. The executor won 0.73,
+  against 0.75 for a scripted chase-and-hit, and matched it in every cell.
+  At health 2 it always lost; from 5 up it won 0.8 to 1.0. Against
+  skeletons it won 0.37 against the chase's 0.66, timing out more often
+  than dying. Night changed nothing, since the environment spawns no extra
+  creatures.
+- **The VLM does not decide by the odds.** With the measured win and death
+  rates in its prompt (`648eca2`, seed 51), it declined 12 of 71 fights, 10
+  of them at a win rate of 0.75 or more, mostly to drink. The zombie
+  followed, and deaths moved from fights (10 to 6) to drinking (2 to 6).
+  Achievements per episode were 11.81, against 11.94 just before. The
+  prompt then said walking away had not been measured; `623f115` adds the
+  measured odds of drinking or collecting wood with zombies close, and has
+  not run yet.
+- **The Crafter score misleads at a cap.** Its geometric mean over 22
+  achievements rewards rare incidental unlocks, so we report achievements
+  per episode first.
 
-  None is significant (p ≥ 0.22). Both sit at the cap, which leaves the VLM
-  no room to win.
-- **With creatures on, sub-goals beat per-turn choice.** The 8B sub-goal VLM
-  beats SayCan 11 against 1 on seed 51 (p = 0.006) and 11 against 2 on seed
-  202 (p = 0.022). SayCan loses to the curriculum 1 against 13 and 1 against
-  12 (p ≤ 0.003). With creatures off, no difference is significant.
-- **SayCan dies in every episode.** It spends its decisions on surplus wood,
-  stone and pickaxes: on seed 202 with creatures off, 277 of its 592
-  requests were `collect_wood`, and 16 were `drink_water`. With creatures
-  off it dies near step 340, and every episode's last skill ends on a lost
-  precondition.
-- **The sub-goal designs stop when nothing reachable is left.** The VLM's
-  last proposal is usually an iron sword or iron pickaxe, which the planner
-  rejects because no skill produces it: in 7 to 10 of 16 episodes per
-  setting. The curriculum stops when its list runs out.
-- **The Crafter score misleads at this cap.** Its geometric mean over 22
-  achievements rewards rare incidental unlocks: a sapling, a placed stone, a
-  furnace, coal or iron, picked up on the way to something else. SayCan's
-  longer episodes collect more of these, so it has the highest score with
-  creatures off (6.43 and 5.35). It does not have the most achievements per
-  episode. We report achievements per episode first.
-
-Results and manifests are in `runs/open-ended/seed<N>-<timestamp>/`.
+Results and manifests are in `runs/open-ended/seed<N>-<timestamp>/`, and the
+staged fights in `runs/open-ended/fights-<timestamp>/`, on the machine that
+ran them.
 
 ## Refuted approaches
 
@@ -555,14 +578,14 @@ All of them are implemented and tested on CPU with stub backends.
    chains, so check the combat and iron skills in the per-skill training
    table before going on. Compare each against its scripted baseline in
    notebook 03.
-2. **The open-ended task with sixteen skills.** Run notebook 08 with
-   `EXECUTOR_PRESET = "sixteen_skill"` and Qwen3-VL-8B, on seed 51, then on
-   seed 202. The cap rises from 7 to 16, which gives the VLM room to beat the
-   curriculum. The competence prior is refitted over the whole catalog and
-   saved under its own name. Then repeat with `EXECUTOR_PRESET =
-   "twenty_two_skill"`, which raises the cap to 22. Iron and diamond lie in
-   caves and mountains, usually out of view, so the cap may stay out of
-   reach for want of exploration rather than of skill.
+2. **The open-ended task with twenty-two skills.** Run notebook 08 with
+   `EXECUTOR_PRESET = "twenty_two_skill"` and Qwen3-VL-8B, on seed 51, then
+   on seed 202, which has not run with the survival changes. The cap rises
+   to 22. Notebook 08 measures the competence prior and the fight and
+   errand odds for the new executor first. Iron and diamond lie in caves
+   and mountains, usually out of view, so the cap may stay out of reach for
+   want of exploration rather than of skill. Check whether the errand odds
+   change the VLM's fight choices.
 3. **The feasibility study.** Notebook 06, section "Can the VLM judge when a
    skill will succeed?", after the paired probes. It is
    the reverse of the Can term: the VLM rates every skill from 0 to 10 for
@@ -616,19 +639,17 @@ these.
 | --- | --- | --- |
 | 1. Environment and baseline | A reproducible Craftax PPO-RNN setup with throughput and memory measured | Complete |
 | 2. Skill benchmark | Skills with preconditions, success predicates, sparse rewards, and scripted and random baselines | Complete |
-| 3. Goal-conditioned executor | One policy for every skill, trained on `local_navigation`, then on the `randomized` scenario | Complete with seven, sixteen and eighteen skills; the twenty-two-skill executor is next |
+| 3. Goal-conditioned executor | One policy for every skill, trained on `local_navigation`, then on the `randomized` scenario | Trained with seven, sixteen and eighteen skills, whose checkpoints are lost; the twenty-two-skill executor is next |
 | 4. Per-turn planner | A frozen VLM in a SayCan loop, with a grounded ablation ladder | Complete; no per-turn condition reaches the bar, and the plan veto is the upper bound |
-| 4b. Sub-goal planner | VLM sub-goals, a symbolic planner, memory, richer observation, the open-ended task, and a learned skill model | Chains at the upper bound on two seeds; open-ended task at the seven-skill cap; feasibility, model learning and the observation ablation pending |
+| 4b. Sub-goal planner | VLM sub-goals, a symbolic planner, memory, richer observation, the open-ended task, and a learned skill model | Chains at the upper bound on two seeds; on the open-ended task sub-goals beat per-turn choice and the VLM ties the curriculum; feasibility, model learning and the observation ablation pending |
 | 5. Memory and visual grounding | Structured episodic memory; symbolic against pixel inputs; frame history; paraphrased instructions | Memory and the image/text ablation built; the rest not started |
-| 6. Full evaluation | The full Craftax-Classic achievement set, multi-seed ablations, compute accounting, and documented failures | Not started |
+| 6. Full evaluation | The full Craftax-Classic achievement set, multi-seed ablations, compute accounting, and documented failures | Every achievement has a skill; not started otherwise |
 
 Next steps, in order:
 
-1. **Run Experiments 1 and 2:** train the sixteen-skill executor, then run
-   the open-ended task with it.
-2. **Train the twenty-two-skill executor** with notebook 07's
-   `twenty_two_skill_smoke` and `twenty_two_skill` presets, then run the
-   open-ended task with it.
+1. **Train the twenty-two-skill executor** on Runpod with notebook 07's
+   `twenty_two_skill_smoke` and `twenty_two_skill` presets (Experiment 1).
+2. **Run the open-ended task with it** on seeds 51 and 202 (Experiment 2).
 3. **Run Experiments 3 to 5**, the feasibility study, model learning and the
    observation ablation.
 
@@ -668,7 +689,7 @@ tiny-sima-train-skills --config configs/skill_ppo_local_1m.yaml
 tiny-sima-train-skills --config configs/skill_ppo_randomized_debug.yaml
 tiny-sima-train-skills --config configs/skill_ppo_randomized_10m.yaml
 
-# Seven skills, the current executor: 112 environments, 16 per skill.
+# Seven skills: 112 environments, 16 per skill.
 tiny-sima-train-skills --config configs/skill_ppo_stone_pickaxe_randomized_debug.yaml
 tiny-sima-train-skills --config configs/skill_ppo_stone_pickaxe_randomized_10m.yaml
 
@@ -768,7 +789,7 @@ provenance was recorded are always rerun.
 Provenance cannot see code. Each result also records the commit it ran at, so
 rerun a baseline whose own code changed, such as the per-turn VLM prompt.
 
-### JupyterHub
+### Notebook setup
 
 The first cell of every notebook except `02_evaluate_baseline` does the
 setup:
@@ -788,7 +809,7 @@ not always stop its kernel.
 
 ### Runpod
 
-The same setup cell works in a Runpod Jupyter pod:
+The project now runs in a Runpod Jupyter pod, with the same setup cell:
 
 - Use an image with Python 3.11 or 3.12 and a GPU with 40 to 48 GB, which
   the 8B VLM in notebook 08 needs.
