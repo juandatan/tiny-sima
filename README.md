@@ -809,16 +809,44 @@ not always stop its kernel.
 
 ### Runpod
 
-The project now runs in a Runpod Jupyter pod, with the same setup cell:
+The project runs on a Runpod pod:
 
 - Use an image with Python 3.11 or 3.12 and a GPU with 40 to 48 GB, which
   the 8B VLM in notebook 08 needs.
 - Clone the repository under `/workspace`, the persistent volume, so
-  `runs/` and the Hugging Face cache survive a pod restart.
+  `runs/` and the Hugging Face cache survive the pod stopping.
 - Run notebook 07 before 08. A fresh pod has no `runs/`, so notebook 07
   retrains the paired baseline, then trains and selects the executor that
   notebook 08 loads. Notebook 08 then measures the competence prior and the
   fight odds for that executor.
+
+To run them headless, and stop the pod when they end, start them from a
+terminal on the pod:
+
+```bash
+cd /workspace/tiny-sima
+bash scripts/runpod_run.sh \
+    notebooks/07_improve_executor.ipynb \
+    notebooks/08_open_ended_achievements.ipynb
+```
+
+- It creates `/workspace/tiny-sima-venv` with Python 3.12, or 3.11, on the
+  first run. A stopped pod loses its container disk, so packages installed
+  into the image's Python would have to be reinstalled on every run.
+- It runs `scripts/run_notebooks.py` under `nohup`, so closing the terminal
+  or the browser does not end the run.
+- Each notebook runs in a fresh kernel and is saved after every cell under
+  `runs/notebook-runs/<timestamp>/`. Open the saved copy to follow progress.
+  The log is in `runs/notebook-runs/<timestamp>.log`.
+- The first failing notebook ends the run, with its outputs up to the error
+  kept.
+- However the run ends, by finishing, failing or being killed, it then runs
+  `runpodctl stop pod $RUNPOD_POD_ID`. Pass `--keep-pod` to leave the pod
+  running.
+- `--set NAME=VALUE` replaces a one-line assignment in the notebooks before
+  they run, and fails before running anything if no notebook has one. For
+  example, `--set EVALUATION_SEED=202` runs notebook 08 on seed 202, and
+  `--set PRESET='"twenty_two_skill_smoke"'` runs notebook 07's smoke preset.
 
 ## Evaluation principles
 

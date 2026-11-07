@@ -30,6 +30,7 @@ notebook = [
     "ipykernel>=6.29,<8",
     "jupyterlab>=4.3,<5",
     "matplotlib>=3.9,<4",
+    "nbclient>=0.10,<1",
     "nbformat>=5.10,<6",
 ]
 cuda12 = [
