@@ -110,6 +110,18 @@ def run_notebook(
     import nbformat
     from nbclient import NotebookClient
 
+    class EchoingClient(NotebookClient):
+        """Log each line a cell prints as it arrives, not when the cell ends."""
+
+        def output(self, outs, msg, display_id, cell_index):
+            out = super().output(outs, msg, display_id, cell_index)
+            # stdout only: stderr carries progress bars redrawn many times a second.
+            if out is not None and out.get("name") == "stdout":
+                for line in out["text"].splitlines():
+                    if line.strip():
+                        log(f"{path.name} [{cell_index}] {line}")
+            return out
+
     output_path = output_dir / path.name
     code_cells = sum(cell.cell_type == "code" for cell in notebook.cells)
     started = time.perf_counter()
@@ -125,7 +137,7 @@ def run_notebook(
         progress = f"{executed} of {code_cells} code cells"
         log(f"{path.name}: cell {cell_index} done, {progress}, {elapsed:.0f}s")
 
-    client = NotebookClient(
+    client = EchoingClient(
         notebook,
         timeout=timeout,
         # The kernel of this interpreter: the notebooks' own kernelspec names

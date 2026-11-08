@@ -60,7 +60,9 @@ def test_overrides_replace_only_one_line_assignments() -> None:
         run_notebooks.parse_overrides(["SEED"])
 
 
-def test_a_finished_run_saves_the_outputs_and_stops_the_pod(tmp_path, pod) -> None:
+def test_a_finished_run_saves_the_outputs_and_stops_the_pod(
+    tmp_path, pod, capsys
+) -> None:
     first = _notebook(tmp_path / "first.ipynb", "SEED = 51", "print(SEED * 2)")
     second = _notebook(tmp_path / "second.ipynb", "print('second')")
     output_dir = tmp_path / "out"
@@ -72,6 +74,8 @@ def test_a_finished_run_saves_the_outputs_and_stops_the_pod(tmp_path, pod) -> No
     assert status == 0
     executed = nbformat.read(output_dir / "first.ipynb", as_version=4)
     assert executed.cells[1].outputs[0]["text"] == "404\n"
+    # Printed lines reach the log while the run goes, tagged with their cell.
+    assert "first.ipynb [1] 404" in capsys.readouterr().out
     assert (output_dir / "second.ipynb").is_file()
     assert _stops(pod) == ["stop pod pod-123"]
 
