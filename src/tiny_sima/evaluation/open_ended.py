@@ -59,6 +59,7 @@ from tiny_sima.planner.subgoals import (
     open_ended_subgoal_fields,
 )
 from tiny_sima.planner.symbolic import SkillModel
+from tiny_sima.planner.vital_rates import VitalRates
 from tiny_sima.planner.vlm import (
     PlannerPromptStyle,
     VisionLanguageBackend,
@@ -72,8 +73,11 @@ DEFAULT_MAX_ENVIRONMENT_STEPS = 3000
 # view's row radius, so anything visible above or below counts.
 DEFAULT_THREAT_RADIUS = 3
 # A skill hands back to the planner when a zombie comes that close or the
-# player is hurt, so the planners can fight it off mid-skill.
-DEFAULT_INTERRUPTION = SkillInterruption(threat_radius=DEFAULT_THREAT_RADIUS)
+# player is hurt, so the planners can fight it off mid-skill, and a fight
+# hands back at each hit, so the goal source can weigh it again.
+DEFAULT_INTERRUPTION = SkillInterruption(
+    threat_radius=DEFAULT_THREAT_RADIUS, fights_on_hit=True
+)
 
 ACHIEVEMENT_NAMES: tuple[str, ...] = tuple(
     achievement.name.lower() for achievement in Achievement
@@ -211,12 +215,15 @@ def _mean_std(values: Sequence[float]) -> dict[str, float]:
 def curriculum_choice(choice: Mapping[str, Any]) -> str:
     """Return what the curriculum answers where a recorded choice was made.
 
-    It shelters whenever the shelter could start and always fights; see
+    It shelters at night whenever the shelter could start, never rests by
+    day, and always fights; see
     :class:`~tiny_sima.planner.goal_selector.ScriptedGoalSelector`.
     """
 
     if choice["kind"] == "fight":
         return "true"
+    if choice["kind"] == "rest":
+        return "no"
     return "now" if choice["possible"] else "no"
 
 
@@ -244,7 +251,7 @@ def summarize_choices(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """
 
     summary: dict[str, Any] = {}
-    for kind in ("shelter", "fight"):
+    for kind in ("shelter", "rest", "fight"):
         answers = [
             choice
             for record in records
@@ -422,6 +429,8 @@ def open_ended_planners(
     shelter_at_night: bool = True,
     choose_fights: bool = True,
     fight_odds: FightOdds | None = None,
+    vital_rates: VitalRates | None = None,
+    informed: bool = True,
 ) -> dict[str, SkillPlanner]:
     """Return the three designs, built as notebook 06 builds its planners.
 
@@ -436,6 +445,11 @@ def open_ended_planners(
     what the prompt says; the curriculum always fights and shelters
     whenever it can. ``fight_odds``, the executor's measured fight odds,
     are shown to the VLM with the close threats.
+
+    With ``informed`` both goal sources read the whole status bar, are
+    asked again when the player is hit with a zombie close, and may shelter
+    by day to rest; the VLM also gets the game's general rules and, with
+    ``vital_rates``, the vital rates measured in staged play.
     """
 
     feasibility = prior if prior is not None else reachability_feasibility
@@ -464,6 +478,9 @@ def open_ended_planners(
             defend_against=("zombie",),
             shelter_at_night=shelter_at_night,
             choose_fights=choose_fights,
+            show_status=informed,
+            replan_when_hurt=informed,
+            rest_by_day=informed,
             **options,
         )
 
@@ -479,7 +496,11 @@ def open_ended_planners(
             candidate_skills=candidate_skills,
         ),
         "subgoal_vlm": subgoal_planner(
-            backend, fallback=curriculum(), fight_odds=fight_odds
+            backend,
+            fallback=curriculum(),
+            fight_odds=fight_odds,
+            manual=informed,
+            vital_rates=vital_rates if informed else None,
         ),
         "subgoal_scripted": subgoal_planner(curriculum()),
     }

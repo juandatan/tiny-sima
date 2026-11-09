@@ -52,6 +52,7 @@ from tiny_sima.executor.model import (
 )
 from tiny_sima.goals import (
     ALL_SKILL_IDS,
+    MAX_VITAL,
     SKILL_IDS,
     SKILL_MOBS,
     STONE_PICKAXE_SKILL_IDS,
@@ -159,9 +160,7 @@ def _wood_to_stone_valid_next_skills(state: Any) -> tuple[SkillId, ...]:
     wood = int(np.asarray(inventory.wood))
     stone = int(np.asarray(inventory.stone))
     wood_pickaxe = int(np.asarray(inventory.wood_pickaxe))
-    has_table = bool(
-        np.any(np.asarray(state.map) == BlockType.CRAFTING_TABLE.value)
-    )
+    has_table = bool(np.any(np.asarray(state.map) == BlockType.CRAFTING_TABLE.value))
     if wood_pickaxe > 0 and stone > 0:
         return ()
     if wood_pickaxe > 0:
@@ -218,9 +217,7 @@ def _stone_pickaxe_valid_next_skills(state: Any) -> tuple[SkillId, ...]:
     stone = int(np.asarray(inventory.stone))
     wood_pickaxe = int(np.asarray(inventory.wood_pickaxe))
     stone_pickaxe = int(np.asarray(inventory.stone_pickaxe))
-    has_table = bool(
-        np.any(np.asarray(state.map) == BlockType.CRAFTING_TABLE.value)
-    )
+    has_table = bool(np.any(np.asarray(state.map) == BlockType.CRAFTING_TABLE.value))
     if stone_pickaxe > 0:
         return ()
     needs_wood_pickaxe = wood_pickaxe == 0 and stone == 0
@@ -250,8 +247,7 @@ def _stone_pickaxe_valid_next_skills(state: Any) -> tuple[SkillId, ...]:
 WOOD_TO_STONE_PICKAXE_CHAIN = SkillChainSpec(
     name="wood_to_stone_pickaxe",
     objective=(
-        "Craft a wooden pickaxe, use it to collect stone, and craft a stone "
-        "pickaxe."
+        "Craft a wooden pickaxe, use it to collect stone, and craft a stone pickaxe."
     ),
     reference_skills=(
         SkillId.COLLECT_WOOD,
@@ -425,12 +421,8 @@ class ChainStepTrace:
             "utility": float(self.utility),
             "feasibility": float(self.feasibility),
             "combined_score": float(self.combined_score),
-            "accepted_skills": [
-                skill_id.value for skill_id in self.accepted_skills
-            ],
-            "planner_ranking": [
-                skill_id.value for skill_id in self.planner_ranking
-            ],
+            "accepted_skills": [skill_id.value for skill_id in self.accepted_skills],
+            "planner_ranking": [skill_id.value for skill_id in self.planner_ranking],
             "planner_raw_response": self.planner_raw_response,
             "candidate_scores": [
                 {
@@ -562,11 +554,14 @@ class SkillInterruption:
     tiles (Chebyshev) after none was. The planner decides only between
     skills, so without this a zombie that turns up mid-skill can hit the
     player until the skill's horizon runs out. A skill that hunts one of
-    ``mobs`` is never interrupted: the fight is the answer to both.
+    ``mobs`` is not interrupted by one arriving, since the fight is the
+    answer to that; with ``fights_on_hit`` it is interrupted when the player
+    is hit, so the planner can weigh the fight again at the lower health.
     """
 
     threat_radius: int = 3
     mobs: tuple[str, ...] = ("zombie",)
+    fights_on_hit: bool = False
 
     def exempts(self, skill_id: SkillId) -> bool:
         """Whether ``skill_id`` runs on regardless."""
@@ -574,7 +569,11 @@ class SkillInterruption:
         return SKILL_MOBS.get(skill_id) in self.mobs
 
     def to_dict(self) -> dict[str, Any]:
-        return {"threat_radius": self.threat_radius, "mobs": list(self.mobs)}
+        return {
+            "threat_radius": self.threat_radius,
+            "mobs": list(self.mobs),
+            "fights_on_hit": self.fights_on_hit,
+        }
 
 
 def _threat_near(interruption: SkillInterruption, state: Any) -> jax.Array:
@@ -597,8 +596,12 @@ def _interrupts(
     interruption: SkillInterruption,
     previous: Any,
     state: Any,
+    hunting: Any = False,
 ) -> jax.Array:
-    """Return whether the step from ``previous`` to ``state`` interrupts."""
+    """Return whether the step from ``previous`` to ``state`` interrupts.
+
+    ``hunting`` says the running skill hunts one of the interruption's mobs.
+    """
 
     # Health lost to an empty need is the planner's to answer at the next
     # boundary, as before.
@@ -610,7 +613,8 @@ def _interrupts(
         jnp.asarray(state.player_health) < jnp.asarray(previous.player_health)
     )
     arrived = _threat_near(interruption, state) & ~_threat_near(interruption, previous)
-    return hurt | arrived
+    hunting = jnp.asarray(hunting)
+    return (hurt & (~hunting | interruption.fights_on_hit)) | (arrived & ~hunting)
 
 
 class SkillExecutor(Protocol):
@@ -861,7 +865,7 @@ class ScriptedSkillExecutor:
         native_return = 0.0
         minimum, maximum = start, start
         current = episode_state
-        interruptible = interruption is not None and not interruption.exempts(skill_id)
+        hunting = interruption is not None and interruption.exempts(skill_id)
         step_keys = jax.random.split(rng, horizon)
         for step_index in range(horizon):
             action = _scripted_action(current.env_state, skill_id)
@@ -878,10 +882,12 @@ class ScriptedSkillExecutor:
             maximum = tuple(map(max, maximum, counts))
             outcome = _outcome_from_step(result)
             if (
-                interruptible
+                interruption is not None
                 and outcome in (None, SkillOutcome.TIMEOUT)
                 and bool(
-                    _interrupts(interruption, previous.env_state, current.env_state)
+                    _interrupts(
+                        interruption, previous.env_state, current.env_state, hunting
+                    )
                 )
             ):
                 outcome = SkillOutcome.INTERRUPTED
@@ -993,7 +999,9 @@ def _run_shelter(
 
     It runs to its own horizon, which spans a night, rather than the chain's
     skill horizon. It succeeds once the player is out again in the morning
-    and loses its precondition when food or drink runs low first.
+    and loses its precondition when food or drink runs low first. Started
+    by day it rests instead, and succeeds once the player is out again with
+    its health full.
     """
 
     start = _inventory_counts(state)
@@ -1001,16 +1009,17 @@ def _run_shelter(
     native_return = 0.0
     step = _compiled_step(environment.bundle.env)
     room = None
-    outcome = SkillOutcome.INFEASIBLE if not shelter_feasible(state) else None
+    rest = not is_night(state)
+    outcome = None if shelter_feasible(state, by_day=True) else SkillOutcome.INFEASIBLE
     horizon = get_skill_spec(SkillId.SHELTER).default_horizon
     keys = jax.random.split(rng, horizon)
     steps = 0
     while outcome is None and steps < horizon:
-        action, room = shelter_action(state, room)
+        action, room = shelter_action(state, room, rest)
         if action is None:
             if needs_low(state):
                 outcome = SkillOutcome.PRECONDITION_LOST
-            elif is_night(state):
+            elif is_night(state) or (rest and int(state.player_health) < MAX_VITAL):
                 outcome = SkillOutcome.INFEASIBLE
             else:
                 outcome = SkillOutcome.SUCCESS
@@ -1162,8 +1171,7 @@ class LearnedSkillExecutor:
                 outcome=PROBE_OUTCOMES[int(output.outcome[index])],
                 steps=int(output.steps[index]),
                 skill_return=float(
-                    PROBE_OUTCOMES[int(output.outcome[index])]
-                    is SkillOutcome.SUCCESS
+                    PROBE_OUTCOMES[int(output.outcome[index])] is SkillOutcome.SUCCESS
                 ),
                 native_return=float(output.native_return[index]),
                 inventory_extremes=_inventory_extremes(
@@ -1265,11 +1273,14 @@ def _record_skill_failures(
 ) -> tuple[jax.Array, jax.Array]:
     """Accumulate failures across every occurrence of each requested skill."""
 
-    failure_delta = jax.nn.one_hot(
-        skill_ids,
-        failures_by_skill.shape[1],
-        dtype=jnp.int32,
-    ) * failed[:, None]
+    failure_delta = (
+        jax.nn.one_hot(
+            skill_ids,
+            failures_by_skill.shape[1],
+            dtype=jnp.int32,
+        )
+        * failed[:, None]
+    )
     updated = failures_by_skill + failure_delta
     selected_failures = jnp.take_along_axis(
         updated,
@@ -1320,15 +1331,9 @@ def _make_batched_chain_rollout(
     )
     max_primitive_steps = max_decisions * skill_horizon
     success_code = list(ChainTermination).index(ChainTermination.SUCCESS)
-    no_viable_code = list(ChainTermination).index(
-        ChainTermination.NO_VIABLE_SKILL
-    )
-    failure_limit_code = list(ChainTermination).index(
-        ChainTermination.FAILURE_LIMIT
-    )
-    decision_limit_code = list(ChainTermination).index(
-        ChainTermination.DECISION_LIMIT
-    )
+    no_viable_code = list(ChainTermination).index(ChainTermination.NO_VIABLE_SKILL)
+    failure_limit_code = list(ChainTermination).index(ChainTermination.FAILURE_LIMIT)
+    decision_limit_code = list(ChainTermination).index(ChainTermination.DECISION_LIMIT)
 
     def rollout(
         params: Any,
@@ -1425,11 +1430,7 @@ def _make_batched_chain_rollout(
                 & at_option_boundary
                 & (plan_exhausted | ~precondition)
             )
-            active = (
-                ~carry.finished
-                & ~decision_limit_reached
-                & ~no_viable_skill
-            )
+            active = ~carry.finished & ~decision_limit_reached & ~no_viable_skill
             # Retries reuse a plan step, so a step whose outcome is already
             # set is not a first attempt and must not overwrite its record.
             first_attempt = carry.first_outcome[episode_rows, safe_plan_index] < 0
@@ -1497,15 +1498,11 @@ def _make_batched_chain_rollout(
                 skill_ids,
                 failed,
             )
-            failure_limit = failed & (
-                selected_failures >= max_failures_per_skill
-            )
+            failure_limit = failed & (selected_failures >= max_failures_per_skill)
 
             precondition_after = _batched_skill_precondition(skill_ids, state)
             retry_is_infeasible = (
-                failed
-                & ~failure_limit
-                & (~precondition_after | environment_terminated)
+                failed & ~failure_limit & (~precondition_after | environment_terminated)
             )
             # Outcome codes follow the probe so the two can be compared.
             outcome_code = jnp.where(timeout, timeout_outcome, terminated_outcome)
@@ -1522,9 +1519,7 @@ def _make_batched_chain_rollout(
                 outcome_code,
             )
             record_outcome = (option_ended | infeasible_start) & first_attempt
-            first_outcome = carry.first_outcome.at[
-                episode_rows, safe_plan_index
-            ].set(
+            first_outcome = carry.first_outcome.at[episode_rows, safe_plan_index].set(
                 jnp.where(
                     record_outcome,
                     outcome_code,
@@ -1589,13 +1584,9 @@ def _make_batched_chain_rollout(
                 finished=finished,
                 succeeded=carry.succeeded | chain_succeeded,
                 termination=termination,
-                completed_skills=(
-                    carry.completed_skills + success.astype(jnp.int32)
-                ),
+                completed_skills=(carry.completed_skills + success.astype(jnp.int32)),
                 decisions=carry.decisions + option_ended.astype(jnp.int32),
-                environment_steps=(
-                    carry.environment_steps + active.astype(jnp.int32)
-                ),
+                environment_steps=(carry.environment_steps + active.astype(jnp.int32)),
                 native_return=(
                     carry.native_return
                     + jnp.where(active, environment_step.reward, 0.0)
@@ -1714,18 +1705,14 @@ def evaluate_learned_skill_chain_batched(
     last_failed_skills = np.asarray(output.last_failed_skill)
     termination_counts = {
         termination.value: int(
-            np.count_nonzero(
-                terminations == list(ChainTermination).index(termination)
-            )
+            np.count_nonzero(terminations == list(ChainTermination).index(termination))
         )
         for termination in ChainTermination
         if termination not in _OPEN_ENDED_TERMINATIONS
     }
     final_failed_skill_counts = {
         skill_id.value: int(
-            np.count_nonzero(
-                ~succeeded & (last_failed_skills == skill_index(skill_id))
-            )
+            np.count_nonzero(~succeeded & (last_failed_skills == skill_index(skill_id)))
         )
         for skill_id in ALL_SKILL_IDS
         if np.any(~succeeded & (last_failed_skills == skill_index(skill_id)))
@@ -1735,22 +1722,16 @@ def evaluate_learned_skill_chain_batched(
     result: dict[str, Any] = {
         "chain": chain.name,
         "objective": chain.objective,
-        "reference_skills": [
-            skill.value for skill in chain.reference_skills
-        ],
+        "reference_skills": [skill.value for skill in chain.reference_skills],
         "plan": [skill.value for skill in plan_skills],
         "num_episodes": num_episodes,
         "seed": seed,
         "batched": True,
         "compile_cache_hit": compile_cache_hit,
         "success_rate": float(succeeded.mean()),
-        "mean_completed_skills": float(
-            np.asarray(output.completed_skills).mean()
-        ),
+        "mean_completed_skills": float(np.asarray(output.completed_skills).mean()),
         "mean_decisions": float(np.asarray(output.decisions).mean()),
-        "mean_environment_steps": float(
-            np.asarray(output.environment_steps).mean()
-        ),
+        "mean_environment_steps": float(np.asarray(output.environment_steps).mean()),
         "mean_native_return": float(np.asarray(output.native_return).mean()),
         "termination_counts": termination_counts,
         "final_failed_skill_counts": final_failed_skill_counts,
@@ -1763,15 +1744,11 @@ def evaluate_learned_skill_chain_batched(
             list(ChainTermination)[int(code)].value for code in terminations
         ],
         "first_attempt_outcomes": [
-            [
-                None if code < 0 else PROBE_OUTCOMES[int(code)].value
-                for code in row
-            ]
+            [None if code < 0 else PROBE_OUTCOMES[int(code)].value for code in row]
             for row in first_outcomes
         ],
         "first_attempt_steps": [
-            [None if steps < 0 else int(steps) for steps in row]
-            for row in first_steps
+            [None if steps < 0 else int(steps) for steps in row] for row in first_steps
         ],
     }
     if record_boundaries:
@@ -1869,6 +1846,7 @@ BatchedSkillPolicy = Callable[[jax.Array, Any], jax.Array]
 # module-level for the same reason.
 BatchedProbeRecorder = Callable[[jax.Array, Any], Any]
 
+
 @lru_cache(maxsize=16)
 def _make_batched_skill_probe(
     *,
@@ -1917,11 +1895,11 @@ def _make_batched_skill_probe(
         record = None
         if recorder is not None:
             record = jax.tree_util.tree_map(
-                lambda first: jnp.zeros(
-                    (skill_horizon + 1, *first.shape), dtype=first.dtype
-                )
-                .at[0]
-                .set(first),
+                lambda first: (
+                    jnp.zeros((skill_horizon + 1, *first.shape), dtype=first.dtype)
+                    .at[0]
+                    .set(first)
+                ),
                 recorder(skill_ids, states),
             )
         initial_carry = BatchedProbeCarry(
@@ -2273,8 +2251,9 @@ def _batched_skill_execution(
     terminated_code = PROBE_OUTCOMES.index(SkillOutcome.ENVIRONMENT_TERMINATED)
     infeasible_code = PROBE_OUTCOMES.index(SkillOutcome.INFEASIBLE)
     interrupted_code = PROBE_OUTCOMES.index(SkillOutcome.INTERRUPTED)
-    # Indexed by executor skill index.
-    exempt = jnp.asarray(
+    # Indexed by executor skill index: whether the skill hunts a mob the
+    # interruption watches for.
+    hunting = jnp.asarray(
         [
             interruption is not None and interruption.exempts(skill_id)
             for skill_id in ALL_SKILL_IDS
@@ -2292,9 +2271,7 @@ def _batched_skill_execution(
         active: jax.Array,
         rngs: jax.Array,
     ) -> BatchedExecutionOutput:
-        step_keys = jax.vmap(
-            lambda rng: jax.random.split(rng, 2 * skill_horizon)
-        )(rngs)
+        step_keys = jax.vmap(lambda rng: jax.random.split(rng, 2 * skill_horizon))(rngs)
         runnable = active & _batched_skill_precondition(skill_ids, states)
         initial_metric = _batched_skill_metric(skill_ids, states)
         initial_carry = BatchedExecutionCarry(
@@ -2357,8 +2334,9 @@ def _batched_skill_execution(
                     running
                     & ~success
                     & ~done
-                    & ~exempt[skill_ids]
-                    & jax.vmap(partial(_interrupts, interruption))(carry.state, state)
+                    & jax.vmap(partial(_interrupts, interruption))(
+                        carry.state, state, hunting[skill_ids]
+                    )
                 )
             timeout = running & ~success & ~interrupted & (steps >= skill_horizon)
             ended = success | timeout | terminated | interrupted
@@ -2773,10 +2751,7 @@ def evaluate_skill_chain(
         if failed_trace is not None
     ]
     final_failed_skill_counts = dict(
-        Counter(
-            trace.requested_skill.value
-            for trace in final_failure_traces
-        )
+        Counter(trace.requested_skill.value for trace in final_failure_traces)
     )
     final_failure_outcome_counts = dict(
         Counter(trace.outcome.value for trace in final_failure_traces)
@@ -2836,6 +2811,7 @@ def compare_paired_successes(
 def _episode_successes(result: dict[str, Any]) -> list[bool]:
     if "episode_successes" in result:
         return [bool(value) for value in result["episode_successes"]]
+
     # Episodes are ChainEpisodeResult objects, or their records once saved.
     def succeeded(episode: Any) -> bool:
         if isinstance(episode, Mapping):

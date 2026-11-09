@@ -4,17 +4,23 @@ import pytest
 from craftax.craftax_classic.constants import BlockType
 
 from tests.test_chains import _make_random_learned_executor
+from tiny_sima.config import SkillPPOConfig
 from tiny_sima.envs import make_open_ended_environment
 from tiny_sima.envs.chains import make_skill_chain_environment
 from tiny_sima.evaluation.chains import (
     ChainTermination,
+    LearnedSkillExecutor,
     ScriptedSkillExecutor,
     SkillExecutionResult,
     SkillInterruption,
     _interrupts,
     evaluate_chain_episodes,
 )
-from tiny_sima.goals import SkillId
+from tiny_sima.executor.model import (
+    initialize_goal_conditioned_parameters,
+    make_goal_conditioned_actor_critic,
+)
+from tiny_sima.goals import ALL_SKILL_IDS, SkillId
 from tiny_sima.memory import EpisodeMemory, FailureCause
 from tiny_sima.planner.saycan import (
     SayCanPlanner,
@@ -122,6 +128,56 @@ def test_the_fight_itself_is_not_interrupted() -> None:
         interruption=RULE,
     )
     assert result.outcome is SkillOutcome.SUCCESS
+
+
+def test_a_hunt_is_interrupted_by_a_hit_only_when_asked() -> None:
+    clear = _without_mobs(ENVIRONMENT.reset(jax.random.PRNGKey(0)).state)
+    near = _with_zombie(clear, (3, -3))
+    hit = clear.replace(player_health=clear.player_health - 2)
+    on_hit = SkillInterruption(threat_radius=3, fights_on_hit=True)
+    for rule in (RULE, on_hit):
+        # A zombie arriving never interrupts its own hunt.
+        assert not bool(_interrupts(rule, clear, near, True))
+    assert not bool(_interrupts(RULE, clear, hit, True))
+    assert bool(_interrupts(on_hit, clear, hit, True))
+
+
+def _all_skill_executor() -> LearnedSkillExecutor:
+    """An untrained executor that knows every skill, the fights included."""
+
+    config = SkillPPOConfig(
+        num_skills=len(ALL_SKILL_IDS),
+        hidden_size=16,
+        skill_embedding_size=4,
+        monitor_gpu=False,
+    ).validate()
+    environment = make_skill_chain_environment()
+    model = make_goal_conditioned_actor_critic(
+        num_actions=environment.bundle.spec.num_actions,
+        num_skills=config.num_skills,
+        hidden_size=config.hidden_size,
+        skill_embedding_size=config.skill_embedding_size,
+    )
+    params = initialize_goal_conditioned_parameters(
+        model, jax.random.PRNGKey(0), environment.bundle.spec.observation_shape
+    )
+    return LearnedSkillExecutor(params=params, config=config, model=model)
+
+
+@pytest.mark.parametrize("make_executor", [ScriptedSkillExecutor, _all_skill_executor])
+def test_a_hit_hands_the_fight_back_with_fights_on_hit(make_executor) -> None:
+    state = _cornered()
+    result = make_executor().execute(
+        ENVIRONMENT,
+        state,
+        SkillId.DEFEAT_ZOMBIE,
+        jax.random.PRNGKey(1),
+        horizon=32,
+        interruption=SkillInterruption(threat_radius=3, fights_on_hit=True),
+    )
+    assert result.outcome is SkillOutcome.INTERRUPTED
+    assert result.steps == 1
+    assert int(result.state.player_health) == int(state.player_health) - 2
 
 
 def test_an_interrupted_attempt_is_not_a_failure() -> None:

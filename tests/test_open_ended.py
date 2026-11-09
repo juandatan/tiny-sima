@@ -361,7 +361,11 @@ def test_a_zombie_at_reset_is_fought_off_in_the_closed_loop() -> None:
     assert trace[0]["requested_skill"] == "defeat_zombie"
     assert trace[0]["plan_state"]["defending"]
     # Skills are interrupted by default, and the result says how.
-    assert result["interruption"] == {"threat_radius": 3, "mobs": ["zombie"]}
+    assert result["interruption"] == {
+        "threat_radius": 3,
+        "mobs": ["zombie"],
+        "fights_on_hit": True,
+    }
 
 
 def test_scripted_design_unlocks_achievements_in_the_closed_loop() -> None:

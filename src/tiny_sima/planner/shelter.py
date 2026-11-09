@@ -15,6 +15,9 @@ walks into the room, places stone on each open wall and then sleeps. It
 prefers a room walled partly by water, which keeps zombies out as well and
 which the player drinks from inside. In the morning, or once food runs low
 or drink does with no water to hand, it mines a stone wall to get out.
+
+By day the same room is a place to rest: with ``rest`` the player stays
+walled in, asleep while it can, until its health is full, and then leaves.
 """
 
 from __future__ import annotations
@@ -136,6 +139,10 @@ def needs_low(state: Any) -> bool:
     return min(_food(state), int(np.asarray(state.player_drink))) <= SHELTER_NEED_FLOOR
 
 
+def _health(state: Any) -> int:
+    return int(np.asarray(state.player_health))
+
+
 def _food(state: Any) -> int:
     return int(np.asarray(state.player_food))
 
@@ -240,20 +247,28 @@ def _use_wall(state: Any, walls: list[tuple[Position, int]]) -> int:
     return _towards(player, walls[0][0])
 
 
-def shelter_blocker(state: Any) -> str | None:
-    """Why the shelter cannot start now, or ``None`` when it can."""
+def shelter_blocker(state: Any, by_day: bool = False) -> str | None:
+    """Why the shelter cannot start now, or ``None`` when it can.
 
-    return shelter_status(state)[0]
+    With ``by_day`` it may also start by day, to rest while health is not
+    full.
+    """
+
+    return shelter_status(state, by_day)[0]
 
 
-def shelter_status(state: Any) -> tuple[str | None, Room | None]:
+def shelter_status(state: Any, by_day: bool = False) -> tuple[str | None, Room | None]:
     """:func:`shelter_blocker` with the room the shelter would use, if any.
 
-    The room is looked for at night only.
+    The room is looked for at night, or with ``by_day`` by day while health
+    is not full.
     """
 
     if not is_night(state):
-        return "it is day", None
+        if not by_day:
+            return "it is day", None
+        if _health(state) >= _MAX_VITAL:
+            return "health is full", None
     room = choose_room(state)
     if _food(state) <= SHELTER_NEED_FLOOR:
         return "food is too low to stay in", room
@@ -278,10 +293,13 @@ def room_has_water(state: Any, room: Room) -> bool:
     return bool(_walls_of(room, np.asarray(state.map), BlockType.WATER))
 
 
-def shelter_feasible(state: Any) -> bool:
-    """Whether the shelter can start: night, a pickaxe, food, drink, a room."""
+def shelter_feasible(state: Any, by_day: bool = False) -> bool:
+    """Whether the shelter can start: night, a pickaxe, food, drink, a room.
 
-    return shelter_blocker(state) is None
+    With ``by_day`` a day with health below full serves as well as night.
+    """
+
+    return shelter_blocker(state, by_day) is None
 
 
 def _face(state: Any, move: int, action: Action) -> int:
@@ -303,12 +321,15 @@ def _towards(start: Position, goal: Position) -> int:
     return Action.LEFT.value if goal[1] < start[1] else Action.RIGHT.value
 
 
-def shelter_action(state: Any, room: Room | None) -> tuple[int | None, Room | None]:
+def shelter_action(
+    state: Any, room: Room | None, rest: bool = False
+) -> tuple[int | None, Room | None]:
     """Return the next shelter action and the room it works on.
 
     The action is ``None`` once there is nothing left to do: the player is
     out in the morning, or out with food or drink low, or there is no room
-    to build or stone to build it with.
+    to build or stone to build it with. With ``rest`` the day keeps the
+    player in, as the night does, until its health is full.
     """
 
     world_map = np.asarray(state.map)
@@ -330,7 +351,8 @@ def shelter_action(state: Any, room: Room | None) -> tuple[int | None, Room | No
     if inside and not open_walls and not sleeping and water and drink < _MAX_VITAL:
         return _use_wall(state, water), room
     thirsty = needs_low(state) and (_food(state) <= SHELTER_NEED_FLOOR or not water)
-    if (not is_night(state) and not sleeping) or thirsty:
+    stay = is_night(state) or sleeping or (rest and _health(state) < _MAX_VITAL)
+    if not stay or thirsty:
         if not inside or open_walls:
             return None, room
         exits = _walls_of(room, world_map, BlockType.STONE)

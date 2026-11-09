@@ -136,6 +136,13 @@ from tiny_sima.evaluation.skills import (
     evaluate_skill_suite,
     scripted_skill_action,
 )
+from tiny_sima.evaluation.vitals import (
+    VITAL_RATES_SEED,
+    VITAL_SCENARIOS,
+    measure_vital_rates,
+    run_vital_scenarios,
+    vital_rates_from_readings,
+)
 from tiny_sima.evaluation.vlm_feasibility import (
     FeasibilityRatings,
     LogisticBlend,
@@ -282,4 +289,9 @@ __all__ = [
     "feasibility_output_type",
     "fit_logistic_blend",
     "parse_feasibility_response",
+    "VITAL_RATES_SEED",
+    "VITAL_SCENARIOS",
+    "measure_vital_rates",
+    "run_vital_scenarios",
+    "vital_rates_from_readings",
 ]

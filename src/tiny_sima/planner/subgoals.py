@@ -10,8 +10,9 @@ the VLM never has to sequence skills itself.
 The VLM is called only when the plan needs it: at the first decision, once
 every sub-goal is reached but the objective is not, after a failed skill,
 when a sub-goal uses up its skill budget, when a vital falls to its
-threshold, when a hostile creature comes close, at nightfall, and when the
-current sub-goal stops being reachable. Each alert (a low vital, a threat,
+threshold, when a hostile creature comes close, at nightfall, when the
+current sub-goal stops being reachable, and optionally when the player is
+hit with a hostile creature close. Each alert (a low vital, a threat,
 the night) asks once per spell rather than at every decision. Between calls
 the planner follows the plan alone.
 
@@ -85,6 +86,7 @@ from tiny_sima.planner.symbolic import (
     check_subgoal,
     read_field,
 )
+from tiny_sima.planner.vital_rates import VitalRates
 from tiny_sima.planner.vlm import (
     VisionLanguageBackend,
     VLMRequest,
@@ -148,6 +150,7 @@ class ReplanTrigger(str, Enum):
     THREAT = "threat"
     NIGHT = "night"
     UNREACHABLE = "unreachable"
+    HURT = "hurt"
 
 
 _TRIGGER_TEXT = {
@@ -163,6 +166,7 @@ _TRIGGER_TEXT = {
     ReplanTrigger.THREAT: "A hostile creature is close",
     ReplanTrigger.NIGHT: "Night has fallen.",
     ReplanTrigger.UNREACHABLE: "The current sub-goal can no longer be reached.",
+    ReplanTrigger.HURT: "The player was hit",
 }
 
 
@@ -312,6 +316,8 @@ class SubgoalPlan:
     fighting: bool = False
     # Every valid answer's shelter and fight choices, where they were offered.
     choices: tuple[SubgoalChoice, ...] = ()
+    # The player's health at this decision, to tell when it was hit since.
+    health: int | None = None
 
     @property
     def current(self) -> GoalCondition | None:
@@ -506,8 +512,7 @@ _SUBGOAL_INSTRUCTIONS = (
     "Return 1 to {max_subgoals} sub-goals in the order they should be "
     "reached. Finish with what the objective asks for: the plan is done "
     "when the last sub-goal is reached.",
-    "Keep the plan short. Add an earlier sub-goal only when the order "
-    "matters, for example drinking first when drink is low.",
+    "{order_note}",
     "If the planner rejected a sub-goal, its reason is given; do not "
     "propose that sub-goal again unless the state has changed.",
     "Sub-goal fields: {fields}.",
@@ -518,6 +523,30 @@ _SUBGOAL_INSTRUCTIONS = (
 )
 
 
+_ORDER_NOTE = (
+    "Keep the plan short. Add an earlier sub-goal only when the order "
+    "matters, for example drinking first when drink is low."
+)
+
+_LOOK_AHEAD_NOTE = (
+    "Keep the plan short, but look ahead. Add an earlier sub-goal when the "
+    "order matters, for example drinking first when drink is low, or "
+    "planting a sapling early so that there is food later."
+)
+
+_GAME_MANUAL = (
+    "How the game works: food, drink and energy each fall over time, and "
+    "while any of them is 0 health drains. Health comes back while all three "
+    "are above 0, faster asleep. Food comes from cows and from ripe plants: "
+    "a sapling, found in grass, planted on grass ripens after a long while "
+    "and grows back after it is eaten, so planting early gives food later. "
+    "Drink comes from water and energy from sleeping. Zombies roam the "
+    "grass, more at night, and a player asleep in the open is easy prey; "
+    "skeletons keep to dark tunnels. Iron and diamond lie among stone in "
+    "caves and mountains. An episode is long, so plan to survive all of it, "
+    "not only to reach the next sub-goal."
+)
+
 _SHELTER_NOTE = (
     "Zombies come out at night and hit hard, hardest while the player "
     "sleeps. Also return shelter: now, after or no. now walls the player "
@@ -527,7 +556,15 @@ _SHELTER_NOTE = (
     "through the night. The shelter needs a wood pickaxe and stone or stone "
     "nearby. The player leaves early once food, or drink with no water "
     "beside the room, falls to {floor}; asleep, each falls by 1 about every "
-    "40 steps. Shelter only counts at night."
+    "40 steps. {when}"
+)
+
+_NIGHT_ONLY_NOTE = "Shelter only counts at night."
+
+_REST_NOTE = (
+    "By day, while health is not full, the same choice rests: now walls the "
+    "player in until its health is full, asleep while it can, and after does "
+    "so once the sub-goals are reached."
 )
 
 _FIGHT_NOTE = (
@@ -555,6 +592,9 @@ def build_subgoal_system_prompt(
     shelter: bool = False,
     fight: bool = False,
     fight_odds: bool = False,
+    manual: bool = False,
+    rest_by_day: bool = False,
+    vital_rates: VitalRates | None = None,
 ) -> str:
     """Return the sub-goal planner's role, documentation and output format.
 
@@ -562,7 +602,10 @@ def build_subgoal_system_prompt(
     legend appear only when the fields include achievements, ``shelter`` or
     ``fight`` is set or the observation has text, so the default prompt is
     unchanged. With ``fight`` and ``fight_odds`` it says what the fight odds
-    in the user prompt mean.
+    in the user prompt mean. ``manual`` adds the game's general rules and
+    asks the plan to look ahead, ``rest_by_day`` with ``shelter`` offers the
+    shelter by day to rest in, and ``vital_rates`` adds the rates measured
+    in staged play.
     """
 
     has_achievements = any(name.startswith("achievement.") for name in fields)
@@ -570,9 +613,17 @@ def build_subgoal_system_prompt(
         max_subgoals=max_subgoals,
         fields=", ".join(fields),
         achievement_note=_ACHIEVEMENT_NOTE if has_achievements else "",
+        order_note=_LOOK_AHEAD_NOTE if manual else _ORDER_NOTE,
     )
+    if manual:
+        instructions += " " + _GAME_MANUAL
+    if vital_rates is not None:
+        instructions += " " + vital_rates.system_text()
     if shelter:
-        instructions += " " + _SHELTER_NOTE.format(floor=SHELTER_NEED_FLOOR)
+        instructions += " " + _SHELTER_NOTE.format(
+            floor=SHELTER_NEED_FLOOR,
+            when=_REST_NOTE if rest_by_day else _NIGHT_ONLY_NOTE,
+        )
     if fight:
         instructions += " " + _FIGHT_NOTE
         if fight_odds:
@@ -613,11 +664,17 @@ def build_subgoal_prompt(
     threats: Sequence[dict[str, Any]] | None = None,
     fight_rates: Sequence[FightRate] = (),
     fight_mob: str = "zombie",
+    status: bool = False,
+    vital_rates: VitalRates | None = None,
+    rest_by_day: bool = False,
 ) -> str:
     """Return the user prompt for one sub-goal request.
 
+    With ``status`` it reads out the whole status bar, health included, and
+    with ``vital_rates`` how long each need lasts at the measured rates.
     With ``shelter`` it says whether the shelter could start now, and why
-    not, with whether its room has water and how long the night has left.
+    not, with whether its room has water and how long the night has left;
+    with ``rest_by_day`` too, by day, whether it could start to rest.
     With ``threats``, the close hostile mobs, it lists them with the
     player's health for the fight choice, and with ``fight_rates`` the
     measured odds of fighting the close ``fight_mob``, and of the errands
@@ -629,6 +686,8 @@ def build_subgoal_prompt(
         f"Why you are asked now: {_trigger_text(trigger, plan.trigger_detail)}",
         "Current state: " + json.dumps(_visible_state(state, fields), sort_keys=True),
     ]
+    if status:
+        lines.append(_status_text(state, vital_rates))
     if observation is not None and observation.has_text:
         lines.append(
             "Text observation: " + json.dumps(observation_block(state, observation))
@@ -655,7 +714,7 @@ def build_subgoal_prompt(
             )
         )
     if shelter:
-        lines.append(_shelter_text(state))
+        lines.append(_shelter_text(state, rest_by_day))
     if threats is not None:
         line = (
             f"Close threats: {_threat_text(threats) or 'none'}; "
@@ -673,18 +732,37 @@ def build_subgoal_prompt(
     return "\n".join(lines)
 
 
-def _shelter_text(state: Any) -> str:
-    """Whether the shelter could start now, and what the night holds."""
+def _status_text(state: Any, rates: VitalRates | None) -> str:
+    """The status bar in words, with how long the needs last at ``rates``."""
 
-    if not is_night(state):
+    readings = vitals(state)
+    text = (
+        f"Status bar: health {readings['health']}, food {readings['food']}, "
+        f"drink {readings['drink']}, energy {readings['energy']}; "
+        f"{'night' if readings['night'] else 'day'}, "
+        f"{'asleep' if readings['sleeping'] else 'awake'}."
+    )
+    projection = "" if rates is None else rates.projection(state)
+    return f"{text} {projection}" if projection else text
+
+
+def _shelter_text(state: Any, rest_by_day: bool = False) -> str:
+    """Whether the shelter could start now, and what the night holds.
+
+    With ``rest_by_day``, by day, whether it could start to rest.
+    """
+
+    night = is_night(state)
+    if not night and not rest_by_day:
         return "Shelter: not possible now: it is day."
-    blocker, room = shelter_status(state)
+    blocker, room = shelter_status(state, by_day=rest_by_day)
     text = "possible now" if blocker is None else f"not possible now: {blocker}"
-    lines = [f"Shelter: {text}."]
+    lines = [f"{'Shelter' if night else 'Resting in a shelter'}: {text}."]
     if room is not None:
         water = "has" if room_has_water(state, room) else "has no"
         lines.append(f"The nearest room {water} water beside it.")
-    lines.append(f"Morning is in {steps_until_morning(state)} steps.")
+    if night:
+        lines.append(f"Morning is in {steps_until_morning(state)} steps.")
     return " ".join(lines)
 
 
@@ -724,11 +802,11 @@ def _threat_text(threats: Sequence[dict[str, Any]]) -> str:
 
 
 def _start_shelter(
-    plan: SubgoalPlan, state: Any, status: str, reason: str = ""
+    plan: SubgoalPlan, state: Any, status: str, reason: str = "", by_day: bool = False
 ) -> tuple[SubgoalPlan, str | None]:
     """Record whether the shelter starts now; return why not, if it cannot."""
 
-    blocker = shelter_blocker(state)
+    blocker = shelter_blocker(state, by_day)
     if blocker is None:
         return plan.with_event("shelter", status, reason), None
     return plan.with_event("shelter", "rejected", blocker), blocker
@@ -821,7 +899,15 @@ class SubgoalPlanner:
     shelters while it can until morning. Like a defence fight, that spends
     no sub-goal budget. The prompt says whether the shelter could start,
     whether its room has water and when morning comes; the choices are the
-    goal source's.
+    goal source's. With ``rest_by_day`` too it is offered by day while
+    health is not full, to rest in until it is.
+    ``show_status`` reads the whole status bar out in the prompt, health
+    included, and ``vital_rates``, measured in staged play, says how fast
+    the vitals change and how long the needs last at those rates.
+    ``manual`` adds the game's general rules to the system prompt.
+    ``replan_when_hurt`` asks the goal source again when the player is hit
+    with a hostile creature close, such as in a fight, whose odds change
+    with its health.
     ``fallback`` answers once for an episode whose answers were all rejected
     and whose earlier sub-goals are no longer reachable, so it keeps playing
     rather than stopping; its sub-goals are proposed with reason
@@ -852,6 +938,11 @@ class SubgoalPlanner:
     choose_fights: bool = False
     fight_odds: FightOdds | None = None
     fallback: SubgoalSource | None = None
+    rest_by_day: bool = False
+    show_status: bool = False
+    manual: bool = False
+    replan_when_hurt: bool = False
+    vital_rates: VitalRates | None = None
     _cache: dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
     def _belief(self, context: PlannerContext) -> Any:
@@ -922,6 +1013,15 @@ class SubgoalPlanner:
         )
         return tuple(rate for rate in rates if rate is not None)
 
+    def _shelter_offered(self, state: Any) -> bool:
+        """Whether the shelter choice is the goal source's now."""
+
+        if not self.shelter_at_night:
+            return False
+        if is_night(state):
+            return True
+        return self.rest_by_day and vitals(state)["health"] < _MAX_FIELD_VALUE
+
     def _alerts(self, state: Any) -> dict[str, str]:
         """Return the alert conditions that hold now, with their details.
 
@@ -964,9 +1064,18 @@ class SubgoalPlanner:
         spent = max(decision_index - plan.decision_index - int(defended), 0)
         trigger: ReplanTrigger | None = None
         detail = ""
+        health = vitals(state)["health"]
+        hurt = (
+            self.replan_when_hurt
+            and plan.health is not None
+            and health < plan.health
+            and bool(self._threats(state))
+        )
+        hurt_detail = f"health {plan.health} to {health}"
         plan = replace(
             plan,
             decision_index=decision_index,
+            health=health,
             trigger=None,
             trigger_detail="",
             raw_response=None,
@@ -978,13 +1087,23 @@ class SubgoalPlanner:
         # again if nothing else is pending.
         if plan.fighting and self._defence(state) is None:
             plan = replace(plan, fighting=False).with_event("fight", "ended")
+        last = context.history[-1] if context.history else None
         if plan.shelter == "now":
-            blocker = shelter_blocker(state)
+            blocker = shelter_blocker(state, self.rest_by_day)
+            if (
+                self.rest_by_day
+                and last is not None
+                and last.skill_id is SkillId.SHELTER
+                and last.succeeded
+            ):
+                # A rest, or a night, that ended well is not taken again
+                # unasked.
+                blocker = "done"
             if blocker is not None:
                 plan = replace(plan, shelter="no").with_event(
                     "shelter", "ended", blocker
                 )
-        elif plan.shelter == "after" and not is_night(state):
+        elif plan.shelter == "after" and not self._shelter_offered(state):
             plan = replace(plan, shelter="no")
         if plan.vlm_calls == 0:
             trigger = ReplanTrigger.START
@@ -992,7 +1111,9 @@ class SubgoalPlanner:
             plan = plan.advanced("achieved")
         if plan.shelter == "after" and plan.current is None:
             # The goal source asked for the shelter once these were reached.
-            plan, blocker = _start_shelter(plan, state, "started")
+            plan, blocker = _start_shelter(
+                plan, state, "started", by_day=self.rest_by_day
+            )
             plan = replace(plan, shelter="now" if blocker is None else "no")
         active = self._alerts(state)
         plan = replace(plan, alerts=tuple(a for a in plan.alerts if a in active))
@@ -1030,6 +1151,9 @@ class SubgoalPlanner:
             detail = _failure_text(context)
             plan = plan.with_event(render_subgoal(plan.current), "skill_failed", detail)
             trigger = ReplanTrigger.SKILL_FAILED
+        elif hurt:
+            detail = hurt_detail
+            trigger = ReplanTrigger.HURT
         elif fresh_vitals:
             detail = " and ".join(fresh_vitals)
             trigger = ReplanTrigger.LOW_VITALS
@@ -1067,6 +1191,9 @@ class SubgoalPlanner:
             shelter=self.shelter_at_night,
             fight=self.choose_fights,
             fight_odds=self.fight_odds is not None,
+            manual=self.manual,
+            rest_by_day=self.rest_by_day,
+            vital_rates=self.vital_rates,
         )
         fight_mob = self._defended_mob(pending.state)
         user_prompt = build_subgoal_prompt(
@@ -1082,6 +1209,9 @@ class SubgoalPlanner:
             threats=self._threats(pending.state) if self.choose_fights else None,
             fight_rates=self._fight_rates(pending.state),
             fight_mob=fight_mob or "zombie",
+            status=self.show_status,
+            vital_rates=self.vital_rates,
+            rest_by_day=self.rest_by_day,
         )
         cache_key = sha256(
             system_prompt.encode("utf-8")
@@ -1138,18 +1268,19 @@ class SubgoalPlanner:
         reasons: list[str] = []
         held: list[str] = []
         source = "fallback" if fallback else ""
-        night = self.shelter_at_night and is_night(pending.state)
+        # By day, with rest_by_day, the shelter is a rest.
+        offered = self._shelter_offered(pending.state)
         # The latest answer while a mob is close decides the fight.
         fight_offered = self.choose_fights and self._defence(pending.state) is not None
         fighting = fight_offered and parsed.fight
         choices = []
-        if night:
+        if offered:
             choices.append(
                 SubgoalChoice(
                     plan.decision_index,
-                    "shelter",
+                    "shelter" if is_night(pending.state) else "rest",
                     parsed.shelter,
-                    shelter_blocker(pending.state) is None,
+                    shelter_blocker(pending.state, self.rest_by_day) is None,
                     fallback,
                 )
             )
@@ -1217,11 +1348,13 @@ class SubgoalPlanner:
         # choice is moot. A shelter after the sub-goals is checked once they
         # are reached, since they may be what it lacks now, such as drink,
         # and with none accepted it starts now.
-        shelter = parsed.shelter if night else "no"
+        shelter = parsed.shelter if offered else "no"
         if shelter == "after" and not accepted:
             shelter = "now"
         if shelter == "now":
-            plan, blocker = _start_shelter(plan, pending.state, "proposed", source)
+            plan, blocker = _start_shelter(
+                plan, pending.state, "proposed", source, self.rest_by_day
+            )
             if blocker is not None:
                 shelter = "no"
                 reasons.append(f"shelter: {blocker}")
