@@ -281,7 +281,7 @@ def shelter_status(state: Any, by_day: bool = False) -> tuple[str | None, Room |
         return not_now, None
     room = choose_room(state)
     if _food(state) <= SHELTER_NEED_FLOOR:
-        return "food is too low to stay in", room
+        return f"food is {_food(state)}, too low to stay in", room
     if int(np.asarray(state.inventory.wood_pickaxe)) < 1:
         return "it needs a wood pickaxe", room
     if room is None:
@@ -289,7 +289,8 @@ def shelter_status(state: Any, by_day: bool = False) -> tuple[str | None, Room |
     world_map = np.asarray(state.map)
     # Low drink is fine in a room the player can drink inside.
     if needs_low(state) and not room_has_water(state, room):
-        return "drink is too low to stay in", room
+        drink = int(np.asarray(state.player_drink))
+        return f"drink is {drink}, too low to stay in a room with no water", room
     if _stone(state) < len(room.open_walls(world_map)) and (
         _mine_stone(state, world_map, _player(state), _walls(room)) is None
     ):

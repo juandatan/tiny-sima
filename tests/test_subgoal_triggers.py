@@ -305,8 +305,8 @@ def test_the_vlm_chooses_whether_to_fight_a_close_zombie() -> None:
     state = _grass_world(tree=[(0, 2)])
     close = _with_mobs(state, "zombies", (1, 1))
     for fight, skill_id in (
-        (True, SkillId.DEFEAT_ZOMBIE),
-        (False, SkillId.COLLECT_WOOD),
+        ("now", SkillId.DEFEAT_ZOMBIE),
+        ("no", SkillId.COLLECT_WOOD),
     ):
         backend = ScriptedBackend(_answer(("inventory.wood", 1), fight=fight))
         planner = SubgoalPlanner(
@@ -318,11 +318,11 @@ def test_the_vlm_chooses_whether_to_fight_a_close_zombie() -> None:
         )
         selection = _select(planner, close, PlannerContext(OBJECTIVE))
         assert selection.decision.skill_id is skill_id
-        assert selection.plan_state.fighting is fight
+        assert selection.plan_state.fight == fight
         (choice,) = selection.plan_state.choices
         assert (choice.kind, choice.answer, choice.possible) == (
             "fight",
-            "true" if fight else "false",
+            fight,
             True,
         )
         (request,) = backend.requests
@@ -332,7 +332,7 @@ def test_the_vlm_chooses_whether_to_fight_a_close_zombie() -> None:
         )
 
     # The fight lasts while the zombie stays close, and lapses once it goes.
-    backend = ScriptedBackend(_answer(("inventory.wood", 1), fight=True))
+    backend = ScriptedBackend(_answer(("inventory.wood", 1), fight="now"))
     planner = SubgoalPlanner(
         backend,
         candidate_skills=skills,
@@ -351,7 +351,7 @@ def test_the_vlm_chooses_whether_to_fight_a_close_zombie() -> None:
     )
     gone = _select(planner, state, context)
     assert gone.decision.skill_id is SkillId.COLLECT_WOOD
-    assert not gone.plan_state.fighting
+    assert gone.plan_state.fight == "no"
     assert ("fight", "ended") in {
         (event.subgoal, event.status) for event in gone.plan_state.events
     }
@@ -373,7 +373,7 @@ def test_the_vlm_is_shown_the_measured_odds_of_the_fight() -> None:
             ("collect_wood", "zombie", 4, "wood", 2): (0.6, 0.3, 300),
         }
     )
-    backend = ScriptedBackend(_answer(("inventory.wood", 1), fight=False))
+    backend = ScriptedBackend(_answer(("inventory.wood", 1), fight="no"))
     planner = SubgoalPlanner(
         backend,
         candidate_skills=skills,
@@ -393,7 +393,7 @@ def test_the_vlm_is_shown_the_measured_odds_of_the_fight() -> None:
         "60%, died 30%; drink water done 30%, died 50%." in request.user_prompt
     )
     (choice,) = selection.plan_state.choices
-    assert (choice.answer, choice.win_rate) == ("false", 0.45)
+    assert (choice.answer, choice.win_rate) == ("no", 0.45)
     assert choice.to_dict()["win_rate"] == 0.45
     # Without odds the prompt is as before.
     plain = SubgoalPlanner(

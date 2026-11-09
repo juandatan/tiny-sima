@@ -242,9 +242,10 @@ def test_the_vlm_can_drink_first_and_shelter_after() -> None:
     )
     first = _select(planner, thirsty, PlannerContext(OBJECTIVE))
     # Low drink rules out sheltering now, but not drinking first.
-    assert "Shelter: not possible now: drink is too low to stay in." in (
-        backend.requests[0].user_prompt
-    )
+    assert (
+        "Shelter: not possible now: drink is 2, too low to stay in a room "
+        "with no water."
+    ) in backend.requests[0].user_prompt
     assert first.decision.skill_id is SkillId.DRINK_WATER
     assert first.plan_state.shelter == "after"
 
@@ -303,7 +304,7 @@ def test_the_curriculum_shelters_whenever_it_can_and_always_fights() -> None:
     night = _select(planner, state, PlannerContext(OBJECTIVE))
     assert night.decision.skill_id is SkillId.SHELTER
     answer = json.loads(night.plan_state.raw_response)
-    assert (answer["shelter"], answer["fight"]) == ("now", True)
+    assert (answer["shelter"], answer["fight"]) == ("now", "now")
     day = _select(planner, _at(state, 0), PlannerContext(OBJECTIVE))
     assert day.decision.skill_id is SkillId.COLLECT_WOOD
     assert json.loads(day.plan_state.raw_response)["shelter"] == "no"

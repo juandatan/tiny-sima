@@ -71,7 +71,7 @@ def test_a_hit_in_a_fight_asks_again() -> None:
     state = _grass_world(tree=[(0, 2)])
     close = _with_mobs(state, "zombies", (1, 1))
     for replan_when_hurt, requests in ((True, 2), (False, 1)):
-        backend = ScriptedBackend(_answer(("inventory.wood", 1), fight=True))
+        backend = ScriptedBackend(_answer(("inventory.wood", 1), fight="now"))
         planner = SubgoalPlanner(
             backend,
             candidate_skills=FIGHT_SKILLS,
@@ -101,7 +101,7 @@ def test_a_hit_in_a_fight_asks_again() -> None:
             assert len(again.plan_state.choices) == 2
 
     # Health lost with no threat close, such as to thirst, is not a hit.
-    plan = replace(first.plan_state, health=9, fighting=False)
+    plan = replace(first.plan_state, health=9, fight="no")
     context = PlannerContext(
         OBJECTIVE, history=(_attempt(SkillId.COLLECT_WOOD),), plan_state=plan
     )
@@ -116,12 +116,90 @@ def test_a_hit_in_a_fight_asks_again() -> None:
 
     # Nor is health lost with a zombie close while a need is empty.
     thirsty = close.replace(player_health=jnp.int32(7), player_drink=jnp.int32(0))
-    plan = replace(first.plan_state, health=9, fighting=False)
+    plan = replace(first.plan_state, health=9, fight="no")
     context = PlannerContext(
         OBJECTIVE, history=(_attempt(SkillId.COLLECT_WOOD),), plan_state=plan
     )
     parched = _select(planner, thirsty, context)
     assert parched.plan_state.trigger is not ReplanTrigger.HURT
+
+
+def _fight_planner(*answers: str, replan_when_hurt: bool = False):
+    backend = ScriptedBackend(*answers)
+    planner = SubgoalPlanner(
+        backend,
+        candidate_skills=FIGHT_SKILLS,
+        threat_radius=2,
+        defend_against=("zombie",),
+        choose_fights=True,
+        replan_when_hurt=replan_when_hurt,
+    )
+    return planner, backend
+
+
+def test_a_fight_after_waits_for_the_first_subgoal() -> None:
+    state = _grass_world(tree=[(0, 2)])
+    close = _with_mobs(state, "zombies", (1, 1))
+    planner, backend = _fight_planner(_answer(("inventory.wood", 1), fight="after"))
+    first = _select(planner, close, PlannerContext(OBJECTIVE))
+    assert first.decision is not None
+    assert first.decision.skill_id is SkillId.COLLECT_WOOD
+    assert first.plan_state.fight == "after"
+    (choice,) = first.plan_state.choices
+    assert (choice.kind, choice.answer) == ("fight", "after")
+    assert "after reaches the first sub-goal first" in (
+        backend.requests[0].system_prompt
+    )
+
+    # With the wood, the zombie still close is fought without asking again.
+    wood = close.replace(inventory=close.inventory.replace(wood=1))
+    context = PlannerContext(
+        OBJECTIVE,
+        history=(_attempt(SkillId.COLLECT_WOOD),),
+        plan_state=first.plan_state,
+    )
+    fought = _select(planner, wood, context)
+    assert fought.decision is not None
+    assert fought.decision.skill_id is SkillId.DEFEAT_ZOMBIE
+    assert fought.plan_state.fight == "now"
+    assert ("fight", "started") in {
+        (event.subgoal, event.status) for event in fought.plan_state.events
+    }
+    assert len(backend.requests) == 1
+
+    # Once the zombie goes, the fight for later lapses.
+    gone = _select(planner, state, context)
+    assert gone.plan_state.fight == "no"
+
+
+def test_a_hit_asks_only_about_the_fight() -> None:
+    state = _grass_world(tree=[(0, 2)])
+    close = _with_mobs(state, "zombies", (1, 1))
+    planner, backend = _fight_planner(
+        _answer(("inventory.wood", 1), fight="no"),
+        _answer(("inventory.sapling", 1), fight="now"),
+        replan_when_hurt=True,
+    )
+    first = _select(planner, close, PlannerContext(OBJECTIVE))
+    assert first.decision is not None
+    assert first.decision.skill_id is SkillId.COLLECT_WOOD
+
+    hit = close.replace(player_health=jnp.int32(7))
+    context = PlannerContext(
+        OBJECTIVE,
+        history=(_attempt(SkillId.COLLECT_WOOD, SkillOutcome.INTERRUPTED),),
+        plan_state=first.plan_state,
+    )
+    again = _select(planner, hit, context)
+    assert again.plan_state.trigger is ReplanTrigger.HURT
+    assert "A hit asks only whether to fight and shelter" in (
+        backend.requests[1].user_prompt
+    )
+    # The fight is taken, and the sub-goals stand.
+    assert again.decision is not None
+    assert again.decision.skill_id is SkillId.DEFEAT_ZOMBIE
+    assert again.plan_state.fight == "now"
+    assert again.plan_state.pending == first.plan_state.pending
 
 
 def _rest_planner():

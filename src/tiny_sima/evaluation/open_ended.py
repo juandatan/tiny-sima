@@ -214,12 +214,12 @@ def curriculum_choice(choice: Mapping[str, Any]) -> str:
     """Return what the curriculum answers where a recorded choice was made.
 
     It shelters at night whenever the shelter could start, never rests by
-    day, and always fights; see
+    day, and always fights now; see
     :class:`~tiny_sima.planner.goal_selector.ScriptedGoalSelector`.
     """
 
     if choice["kind"] == "fight":
-        return "true"
+        return "now"
     if choice["kind"] == "rest":
         return "no"
     return "now" if choice["possible"] else "no"
@@ -440,15 +440,17 @@ def open_ended_planners(
     ``choose_fights`` their goal source chooses whether to. With
     ``shelter_at_night`` it chooses whether to wall the player in with stone
     for the night, now or after its sub-goals. The VLM decides both from
-    what the prompt says; the curriculum always fights and shelters
+    what the prompt says, and may fight after its first sub-goal, such as
+    drinking first; the curriculum always fights at once and shelters
     whenever it can. ``fight_odds``, the executor's measured fight odds,
     are shown to the VLM with the close threats.
 
-    With ``informed`` both goal sources are asked again when the player is
-    hit with a zombie close, which needs an interruption with
-    ``fights_on_hit``, and may shelter by day to rest; the VLM also gets the
-    game's general rules and, with ``vital_rates``, the vital rates measured
-    in staged play.
+    With ``informed`` both goal sources are asked again, for the fight and
+    shelter choices alone, when the player is hit with a zombie close, and
+    may shelter by day to rest; the VLM also gets the game's general rules
+    and, with ``vital_rates``, the vital rates measured in staged play. A
+    fight is asked about again at each hit only with an interruption with
+    ``fights_on_hit``, which only the VLM needs: the curriculum fights on.
     """
 
     feasibility = prior if prior is not None else reachability_feasibility

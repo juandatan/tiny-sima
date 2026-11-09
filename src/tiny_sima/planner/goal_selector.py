@@ -101,7 +101,7 @@ def _answer(
     subgoal: GoalCondition,
     assessment: str,
     shelter: str | None = None,
-    fight: bool | None = None,
+    fight: str | None = None,
 ) -> str:
     answer: dict[str, object] = {"assessment": assessment}
     if shelter is not None:
@@ -124,7 +124,7 @@ class ScriptedGoalSelector:
     ``use_memory_belief`` the world facts come from the episode memory when
     it has any, as in the planner. With ``shelter_at_night``, which should
     match the planner's, every answer says to shelter now when it can
-    start, and with ``choose_fights`` every answer says to fight.
+    start, and with ``choose_fights`` every answer says to fight now.
 
     When no candidate is left it answers with :data:`NOTHING_TO_DO`, which
     always holds, so the planner rejects it as it would a VLM that has run
@@ -166,7 +166,7 @@ class ScriptedGoalSelector:
         shelter = None
         if self.shelter_at_night:
             shelter = "now" if shelter_blocker(request.state) is None else "no"
-        fight = True if self.choose_fights else None
+        fight = "now" if self.choose_fights else None
         rejected_now = {
             event.subgoal
             for event in plan.events

@@ -135,6 +135,9 @@ HOSTILE_MOBS: tuple[str, ...] = ("zombie", "skeleton")
 # The goal source's night choices: shelter at once, once the answer's
 # sub-goals are reached, or not at all.
 SHELTER_CHOICES: tuple[str, ...] = ("now", "after", "no")
+# Its choices with a zombie close: fight at once, once the current sub-goal
+# is reached, such as drinking first, or not at all.
+FIGHT_CHOICES: tuple[str, ...] = ("now", "after", "no")
 _HUNTING_SKILLS: dict[str, SkillId] = {mob: skill for skill, mob in SKILL_MOBS.items()}
 _ASSESSMENT_MAX_LENGTH = 120
 _MAX_FIELD_VALUE = 9
@@ -264,7 +267,7 @@ class SubgoalChoice:
     decision_index: int
     # "shelter" or "fight".
     kind: str
-    # One of SHELTER_CHOICES, or "true" or "false".
+    # One of SHELTER_CHOICES or FIGHT_CHOICES.
     answer: str
     possible: bool
     fallback: bool = False
@@ -313,8 +316,9 @@ class SubgoalPlan:
     # The goal source's shelter for this night, one of SHELTER_CHOICES:
     # sheltering "now", "after" the pending sub-goals are reached, or "no".
     shelter: str = "no"
-    # Whether the goal source chose to fight off the zombie that is close.
-    fighting: bool = False
+    # The goal source's fight with the close zombie, one of FIGHT_CHOICES:
+    # fighting it "now", "after" the current sub-goal is reached, or "no".
+    fight: str = "no"
     # Every valid answer's shelter and fight choices, where they were offered.
     choices: tuple[SubgoalChoice, ...] = ()
     # The player's health at this decision, to tell when it was hit since.
@@ -372,7 +376,7 @@ class SubgoalPlan:
             "current_budget": self.current_budget,
             "defending": self.defending,
             "shelter": self.shelter,
-            "fighting": self.fighting,
+            "fight": self.fight,
         }
 
 
@@ -386,7 +390,7 @@ class ParsedSubgoals:
     valid: bool
     error: str | None = None
     shelter: str = "no"
-    fight: bool = False
+    fight: str = "no"
 
 
 def parse_subgoal_response(
@@ -421,13 +425,14 @@ def parse_subgoal_response(
         subgoals.append((StateRequirement(field_name, "at_least", value),))
     assessment = payload.get("assessment", "")
     shelter = payload.get("shelter")
+    fight = payload.get("fight")
     return ParsedSubgoals(
         subgoals=tuple(subgoals),
         assessment=assessment if isinstance(assessment, str) else "",
         raw_response=text,
         valid=True,
         shelter=shelter if shelter in SHELTER_CHOICES else "no",
-        fight=payload.get("fight") is True,
+        fight=fight if fight in FIGHT_CHOICES else "no",
     )
 
 
@@ -484,7 +489,10 @@ def _subgoal_output_type(
         )
         choice["shelter"] = (shelter_enum, ...)
     if fight:
-        choice["fight"] = (bool, ...)
+        fight_enum = Enum(
+            "FightChoice", {name: name for name in FIGHT_CHOICES}, type=str
+        )
+        choice["fight"] = (fight_enum, ...)
     return create_model(
         "SubgoalOutput",
         __config__=ConfigDict(extra="forbid"),
@@ -568,12 +576,14 @@ _REST_NOTE = (
 )
 
 _FIGHT_NOTE = (
-    "Also return fight, true or false. True fights the close zombie before "
-    "the sub-goals go on. A zombie has 5 health; the player hits for 1, or "
-    "more with a sword, and the zombie hits for 2 every few steps. False "
-    "keeps to the sub-goals, and the zombie may follow. Health comes back "
-    "slowly while food, drink and energy are above 0. Fight only counts "
-    "while a zombie is close."
+    "Also return fight: now, after or no. now fights the close zombie before "
+    "the sub-goals go on. after reaches the first sub-goal first, such as "
+    "drinking, and then fights the zombie if it is still close. no keeps to "
+    "the sub-goals, and the zombie may follow. A zombie has 5 health; the "
+    "player hits for 1, or more with a sword, and the zombie hits for 2 "
+    "every few steps. Fighting does not bring health back: health comes "
+    "back slowly while food, drink and energy are above 0. Fight only "
+    "counts while a zombie is close."
 )
 
 _FIGHT_ODDS_NOTE = (
@@ -709,6 +719,11 @@ def build_subgoal_prompt(
             "Current sub-goals: "
             + json.dumps([render_subgoal(subgoal) for subgoal in plan.pending])
         )
+        if trigger is ReplanTrigger.HURT:
+            lines.append(
+                "A hit asks only whether to fight and shelter: the current "
+                "sub-goals stand, whatever this answer lists."
+            )
     if plan.events:
         lines.append(
             "Recent sub-goal events: "
@@ -877,8 +892,9 @@ class SubgoalPlanner:
     (Chebyshev), and ``replan_at_night`` at nightfall. A mob in
     ``defend_against`` within ``threat_radius`` is fought with its hunting
     skill, when that is a candidate, before the plan goes on: at once, or
-    with ``choose_fights`` only once the goal source's answer says to fight,
-    which holds while the mob stays close. The prompt then lists the close
+    with ``choose_fights`` only as the goal source's answer says: now, or
+    once the current sub-goal is reached, such as drinking first, while the
+    mob stays close. The prompt then lists the close
     threats with the player's health, and with ``fight_odds`` the measured
     odds of the fight: the executor's win and death rates in staged fights
     at the player's health, best sword and number of close mobs of that
@@ -897,7 +913,8 @@ class SubgoalPlanner:
     ``manual`` adds the game's general rules to the system prompt.
     ``replan_when_hurt`` asks the goal source again when the player is hit
     with a hostile creature close, such as in a fight, whose odds change
-    with its health.
+    with its health; only its fight and shelter choices are taken then, and
+    the pending sub-goals stand.
     ``fallback`` answers once for an episode whose answers were all rejected
     and whose earlier sub-goals are no longer reachable, so it keeps playing
     rather than stopping; its sub-goals are proposed with reason
@@ -1072,9 +1089,12 @@ class SubgoalPlanner:
         )
         # A fight lasts while its mob stays close, and a shelter until it
         # cannot go on, by dawn at the latest; the goal source is then asked
-        # again if nothing else is pending.
-        if plan.fighting and self._defence(state) is None:
-            plan = replace(plan, fighting=False).with_event("fight", "ended")
+        # again if nothing else is pending. A fight for after the current
+        # sub-goal lapses once the mob goes.
+        if plan.fight != "no" and self._defence(state) is None:
+            if plan.fight == "now":
+                plan = plan.with_event("fight", "ended")
+            plan = replace(plan, fight="no")
         last = context.history[-1] if context.history else None
         if plan.shelter == "now":
             # A rest, or a night, that ended well is not taken again unasked.
@@ -1090,8 +1110,12 @@ class SubgoalPlanner:
             plan = replace(plan, shelter="no")
         if plan.vlm_calls == 0:
             trigger = ReplanTrigger.START
+        reached = plan.current is not None and _holds(state, plan.current)
         while plan.current is not None and _holds(state, plan.current):
             plan = plan.advanced("achieved")
+        if plan.fight == "after" and reached:
+            # The goal source asked for the fight once this was reached.
+            plan = replace(plan, fight="now").with_event("fight", "started")
         if plan.shelter == "after" and plan.current is None:
             # The goal source asked for the shelter once these were reached.
             plan, blocker = _start_shelter(
@@ -1111,7 +1135,7 @@ class SubgoalPlanner:
         )
         # A shelter or a fight with no sub-goals after it is a plan of its
         # own, which the alerts below may still interrupt.
-        standing = plan.shelter == "now" or plan.fighting
+        standing = plan.shelter == "now" or plan.fight == "now"
         if trigger is not None:
             pass
         elif plan.current is None and not standing:
@@ -1255,7 +1279,10 @@ class SubgoalPlanner:
         blocker = shelter_blocker(pending.state, self.rest_by_day) if offered else None
         # The latest answer while a mob is close decides the fight.
         fight_offered = self.choose_fights and self._defence(pending.state) is not None
-        fighting = fight_offered and parsed.fight
+        fight = parsed.fight if fight_offered else "no"
+        # A hit asks again only whether to fight and shelter; the sub-goals
+        # stand.
+        kept = pending.plan.pending if pending.trigger is ReplanTrigger.HURT else ()
         choices = []
         if offered:
             choices.append(
@@ -1281,15 +1308,13 @@ class SubgoalPlanner:
                 SubgoalChoice(
                     plan.decision_index,
                     "fight",
-                    "true" if parsed.fight else "false",
+                    parsed.fight,
                     True,
                     fallback,
                     None if rate is None else rate.win_rate,
                 )
             )
         plan = replace(plan, choices=(*plan.choices, *choices))
-        if fighting:
-            plan = plan.with_event("fight", "proposed", source)
         # Sub-goals an earlier round of this decision already reported as
         # held; the 2B model repeats them until its rounds run out.
         reported = {
@@ -1298,7 +1323,7 @@ class SubgoalPlanner:
             if event.decision_index == plan.decision_index
             and event.status == "already_held"
         }
-        for subgoal in parsed.subgoals:
+        for subgoal in () if kept else parsed.subgoals:
             text = render_subgoal(subgoal)
             # The schema asks for at_least >= 1, but decoding does not always
             # enforce it, and the 2B model writes the current count of 0.
@@ -1330,9 +1355,9 @@ class SubgoalPlanner:
         # Likewise the latest answer at night decides the shelter; by day the
         # choice is moot. A shelter after the sub-goals is checked once they
         # are reached, since they may be what it lacks now, such as drink,
-        # and with none accepted it starts now.
+        # and with none accepted it starts now; so does a fight after them.
         shelter = parsed.shelter if offered else "no"
-        if shelter == "after" and not accepted:
+        if shelter == "after" and not (accepted or kept):
             shelter = "now"
         if shelter == "now":
             plan, blocker = _start_shelter(plan, blocker, "proposed", source)
@@ -1341,7 +1366,16 @@ class SubgoalPlanner:
                 reasons.append(f"shelter: {blocker}")
         elif shelter == "after":
             plan = plan.with_event("shelter", "proposed", source or "after sub-goals")
-        if (shelter == "now" or fighting) and not accepted:
+        if fight == "after" and not (accepted or kept):
+            fight = "now"
+        if fight != "no":
+            reason = source or ("after the first sub-goal" if fight == "after" else "")
+            plan = plan.with_event("fight", "proposed", reason)
+        if kept:
+            return replace(
+                plan, assessment=parsed.assessment, shelter=shelter, fight=fight
+            )
+        if (shelter == "now" or fight == "now") and not accepted:
             # The night's shelter or the fight alone is a plan; the
             # sub-goals wait.
             return replace(
@@ -1349,7 +1383,7 @@ class SubgoalPlanner:
                 pending=pending.plan.pending,
                 assessment=parsed.assessment,
                 shelter=shelter,
-                fighting=fighting,
+                fight=fight,
             )
         if not accepted:
             pending.plan = replace(plan, rejections=plan.rejections + 1)
@@ -1370,7 +1404,7 @@ class SubgoalPlanner:
             skills_on_current=0,
             current_budget=None,
             shelter=shelter,
-            fighting=fighting,
+            fight=fight,
         )
 
     def _selection(
@@ -1382,7 +1416,7 @@ class SubgoalPlanner:
         """Choose the best first step towards the current sub-goal."""
 
         defence = self._defence(state)
-        if defence is not None and (plan.fighting or not self.choose_fights):
+        if defence is not None and (plan.fight == "now" or not self.choose_fights):
             return self._selected(
                 state, context, replace(plan, defending=True), {defence}
             )

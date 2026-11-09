@@ -561,11 +561,11 @@ def test_summary_sets_choices_against_the_curriculum() -> None:
             choice("shelter", "now", possible=False),
             # The fallback's answers are the curriculum's own.
             choice("shelter", "no", fallback=True),
-            choice("fight", "true"),
-            choice("fight", "false"),
-            choice("fight", "false", win_rate=0.1),
-            choice("fight", "true", win_rate=0.6),
-            choice("fight", "true", win_rate=0.75),
+            choice("fight", "now"),
+            choice("fight", "no"),
+            choice("fight", "after", win_rate=0.1),
+            choice("fight", "now", win_rate=0.6),
+            choice("fight", "now", win_rate=0.75),
         ],
     }
     summary = summarize_open_ended([record])
@@ -580,9 +580,9 @@ def test_summary_sets_choices_against_the_curriculum() -> None:
     assert (fight["answers"], fight["differ"], fight["differ_rate"]) == (5, 2, 0.4)
     # Answers shown no odds are left out of the bands.
     assert fight["by_odds"] == {
-        "won under 25%": {"false": 1},
-        "won 25-75%": {"true": 1},
-        "won 75% or more": {"true": 1},
+        "won under 25%": {"after": 1},
+        "won 25-75%": {"now": 1},
+        "won 75% or more": {"now": 1},
     }
 
 
