@@ -17,9 +17,8 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
+from tiny_sima.goals import MAX_VITAL
 from tiny_sima.planner.observation import vitals
-
-_MAX_VITAL = 9
 
 
 @dataclass(frozen=True)
@@ -89,7 +88,7 @@ class VitalRates:
         parts = []
         if lasts:
             parts.append("At these rates, steps until empty: " + ", ".join(lasts))
-        missing = _MAX_VITAL - readings["health"]
+        missing = MAX_VITAL - readings["health"]
         regain = [
             f"{missing * rate:.0f} steps {how}"
             for how, rate in (

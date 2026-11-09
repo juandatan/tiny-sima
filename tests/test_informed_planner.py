@@ -1,4 +1,4 @@
-"""The goal source's status bar, game manual, rates, re-ask on a hit and rest."""
+"""The goal source's game manual, vital rates, re-ask on a hit and rest."""
 
 from dataclasses import replace
 
@@ -24,7 +24,7 @@ from tiny_sima.planner.subgoals import ReplanTrigger, SubgoalPlanner
 FIGHT_SKILLS = (SkillId.COLLECT_WOOD, SkillId.DEFEAT_ZOMBIE)
 
 
-def test_the_status_bar_and_rates_are_read_out() -> None:
+def test_the_rates_are_told_and_projected() -> None:
     state = _grass_world(tree=[(0, 2)]).replace(
         player_health=jnp.int32(5),
         player_food=jnp.int32(4),
@@ -35,16 +35,12 @@ def test_the_status_bar_and_rates_are_read_out() -> None:
     planner = SubgoalPlanner(
         backend,
         candidate_skills=(SkillId.COLLECT_WOOD,),
-        show_status=True,
         vital_rates=RATES,
     )
     _select(planner, state, PlannerContext(OBJECTIVE))
 
     (request,) = backend.requests
-    assert (
-        "Status bar: health 5, food 4, drink 2, energy 9; day, awake. "
-        "At these rates, steps until empty: food about 104"
-    ) in request.user_prompt
+    assert "At these rates, steps until empty: food about 104" in (request.user_prompt)
     assert "Measured in this player's own staged play" in request.system_prompt
 
     plain = ScriptedBackend(_answer(("inventory.wood", 1)))
@@ -53,7 +49,7 @@ def test_the_status_bar_and_rates_are_read_out() -> None:
         state,
         PlannerContext(OBJECTIVE),
     )
-    assert "Status bar" not in plain.requests[0].user_prompt
+    assert "At these rates" not in plain.requests[0].user_prompt
     assert "staged play" not in plain.requests[0].system_prompt
 
 
@@ -117,6 +113,15 @@ def test_a_hit_in_a_fight_asks_again() -> None:
     )
     calm = _select(planner, state.replace(player_health=jnp.int32(7)), context)
     assert calm.plan_state.trigger is not ReplanTrigger.HURT
+
+    # Nor is health lost with a zombie close while a need is empty.
+    thirsty = close.replace(player_health=jnp.int32(7), player_drink=jnp.int32(0))
+    plan = replace(first.plan_state, health=9, fighting=False)
+    context = PlannerContext(
+        OBJECTIVE, history=(_attempt(SkillId.COLLECT_WOOD),), plan_state=plan
+    )
+    parched = _select(planner, thirsty, context)
+    assert parched.plan_state.trigger is not ReplanTrigger.HURT
 
 
 def _rest_planner():

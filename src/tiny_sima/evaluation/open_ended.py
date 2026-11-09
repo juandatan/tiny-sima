@@ -41,6 +41,7 @@ from tiny_sima.evaluation.chains import (
     chain_episode_record,
     evaluate_chain_episodes,
 )
+from tiny_sima.evaluation.reuse import fingerprint
 from tiny_sima.goals import STONE_PICKAXE_SKILL_IDS, SkillId
 from tiny_sima.planner.competence import CompetencePrior
 from tiny_sima.planner.fight_odds import FightOdds
@@ -73,11 +74,8 @@ DEFAULT_MAX_ENVIRONMENT_STEPS = 3000
 # view's row radius, so anything visible above or below counts.
 DEFAULT_THREAT_RADIUS = 3
 # A skill hands back to the planner when a zombie comes that close or the
-# player is hurt, so the planners can fight it off mid-skill, and a fight
-# hands back at each hit, so the goal source can weigh it again.
-DEFAULT_INTERRUPTION = SkillInterruption(
-    threat_radius=DEFAULT_THREAT_RADIUS, fights_on_hit=True
-)
+# player is hurt, so the planners can fight it off mid-skill.
+DEFAULT_INTERRUPTION = SkillInterruption(threat_radius=DEFAULT_THREAT_RADIUS)
 
 ACHIEVEMENT_NAMES: tuple[str, ...] = tuple(
     achievement.name.lower() for achievement in Achievement
@@ -446,10 +444,11 @@ def open_ended_planners(
     whenever it can. ``fight_odds``, the executor's measured fight odds,
     are shown to the VLM with the close threats.
 
-    With ``informed`` both goal sources read the whole status bar, are
-    asked again when the player is hit with a zombie close, and may shelter
-    by day to rest; the VLM also gets the game's general rules and, with
-    ``vital_rates``, the vital rates measured in staged play.
+    With ``informed`` both goal sources are asked again when the player is
+    hit with a zombie close, which needs an interruption with
+    ``fights_on_hit``, and may shelter by day to rest; the VLM also gets the
+    game's general rules and, with ``vital_rates``, the vital rates measured
+    in staged play.
     """
 
     feasibility = prior if prior is not None else reachability_feasibility
@@ -478,7 +477,6 @@ def open_ended_planners(
             defend_against=("zombie",),
             shelter_at_night=shelter_at_night,
             choose_fights=choose_fights,
-            show_status=informed,
             replan_when_hurt=informed,
             rest_by_day=informed,
             **options,
@@ -504,3 +502,22 @@ def open_ended_planners(
         ),
         "subgoal_scripted": subgoal_planner(curriculum()),
     }
+
+
+def goal_source_provenance(planner: SkillPlanner) -> dict[str, Any] | None:
+    """What a sub-goal planner's goal source is told, for run reuse.
+
+    ``None`` for any other planner, or one told none of it, so runs from
+    before these options still match.
+    """
+
+    if not isinstance(planner, SubgoalPlanner):
+        return None
+    rates = planner.vital_rates
+    told = {
+        "manual": planner.manual,
+        "replan_when_hurt": planner.replan_when_hurt,
+        "rest_by_day": planner.rest_by_day,
+        "vital_rates": None if rates is None else fingerprint(rates.to_dict()),
+    }
+    return told if any(told.values()) else None

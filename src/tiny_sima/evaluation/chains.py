@@ -52,7 +52,6 @@ from tiny_sima.executor.model import (
 )
 from tiny_sima.goals import (
     ALL_SKILL_IDS,
-    MAX_VITAL,
     SKILL_IDS,
     SKILL_MOBS,
     STONE_PICKAXE_SKILL_IDS,
@@ -89,6 +88,7 @@ from tiny_sima.planner.shelter import (
     needs_low,
     shelter_action,
     shelter_feasible,
+    shelter_time,
 )
 from tiny_sima.planner.symbolic import GoalCondition, plan_next_skills
 
@@ -563,17 +563,20 @@ class SkillInterruption:
     mobs: tuple[str, ...] = ("zombie",)
     fights_on_hit: bool = False
 
-    def exempts(self, skill_id: SkillId) -> bool:
-        """Whether ``skill_id`` runs on regardless."""
+    def hunts(self, skill_id: SkillId) -> bool:
+        """Whether ``skill_id`` hunts one of ``mobs``, so none arriving stops it."""
 
         return SKILL_MOBS.get(skill_id) in self.mobs
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "threat_radius": self.threat_radius,
             "mobs": list(self.mobs),
-            "fights_on_hit": self.fights_on_hit,
         }
+        # Left out when off, so runs from before the option still match.
+        if self.fights_on_hit:
+            payload["fights_on_hit"] = True
+        return payload
 
 
 def _threat_near(interruption: SkillInterruption, state: Any) -> jax.Array:
@@ -865,7 +868,13 @@ class ScriptedSkillExecutor:
         native_return = 0.0
         minimum, maximum = start, start
         current = episode_state
-        hunting = interruption is not None and interruption.exempts(skill_id)
+        hunting = interruption is not None and interruption.hunts(skill_id)
+        # A hunt that a hit does not stop runs on regardless.
+        watched = (
+            interruption
+            if interruption is not None and (not hunting or interruption.fights_on_hit)
+            else None
+        )
         step_keys = jax.random.split(rng, horizon)
         for step_index in range(horizon):
             action = _scripted_action(current.env_state, skill_id)
@@ -882,12 +891,10 @@ class ScriptedSkillExecutor:
             maximum = tuple(map(max, maximum, counts))
             outcome = _outcome_from_step(result)
             if (
-                interruption is not None
+                watched is not None
                 and outcome in (None, SkillOutcome.TIMEOUT)
                 and bool(
-                    _interrupts(
-                        interruption, previous.env_state, current.env_state, hunting
-                    )
+                    _interrupts(watched, previous.env_state, current.env_state, hunting)
                 )
             ):
                 outcome = SkillOutcome.INTERRUPTED
@@ -1019,7 +1026,7 @@ def _run_shelter(
         if action is None:
             if needs_low(state):
                 outcome = SkillOutcome.PRECONDITION_LOST
-            elif is_night(state) or (rest and int(state.player_health) < MAX_VITAL):
+            elif shelter_time(state, rest) is None:
                 outcome = SkillOutcome.INFEASIBLE
             else:
                 outcome = SkillOutcome.SUCCESS
@@ -2255,7 +2262,7 @@ def _batched_skill_execution(
     # interruption watches for.
     hunting = jnp.asarray(
         [
-            interruption is not None and interruption.exempts(skill_id)
+            interruption is not None and interruption.hunts(skill_id)
             for skill_id in ALL_SKILL_IDS
         ]
     )

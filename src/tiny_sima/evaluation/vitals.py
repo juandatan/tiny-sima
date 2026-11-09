@@ -31,13 +31,13 @@ from craftax.craftax_classic.constants import DIRECTIONS, Action, BlockType
 
 from tiny_sima.envs.chains import reset_player
 from tiny_sima.envs.open_ended import make_open_ended_environment
+from tiny_sima.goals import MAX_VITAL
 from tiny_sima.planner.vital_rates import VitalRates
 
 VITAL_SCENARIOS: tuple[str, ...] = ("awake", "asleep", "sleeping", "starving", "plant")
 VITAL_RATES_SEED = 223
 # Long enough for a sapling to ripen with room to spare.
 DEFAULT_VITAL_STEPS = 720
-_MAX_VITAL = 9
 
 
 class VitalReadings(NamedTuple):
@@ -68,20 +68,26 @@ def _reading(state: Any) -> tuple[jax.Array, ...]:
     )
 
 
+def _is(scenarios: Any) -> dict[str, Any]:
+    """Whether each world, by its scenario index, stages each scenario."""
+
+    return {name: scenarios == index for index, name in enumerate(VITAL_SCENARIOS)}
+
+
 def _stage(state: Any, scenario: jax.Array) -> Any:
     """Set the player up for one of :data:`VITAL_SCENARIOS`, by index."""
 
-    full = jnp.asarray(_MAX_VITAL, dtype=jnp.int32)
+    full = jnp.asarray(MAX_VITAL, dtype=jnp.int32)
     low = jnp.asarray(1, dtype=jnp.int32)
-    starving = scenario == VITAL_SCENARIOS.index("starving")
+    is_ = _is(scenario)
     state = reset_player(
         state,
-        health=jnp.where(starving, full, low),
-        food=jnp.where(starving, 0, full),
+        health=jnp.where(is_["starving"], full, low),
+        food=jnp.where(is_["starving"], 0, full),
         drink=full,
-        energy=jnp.where(_sleeps(scenario), 0, full),
+        energy=jnp.where(is_["asleep"] | is_["sleeping"], 0, full),
     )
-    plant = scenario == VITAL_SCENARIOS.index("plant")
+    plant = is_["plant"]
     tile = _facing(state)
     block = jnp.where(plant, BlockType.GRASS.value, state.map[tile[0], tile[1]])
     return state.replace(
@@ -92,19 +98,13 @@ def _stage(state: Any, scenario: jax.Array) -> Any:
     )
 
 
-def _sleeps(scenario: jax.Array | int) -> jax.Array:
-    return (scenario == VITAL_SCENARIOS.index("asleep")) | (
-        scenario == VITAL_SCENARIOS.index("sleeping")
-    )
-
-
 def _actions(scenarios: jax.Array, steps: int) -> jax.Array:
     """Each world's action at each step, shaped ``[steps, worlds]``."""
 
-    sleep = _sleeps(scenarios)
-    plant = scenarios == VITAL_SCENARIOS.index("plant")
+    is_ = _is(scenarios)
+    sleep = is_["asleep"] | is_["sleeping"]
     actions = jnp.where(sleep, Action.SLEEP.value, Action.NOOP.value)
-    first = jnp.where(plant, Action.PLACE_PLANT.value, actions)
+    first = jnp.where(is_["plant"], Action.PLACE_PLANT.value, actions)
     return jnp.concatenate(
         [first[None], jnp.broadcast_to(actions, (steps - 1, *actions.shape))]
     ).astype(jnp.int32)
@@ -128,8 +128,7 @@ def run_vital_scenarios(
     keys = jax.random.split(reset_rng, scenarios.shape[0])
     states = jax.vmap(lambda key: environment.reset(key).state)(keys)
     states = jax.vmap(_stage)(states, scenarios)
-    hold = scenarios == VITAL_SCENARIOS.index("plant")
-    drowsy = scenarios == VITAL_SCENARIOS.index("sleeping")
+    is_ = _is(scenarios)
     step = jax.vmap(env.step, in_axes=(0, 0, 0, None))
 
     def advance(state: Any, inputs: tuple[jax.Array, jax.Array]) -> tuple[Any, Any]:
@@ -139,15 +138,16 @@ def run_vital_scenarios(
         )
         # The plant's watcher is kept fed, so it outlives the ripening, and
         # the sleeper is kept tired, so it does not wake.
-        energy = jnp.where(hold, _MAX_VITAL, jnp.where(drowsy, 0, state.player_energy))
+        def pin(where: jax.Array, value: int, current: jax.Array) -> jax.Array:
+            return jnp.where(where, value, current).astype(current.dtype)
+
+        plant = is_["plant"]
         state = state.replace(
-            player_food=jnp.where(hold, _MAX_VITAL, state.player_food).astype(
-                state.player_food.dtype
+            player_food=pin(plant, MAX_VITAL, state.player_food),
+            player_drink=pin(plant, MAX_VITAL, state.player_drink),
+            player_energy=pin(
+                plant, MAX_VITAL, pin(is_["sleeping"], 0, state.player_energy)
             ),
-            player_drink=jnp.where(hold, _MAX_VITAL, state.player_drink).astype(
-                state.player_drink.dtype
-            ),
-            player_energy=energy.astype(state.player_energy.dtype),
         )
         return state, jax.vmap(_reading)(state)
 
@@ -179,7 +179,7 @@ def _steps_per_change(
     """
 
     before = values[:-1].astype(int)
-    keep = keep & ((before > 0) if direction < 0 else (before < _MAX_VITAL))
+    keep = keep & ((before > 0) if direction < 0 else (before < MAX_VITAL))
     changed = (np.diff(values.astype(int), axis=0) * direction > 0) & keep
     count = int(changed.sum())
     return float(keep.sum()) / count if count else None
@@ -190,10 +190,12 @@ def vital_rates_from_readings(
 ) -> VitalRates:
     """Measure each rate in the scenario that shows it, from the readings."""
 
+    is_ = _is(scenarios)
+
     def rate(
         scenario: str, vital: str, direction: int, keep: np.ndarray
     ) -> float | None:
-        worlds = scenarios == VITAL_SCENARIOS.index(scenario)
+        worlds = is_[scenario]
         values = getattr(readings, vital)[:, worlds]
         return _steps_per_change(values, direction, keep[:, worlds])
 
@@ -210,11 +212,8 @@ def vital_rates_from_readings(
         & (readings.drink > 0)
         & ((readings.energy > 0) | readings.sleeping)
     )
-    hurt = readings.health[:-1] < _MAX_VITAL
-
-    plant = scenarios == VITAL_SCENARIOS.index("plant")
     ripening = []
-    for world in np.flatnonzero(plant):
+    for world in np.flatnonzero(is_["plant"]):
         facing = readings.facing[:, world]
         placed = np.flatnonzero(facing == BlockType.PLANT.value)
         ripe = np.flatnonzero(facing == BlockType.RIPE_PLANT.value)
@@ -228,8 +227,8 @@ def vital_rates_from_readings(
         food_asleep=rate("sleeping", "food", -1, asleep & alive),
         drink_asleep=rate("sleeping", "drink", -1, asleep & alive),
         energy_asleep=rate("asleep", "energy", 1, asleep & alive),
-        health_awake=rate("awake", "health", 1, awake & fed & hurt),
-        health_asleep=rate("sleeping", "health", 1, asleep & fed & hurt),
+        health_awake=rate("awake", "health", 1, awake & fed),
+        health_asleep=rate("sleeping", "health", 1, asleep & fed),
         health_starving=rate("starving", "health", -1, awake & ~fed & alive),
         plant_ripe=float(np.mean(ripening)) if ripening else None,
     )

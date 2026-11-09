@@ -37,7 +37,7 @@ from craftax.craftax_classic.constants import (
 from craftax.craftax_classic.envs.craftax_state import EnvParams
 from craftax.craftax_classic.game_logic import calculate_light_level
 
-from tiny_sima.goals import MOB_TYPES, mob_instances
+from tiny_sima.goals import MAX_VITAL, MOB_TYPES, mob_instances
 from tiny_sima.planner.observation import NIGHT_LIGHT_THRESHOLD
 
 Position = tuple[int, int]
@@ -48,8 +48,6 @@ SHELTER_NEED_FLOOR = 2
 SHELTER_SEARCH_RADIUS = 8
 # The steps a water wall is worth: the player drinks from it inside.
 _WATER_BONUS = 4
-# Every vital tops out here.
-_MAX_VITAL = 9
 
 _MOVES: dict[int, Position] = {
     action.value: (int(DIRECTIONS[action.value][0]), int(DIRECTIONS[action.value][1]))
@@ -257,18 +255,30 @@ def shelter_blocker(state: Any, by_day: bool = False) -> str | None:
     return shelter_status(state, by_day)[0]
 
 
+def shelter_time(state: Any, by_day: bool = False) -> str | None:
+    """Why it is not a time to shelter, or ``None`` when it is.
+
+    It is at night, and with ``by_day`` by day too while health is not full.
+    """
+
+    if is_night(state):
+        return None
+    if not by_day:
+        return "it is day"
+    if _health(state) >= MAX_VITAL:
+        return "health is full"
+    return None
+
+
 def shelter_status(state: Any, by_day: bool = False) -> tuple[str | None, Room | None]:
     """:func:`shelter_blocker` with the room the shelter would use, if any.
 
-    The room is looked for at night, or with ``by_day`` by day while health
-    is not full.
+    The room is looked for only at a :func:`shelter_time`.
     """
 
-    if not is_night(state):
-        if not by_day:
-            return "it is day", None
-        if _health(state) >= _MAX_VITAL:
-            return "health is full", None
+    not_now = shelter_time(state, by_day)
+    if not_now is not None:
+        return not_now, None
     room = choose_room(state)
     if _food(state) <= SHELTER_NEED_FLOOR:
         return "food is too low to stay in", room
@@ -348,10 +358,10 @@ def shelter_action(
     water = _walls_of(room, world_map, BlockType.WATER)
     # Water walls the room, so the player drinks without leaving.
     drink = int(np.asarray(state.player_drink))
-    if inside and not open_walls and not sleeping and water and drink < _MAX_VITAL:
+    if inside and not open_walls and not sleeping and water and drink < MAX_VITAL:
         return _use_wall(state, water), room
     thirsty = needs_low(state) and (_food(state) <= SHELTER_NEED_FLOOR or not water)
-    stay = is_night(state) or sleeping or (rest and _health(state) < _MAX_VITAL)
+    stay = sleeping or shelter_time(state, rest) is None
     if not stay or thirsty:
         if not inside or open_walls:
             return None, room
@@ -361,7 +371,7 @@ def shelter_action(
         if not inside:
             return None, room
         energy = int(np.asarray(state.player_energy))
-        return (Action.SLEEP if energy < _MAX_VITAL else Action.NOOP).value, room
+        return (Action.SLEEP if energy < MAX_VITAL else Action.NOOP).value, room
     # Clear any other creature out of the room before walling it in.
     mobs = _mob_positions(state, tuple(MOB_TYPES))
     for move, step in _MOVES.items():
