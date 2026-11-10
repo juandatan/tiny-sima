@@ -157,6 +157,32 @@ class BatchedVisionLanguageBackend(Protocol):
         ...
 
 
+@runtime_checkable
+class LogprobBackend(Protocol):
+    """Optional backend extension that scores continuations of a response.
+
+    SayCan's Say term: rather than the one answer decoding picks, how likely
+    the model finds each of a few answers at the same point.
+    """
+
+    def score_continuations(
+        self,
+        requests: Sequence[VLMRequest],
+        prefixes: Sequence[str],
+        continuations: Sequence[Sequence[str]],
+    ) -> list[tuple[float, ...]]:
+        """Return the log-probability of each continuation of each request.
+
+        ``prefixes[i]`` is the start of the model's response to
+        ``requests[i]``, and each of ``continuations[i]`` is scored as the
+        text that follows it: summed over its tokens, given the chat and the
+        prefix. A request's scores may share a constant, so only their
+        differences are meant to be read.
+        """
+
+        ...
+
+
 def generate_all(
     backend: VisionLanguageBackend,
     requests: Sequence[VLMRequest],
@@ -1443,3 +1469,70 @@ class TransformersVLMBackend:
                 for index, output in zip(chunk, outputs, strict=True):
                     responses[index] = _response_text(output)
         return responses
+
+    def score_continuations(
+        self,
+        requests: Sequence[VLMRequest],
+        prefixes: Sequence[str],
+        continuations: Sequence[Sequence[str]],
+    ) -> list[tuple[float, ...]]:
+        """Score each request's continuations in one forward pass per request.
+
+        The chat is rendered as generation renders it, the prefix appended
+        and each continuation after it, one row each. Only the tokens after
+        the rows' common start are summed: the shared ones score the same in
+        every row, and tokenising each text whole keeps the boundary merges
+        decoding would see. Rows are padded on the left, so their last
+        tokens line up and only the last logits are computed.
+        """
+
+        import torch  # pyright: ignore[reportMissingImports]
+
+        processor, outlines_model, _ = self._load()
+        model = self._model
+        assert model is not None
+        scores: list[tuple[float, ...]] = []
+        for request, prefix, options in zip(
+            requests, prefixes, continuations, strict=True
+        ):
+            formatted = outlines_model.type_adapter.format_input(_planner_chat(request))
+            texts = [formatted["text"] + prefix + option for option in options]
+            images = formatted.get("images")
+            inputs = processor(
+                text=texts,
+                images=None if images is None else images * len(options),
+                padding=True,
+                padding_side="left",
+                return_tensors="pt",
+            ).to(model.device)
+            mask = inputs["attention_mask"].bool()
+            rows = [
+                ids[row_mask].tolist()
+                for ids, row_mask in zip(inputs["input_ids"], mask, strict=True)
+            ]
+            common = 0
+            while all(
+                common < len(row) and row[common] == rows[0][common] for row in rows
+            ):
+                common += 1
+            tails = [len(row) - common for row in rows]
+            if common == 0 or min(tails) == 0:
+                raise ValueError("Continuations must differ after a shared start.")
+            keep = max(tails) + 1
+            with torch.inference_mode():
+                logits = model(**inputs, logits_to_keep=keep).logits
+            log_probs = torch.log_softmax(logits.float(), dim=-1)
+            request_scores = []
+            for row, (ids, tail) in enumerate(
+                zip(inputs["input_ids"], tails, strict=True)
+            ):
+                # The kept logits end at the last token; token j of the tail
+                # sits tail - j from the end and is predicted one before.
+                total = 0.0
+                for j in range(tail):
+                    position = keep - tail + j - 1
+                    token = ids[ids.shape[0] - tail + j]
+                    total += float(log_probs[row, position, token])
+                request_scores.append(total)
+            scores.append(tuple(request_scores))
+        return scores

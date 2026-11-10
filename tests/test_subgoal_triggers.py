@@ -1,6 +1,8 @@
+import math
 from collections.abc import Sequence
 
 import jax.numpy as jnp
+import pytest
 from craftax.craftax_classic.envs.craftax_state import EnvParams
 from craftax.craftax_classic.game_logic import calculate_light_level
 
@@ -390,7 +392,9 @@ def test_the_vlm_is_shown_the_measured_odds_of_the_fight() -> None:
     assert (
         "health is 4. Odds at health 4, a wood sword and 2 zombies: fighting won "
         "45%, died 55%. Not fighting, going on with it close: collect wood done "
-        "60%, died 30%; drink water done 30%, died 50%." in request.user_prompt
+        "60%, died 30%; drink water done 30%, died 50%. Safest first: not "
+        "fighting to collect wood, died 30%; not fighting to drink water, died "
+        "50%; fighting, died 55%." in request.user_prompt
     )
     (choice,) = selection.plan_state.choices
     assert (choice.answer, choice.win_rate) == ("no", 0.45)
@@ -407,3 +411,107 @@ def test_the_vlm_is_shown_the_measured_odds_of_the_fight() -> None:
     (request,) = plain.backend.requests
     assert "Odds at" not in request.user_prompt
     assert "gives the odds" not in request.system_prompt
+
+
+class SayingBackend(ScriptedBackend):
+    """A scripted backend that also gives fixed log-probabilities."""
+
+    def __init__(self, answer: str, logits: tuple[float, ...]) -> None:
+        super().__init__(answer)
+        self.logits = logits
+        self.scored: list[tuple[str, tuple[str, ...]]] = []
+
+    def score_continuations(self, requests, prefixes, continuations):
+        self.scored.extend(zip(prefixes, map(tuple, continuations), strict=True))
+        return [self.logits for _ in requests]
+
+
+def test_the_fight_is_chosen_saycan_style_from_the_vlm_and_the_odds() -> None:
+    skills = (SkillId.COLLECT_WOOD, SkillId.DRINK_WATER, SkillId.DEFEAT_ZOMBIE)
+    close = _with_mobs(_grass_world(tree=[(0, 2)]), "zombies", (1, 1))
+    odds = FightOdds(
+        {
+            ("defeat_zombie", "zombie", 9, "none", 1): (0.8, 0.1, 100),
+            ("collect_wood", "zombie", 9, "none", 1): (0.5, 0.6, 100),
+            ("drink_water", "zombie", 9, "none", 1): (0.5, 0.0, 100),
+        }
+    )
+    answer = _answer(("inventory.wood", 1), assessment="Zombie close.", fight="no")
+    # The VLM leans to going on: now 0.3, after 0.1, no 0.6.
+    say = (math.log(3.0), math.log(1.0), math.log(6.0))
+
+    def planner(weight, backend, fight_odds=odds):
+        return SubgoalPlanner(
+            backend,
+            candidate_skills=skills,
+            threat_radius=2,
+            defend_against=("zombie",),
+            choose_fights=True,
+            fight_odds=fight_odds,
+            fight_survival_weight=weight,
+        )
+
+    backend = SayingBackend(answer, say)
+    selection = _select(planner(1.0, backend), close, PlannerContext(OBJECTIVE))
+    # Going on is to collect wood, died 60%, against the fight's 10%:
+    # 0.3 x 0.9 beats 0.6 x 0.4. The errands' mean, 30%, would not.
+    assert selection.decision.skill_id is SkillId.DEFEAT_ZOMBIE
+    assert selection.plan_state.fight == "now"
+    (choice,) = selection.plan_state.choices
+    assert (choice.answer, choice.generated) == ("now", "no")
+    assert choice.say == pytest.approx((0.3, 0.1, 0.6))
+    assert choice.survival == pytest.approx((0.9, 0.36, 0.4))
+    assert choice.to_dict()["say"] == pytest.approx(
+        {"now": 0.3, "after": 0.1, "no": 0.6}
+    )
+    # Each choice is scored in place of the answer's, after its assessment.
+    ((prefix, options),) = backend.scored
+    assert prefix.endswith(
+        '"Zombie close.", "subgoals": [{"field": '
+        '"inventory.wood", "at_least": 1}], "fight": '
+    )
+    assert options == ('"now"}', '"after"}', '"no"}')
+
+    # A weight of 0 leaves the VLM's probabilities alone to decide, as does
+    # a table without the fight.
+    for weight, fight_odds in ((0.0, odds), (1.0, None)):
+        backend = SayingBackend(answer, say)
+        selection = _select(
+            planner(weight, backend, fight_odds), close, PlannerContext(OBJECTIVE)
+        )
+        assert selection.decision.skill_id is SkillId.COLLECT_WOOD
+        (choice,) = selection.plan_state.choices
+        assert choice.answer == "no"
+    assert choice.survival is None
+
+    # Without a weight the answer's fight stands and nothing is scored.
+    backend = SayingBackend(answer, say)
+    selection = _select(planner(None, backend), close, PlannerContext(OBJECTIVE))
+    assert selection.plan_state.fight == "no"
+    assert backend.scored == []
+    (choice,) = selection.plan_state.choices
+    assert choice.say is None and choice.generated is None
+
+
+def test_saycan_fight_scores_are_cached_and_skip_answers_without_a_fight() -> None:
+    skills = (SkillId.COLLECT_WOOD, SkillId.DEFEAT_ZOMBIE)
+    state = _grass_world(tree=[(0, 2)])
+    close = _with_mobs(state, "zombies", (1, 1))
+    backend = SayingBackend(
+        _answer(("inventory.wood", 1), fight="now"), (0.0, -5.0, -1.0)
+    )
+    planner = SubgoalPlanner(
+        backend,
+        candidate_skills=skills,
+        threat_radius=2,
+        defend_against=("zombie",),
+        choose_fights=True,
+        fight_survival_weight=1.0,
+    )
+    for _ in range(2):
+        selection = _select(planner, close, PlannerContext(OBJECTIVE))
+        assert selection.plan_state.fight == "now"
+    assert len(backend.scored) == 1
+    # No zombie close, no fight offered: nothing to score.
+    _select(planner, state, PlannerContext(OBJECTIVE))
+    assert len(backend.scored) == 1

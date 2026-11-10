@@ -162,6 +162,7 @@ from tiny_sima.planner.vital_rates import VitalRates
 from tiny_sima.planner.vlm import (
     DEFAULT_PROMPT_STYLE,
     BatchedVisionLanguageBackend,
+    LogprobBackend,
     ParsedVLMResponse,
     PlannerPromptStyle,
     TransformersVLMBackend,
@@ -197,6 +198,7 @@ __all__ = [
     "BatchedFeasibilityScorer",
     "BatchedUtilityScorer",
     "BatchedVisionLanguageBackend",
+    "LogprobBackend",
     "CompetencePrior",
     "FightOdds",
     "VitalRates",

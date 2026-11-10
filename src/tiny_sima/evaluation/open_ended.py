@@ -429,6 +429,7 @@ def open_ended_planners(
     fight_odds: FightOdds | None = None,
     vital_rates: VitalRates | None = None,
     informed: bool = True,
+    fight_survival_weight: float | None = None,
 ) -> dict[str, SkillPlanner]:
     """Return the three designs, built as notebook 06 builds its planners.
 
@@ -451,6 +452,10 @@ def open_ended_planners(
     and, with ``vital_rates``, the vital rates measured in staged play. A
     fight is asked about again at each hit only with an interruption with
     ``fights_on_hit``, which only the VLM needs: the curriculum fights on.
+
+    With ``fight_survival_weight`` the VLM's fight is chosen SayCan-style:
+    its probability of each choice weighed against the measured chance of
+    surviving it (see :class:`SubgoalPlanner`).
     """
 
     feasibility = prior if prior is not None else reachability_feasibility
@@ -501,6 +506,7 @@ def open_ended_planners(
             fight_odds=fight_odds,
             manual=informed,
             vital_rates=vital_rates if informed else None,
+            fight_survival_weight=fight_survival_weight,
         ),
         "subgoal_scripted": subgoal_planner(curriculum()),
     }
@@ -522,4 +528,8 @@ def goal_source_provenance(planner: SkillPlanner) -> dict[str, Any] | None:
         "rest_by_day": planner.rest_by_day,
         "vital_rates": None if rates is None else fingerprint(rates.to_dict()),
     }
+    # Only when set, so runs from before the option still match.
+    if planner.fight_survival_weight is not None:
+        told["fight_survival_weight"] = planner.fight_survival_weight
+        return told
     return told if any(told.values()) else None

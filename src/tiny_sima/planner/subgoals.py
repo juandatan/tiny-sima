@@ -30,6 +30,8 @@ with the chain's own completion test.
 from __future__ import annotations
 
 import json
+import math
+import re
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -89,6 +91,7 @@ from tiny_sima.planner.symbolic import (
 )
 from tiny_sima.planner.vital_rates import VitalRates
 from tiny_sima.planner.vlm import (
+    LogprobBackend,
     VisionLanguageBackend,
     VLMRequest,
     _json_object,
@@ -139,6 +142,9 @@ SHELTER_CHOICES: tuple[str, ...] = ("now", "after", "no")
 # is reached, such as drinking first, or not at all.
 FIGHT_CHOICES: tuple[str, ...] = ("now", "after", "no")
 _HUNTING_SKILLS: dict[str, SkillId] = {mob: skill for skill, mob in SKILL_MOBS.items()}
+# The fight value in a generated answer, with what closes it, so each choice
+# is scored as the same text with only the value changed.
+_FIGHT_ANSWER = re.compile(r'"fight"\s*:\s*(")(?:now|after|no)"(\s*[,}]?)')
 _ASSESSMENT_MAX_LENGTH = 120
 _MAX_FIELD_VALUE = 9
 
@@ -261,7 +267,10 @@ class SubgoalChoice:
     a fight is only offered while one could start. With it a report can set
     the answer against the curriculum's rule in the same state.
     ``win_rate`` is the measured chance of winning the fight the prompt
-    gave, when it gave one.
+    gave, when it gave one. A fight chosen SayCan-style also keeps, in
+    ``FIGHT_CHOICES`` order, the VLM's probability of each choice
+    (``say``), the measured chance of surviving it (``survival``), and the
+    answer it generated (``generated``), which the choice may overrule.
     """
 
     decision_index: int
@@ -272,8 +281,18 @@ class SubgoalChoice:
     possible: bool
     fallback: bool = False
     win_rate: float | None = None
+    say: tuple[float, ...] | None = None
+    survival: tuple[float, ...] | None = None
+    generated: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        def by_choice(values: tuple[float, ...] | None) -> dict[str, float] | None:
+            return (
+                None
+                if values is None
+                else dict(zip(FIGHT_CHOICES, values, strict=True))
+            )
+
         return {
             "decision_index": self.decision_index,
             "kind": self.kind,
@@ -281,6 +300,9 @@ class SubgoalChoice:
             "possible": self.possible,
             "fallback": self.fallback,
             "win_rate": self.win_rate,
+            "say": by_choice(self.say),
+            "survival": by_choice(self.survival),
+            "generated": self.generated,
         }
 
 
@@ -797,6 +819,19 @@ def _fight_rates_text(rates: Sequence[FightRate], mob: str) -> str:
             )
             + "."
         )
+    if fight and errands:
+        # Ranked, so the comparison is read rather than worked out; a tie
+        # keeps the fight first.
+        choices = [("fighting", fight[0].death_rate)] + [
+            (f"not fighting to {rate.skill.replace('_', ' ')}", rate.death_rate)
+            for rate in errands
+        ]
+        ranked = sorted(choices, key=lambda choice: choice[1])
+        parts.append(
+            "Safest first: "
+            + "; ".join(f"{name}, died {death:.0%}" for name, death in ranked)
+            + "."
+        )
     return " ".join(parts)
 
 
@@ -919,6 +954,15 @@ class SubgoalPlanner:
     and whose earlier sub-goals are no longer reachable, so it keeps playing
     rather than stopping; its sub-goals are proposed with reason
     ``"fallback"``.
+    With ``fight_survival_weight`` and a :class:`LogprobBackend` the fight
+    is chosen SayCan-style rather than taken from the answer: each choice
+    scores the VLM's log-probability of it, after the answer's assessment,
+    plus the weight times the log of the measured chance of surviving it.
+    Fighting now survives the fight's death rate, declining the errand's
+    with the mob close, the first step of the current sub-goal's where
+    measured and otherwise the errands' mean, and fighting after both.
+    Without both rates every choice survives alike, and the VLM's
+    probabilities alone decide; a weight of 0 does the same.
     """
 
     backend: VisionLanguageBackend | SubgoalSource
@@ -949,7 +993,11 @@ class SubgoalPlanner:
     manual: bool = False
     replan_when_hurt: bool = False
     vital_rates: VitalRates | None = None
+    fight_survival_weight: float | None = None
     _cache: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    _say_cache: dict[str, tuple[float, ...]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def _belief(self, context: PlannerContext) -> Any:
         memory = context.memory
@@ -1248,14 +1296,96 @@ class SubgoalPlanner:
         self._cache.update(zip(missing, responses, strict=True))
         return [self._cache[key] for key, _ in prepared]
 
+    def _fight_says(
+        self, waiting: Sequence[SubgoalRequest], responses: Sequence[str]
+    ) -> list[tuple[float, ...] | None]:
+        """The VLM's probability of each fight choice, where it is scored.
+
+        Each choice is scored in place of the answer's value, after the
+        answer's assessment, and the scores normalised over the choices.
+        ``None`` where no fight is on offer, the answer has no fight, or the
+        fight is the answer's own.
+        """
+
+        says: list[tuple[float, ...] | None] = [None] * len(waiting)
+        if self.fight_survival_weight is None or not isinstance(
+            self.backend, LogprobBackend
+        ):
+            return says
+        missing: dict[str, tuple[VLMRequest, str, tuple[str, ...]]] = {}
+        keys: dict[int, str] = {}
+        for index, (pending, response) in enumerate(
+            zip(waiting, responses, strict=True)
+        ):
+            match = _FIGHT_ANSWER.search(response)
+            if self._defence(pending.state) is None or match is None:
+                continue
+            key, request = self._request(pending)
+            keys[index] = key
+            if key not in self._say_cache:
+                missing[key] = (
+                    request,
+                    response[: match.start(1)],
+                    tuple(f'"{choice}"{match.group(2)}' for choice in FIGHT_CHOICES),
+                )
+        if missing:
+            requests, prefixes, options = zip(*missing.values(), strict=True)
+            scores = self.backend.score_continuations(requests, prefixes, options)
+            for key, logits in zip(missing, scores, strict=True):
+                top = max(logits)
+                weights = [math.exp(logit - top) for logit in logits]
+                self._say_cache[key] = tuple(
+                    weight / sum(weights) for weight in weights
+                )
+        for index, key in keys.items():
+            says[index] = self._say_cache[key]
+        return says
+
+    def _fight_survival(
+        self,
+        state: Any,
+        context: PlannerContext,
+        current: GoalCondition | None,
+    ) -> tuple[float, ...] | None:
+        """The measured chance of surviving each fight choice, if measured.
+
+        In ``FIGHT_CHOICES`` order: the fight's, then both in turn, then the
+        errand's, that of the first step towards ``current`` where measured
+        and otherwise the mean of the errands'.
+        """
+
+        hunting = {skill.value for skill in _HUNTING_SKILLS.values()}
+        rates = self._fight_rates(state)
+        fight = next((rate for rate in rates if rate.skill in hunting), None)
+        errands = [rate for rate in rates if rate.skill not in hunting]
+        if current is not None:
+            steps = {
+                skill.value
+                for skill in self._check(state, context, current).first_steps
+            }
+            errands = [rate for rate in errands if rate.skill in steps] or errands
+        if fight is None or not errands:
+            return None
+        stay = 1.0 - fight.death_rate
+        go = 1.0 - float(np.mean([rate.death_rate for rate in errands]))
+        survival = {"now": stay, "after": stay * go, "no": go}
+        return tuple(survival[choice] for choice in FIGHT_CHOICES)
+
     def _accept(
-        self, pending: SubgoalRequest, response: str, *, fallback: bool = False
+        self,
+        pending: SubgoalRequest,
+        response: str,
+        *,
+        fallback: bool = False,
+        say: tuple[float, ...] | None = None,
     ) -> SubgoalPlan | None:
         """Return the plan a response gives, or record why it was rejected.
 
         On rejection the episode's ``plan`` keeps the counts and events and
         its ``feedback`` holds the reasons for the next round. ``fallback``
         counts the response as the fallback source's rather than a call.
+        ``say``, the VLM's probability of each fight choice, has the fight
+        chosen SayCan-style rather than taken from the response.
         """
 
         plan = replace(
@@ -1279,42 +1409,19 @@ class SubgoalPlanner:
         blocker = shelter_blocker(pending.state, self.rest_by_day) if offered else None
         # The latest answer while a mob is close decides the fight.
         fight_offered = self.choose_fights and self._defence(pending.state) is not None
-        fight = parsed.fight if fight_offered else "no"
+        fight = "no"
         # A hit asks again only whether to fight and shelter; the sub-goals
         # stand.
         kept = pending.plan.pending if pending.trigger is ReplanTrigger.HURT else ()
-        choices = []
         if offered:
-            choices.append(
-                SubgoalChoice(
-                    plan.decision_index,
-                    "shelter" if is_night(pending.state) else "rest",
-                    parsed.shelter,
-                    blocker is None,
-                    fallback,
-                )
+            choice = SubgoalChoice(
+                plan.decision_index,
+                "shelter" if is_night(pending.state) else "rest",
+                parsed.shelter,
+                blocker is None,
+                fallback,
             )
-        if fight_offered:
-            hunting = {skill.value for skill in _HUNTING_SKILLS.values()}
-            rate = next(
-                (
-                    rate
-                    for rate in self._fight_rates(pending.state)
-                    if rate.skill in hunting
-                ),
-                None,
-            )
-            choices.append(
-                SubgoalChoice(
-                    plan.decision_index,
-                    "fight",
-                    parsed.fight,
-                    True,
-                    fallback,
-                    None if rate is None else rate.win_rate,
-                )
-            )
-        plan = replace(plan, choices=(*plan.choices, *choices))
+            plan = replace(plan, choices=(*plan.choices, choice))
         # Sub-goals an earlier round of this decision already reported as
         # held; the 2B model repeats them until its rounds run out.
         reported = {
@@ -1348,6 +1455,12 @@ class SubgoalPlanner:
             else:
                 reasons.append(f"{text}: {check.reason}")
                 plan = plan.with_event(text, "rejected", check.reason)
+        # Declining the fight goes on with the current sub-goal, so its
+        # odds are that sub-goal's first step's.
+        if fight_offered:
+            plan, fight = self._fight_choice(
+                pending, plan, parsed.fight, (*kept, *accepted)[:1], fallback, say
+            )
         # The reachable sub-goals of an answer are kept; the rest stay in the
         # events with their reasons, which the next request shows. Turning
         # the whole answer down for one unreachable sub-goal ended episodes
@@ -1406,6 +1519,51 @@ class SubgoalPlanner:
             shelter=shelter,
             fight=fight,
         )
+
+    def _fight_choice(
+        self,
+        pending: SubgoalRequest,
+        plan: SubgoalPlan,
+        answer: str,
+        current: tuple[GoalCondition, ...],
+        fallback: bool,
+        say: tuple[float, ...] | None,
+    ) -> tuple[SubgoalPlan, str]:
+        """Record the fight choice, SayCan's where ``say`` is given."""
+
+        hunting = {skill.value for skill in _HUNTING_SKILLS.values()}
+        rate = next(
+            (
+                rate
+                for rate in self._fight_rates(pending.state)
+                if rate.skill in hunting
+            ),
+            None,
+        )
+        choice = SubgoalChoice(
+            plan.decision_index,
+            "fight",
+            answer,
+            True,
+            fallback,
+            None if rate is None else rate.win_rate,
+        )
+        if say is not None and self.fight_survival_weight is not None:
+            survival = self._fight_survival(
+                pending.state, pending.context, current[0] if current else None
+            )
+            can = survival or (1.0,) * len(FIGHT_CHOICES)
+            weight = self.fight_survival_weight
+            scores = [
+                math.log(max(p, 1e-12)) + weight * math.log(max(alive, 1e-6))
+                for p, alive in zip(say, can, strict=True)
+            ]
+            chosen = FIGHT_CHOICES[int(np.argmax(scores))]
+            choice = replace(
+                choice, answer=chosen, say=say, survival=survival, generated=answer
+            )
+            answer = chosen
+        return replace(plan, choices=(*plan.choices, choice)), answer
 
     def _selection(
         self,
@@ -1526,9 +1684,10 @@ class SubgoalPlanner:
             if not waiting:
                 break
             responses = self._generate(waiting)
+            says = self._fight_says(waiting, responses)
             rejected: list[SubgoalRequest] = []
-            for pending, response in zip(waiting, responses, strict=True):
-                accepted = self._accept(pending, response)
+            for pending, response, say in zip(waiting, responses, says, strict=True):
+                accepted = self._accept(pending, response, say=say)
                 if accepted is None:
                     rejected.append(pending)
                 else:
@@ -1564,3 +1723,4 @@ class SubgoalPlanner:
         """Discard cached responses between matched ablations."""
 
         self._cache.clear()
+        self._say_cache.clear()
