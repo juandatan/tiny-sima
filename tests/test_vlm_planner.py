@@ -916,6 +916,97 @@ def test_transformers_backend_decodes_greedily_by_default(
     assert [call["do_sample"] for call in calls] == [False, False, True]
 
 
+def test_transformers_backend_scores_continuations_from_one_cached_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    vocabulary = 128
+
+    class Inputs(dict):
+        def to(self, device: Any) -> "Inputs":
+            return self
+
+    class Processor:
+        def tokenizer(self, texts: list[str]) -> dict[str, Any]:
+            return {"input_ids": [[ord(c) for c in text] for text in texts]}
+
+        def __call__(self, *, text, images, return_tensors):
+            # The image placeholder "@" expands to four tokens, as a VLM's does.
+            assert len(text) == 1 and images == ["image"]
+            ids = [ord(c) for c in text[0].replace("@", "@@@@")]
+            return Inputs(
+                input_ids=torch.tensor([ids]),
+                attention_mask=torch.ones(1, len(ids)),
+                pixel_values=torch.zeros(3, 2),
+            )
+
+    # A bigram model, so a token's logits depend only on the token before.
+    table = torch.randn(
+        vocabulary, vocabulary, generator=torch.Generator().manual_seed(0)
+    )
+    calls: list[tuple[int, int]] = []
+
+    class Cache:
+        def __init__(self, tokens: list[int]) -> None:
+            self.tokens = tokens
+            self.rows = 1
+
+        def batch_repeat_interleave(self, repeats: int) -> None:
+            self.rows *= repeats
+
+    class Model:
+        device = "cpu"
+
+        def __init__(self) -> None:
+            self.model = type("Base", (), {"rope_deltas": "stale"})()
+
+        def __call__(self, *, input_ids, use_cache, past_key_values=None, **rest):
+            if past_key_values is None:
+                assert self.model.rope_deltas is None
+                assert rest["pixel_values"].shape == (3, 2)
+                logits = table[input_ids][:, -rest["logits_to_keep"] :]
+                past_key_values = Cache(input_ids[0].tolist())
+            else:
+                # Every tail runs against its own copy of the start.
+                assert past_key_values.rows == input_ids.shape[0]
+                assert past_key_values.tokens[-1] == ord(" ")
+                logits = table[input_ids]
+            calls.append(tuple(input_ids.shape))
+            return type(
+                "Output", (), {"logits": logits, "past_key_values": past_key_values}
+            )
+
+    class Adapter:
+        def format_input(self, chat: Any) -> dict[str, Any]:
+            return {"text": "chat@:", "images": ["image"]}
+
+    def scores(max_batch_size: int) -> list[tuple[float, ...]]:
+        config = VLMPlannerConfig(max_batch_size=max_batch_size)
+        backend = TransformersVLMBackend(config)
+        adapter = type("Outlines", (), {"type_adapter": Adapter()})()
+        monkeypatch.setattr(backend, "_load", lambda: (Processor(), adapter, None))
+        monkeypatch.setattr(vlm_module, "_planner_chat", lambda request: request)
+        backend._model = Model()
+        options = ["a", "bcd", "ef", "ghij", "k"]
+        return backend.score_continuations([None], ['{"x": '], [options])
+
+    whole = scores(8)
+    # The start, with its image expanded, then all five tails at once.
+    assert calls == [(1, len("chat@@@@:" + '{"x": ')), (5, 4)]
+    calls.clear()
+    chunked = scores(2)
+    assert [rows for rows, _ in calls] == [1, 2, 2, 1]
+    assert chunked == pytest.approx(whole)
+    log_probs = torch.log_softmax(table, dim=-1)
+    # "a" is one token after the prefix's closing space; "bcd" is three.
+    assert whole[0][0] == pytest.approx(float(log_probs[ord(" "), ord("a")]))
+    expected = sum(
+        float(log_probs[ord(before), ord(token)])
+        for before, token in zip(" bc", "bcd", strict=True)
+    )
+    assert whole[0][1] == pytest.approx(expected)
+
+
 def test_scorer_repairs_by_default_and_shares_generations_across_parse_modes() -> (
     None
 ):

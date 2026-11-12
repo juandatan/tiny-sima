@@ -1286,6 +1286,12 @@ def _response_text(output: Any) -> str:
     return str(output)
 
 
+# Processor outputs with one entry per token, cut with the tokens they label.
+_PER_TOKEN_INPUTS = frozenset(
+    {"input_ids", "attention_mask", "mm_token_type_ids", "token_type_ids"}
+)
+
+
 class TransformersVLMBackend:
     """Outlines-constrained backend around a frozen Transformers VLM."""
 
@@ -1476,63 +1482,84 @@ class TransformersVLMBackend:
         prefixes: Sequence[str],
         continuations: Sequence[Sequence[str]],
     ) -> list[tuple[float, ...]]:
-        """Score each request's continuations in one forward pass per request.
+        """Score each request's continuations from one pass over their start.
 
         The chat is rendered as generation renders it, the prefix appended
-        and each continuation after it, one row each. Only the tokens after
-        the rows' common start are summed: the shared ones score the same in
-        every row, and tokenising each text whole keeps the boundary merges
-        decoding would see. Rows are padded on the left, so their last
-        tokens line up and only the last logits are computed.
+        and each continuation after it, one text each. Only the tokens after
+        the common start of all a request's texts are summed: the shared ones
+        score the same in every text, and tokenising each text whole keeps the
+        boundary merges decoding would see. The image and the common start go
+        through the model once; the tails then run against copies of its
+        cache, ``max_batch_size`` rows a pass. The texts are tokenised
+        without the image, whose placeholder expands inside the common start,
+        and the first text's expanded tokens are checked against its tail.
         """
+
+        import copy
 
         import torch  # pyright: ignore[reportMissingImports]
 
         processor, outlines_model, _ = self._load()
         model = self._model
         assert model is not None
+        size = self.config.max_batch_size
         scores: list[tuple[float, ...]] = []
         for request, prefix, options in zip(
             requests, prefixes, continuations, strict=True
         ):
             formatted = outlines_model.type_adapter.format_input(_planner_chat(request))
             texts = [formatted["text"] + prefix + option for option in options]
-            images = formatted.get("images")
-            inputs = processor(
-                text=texts,
-                images=None if images is None else images * len(options),
-                padding=True,
-                padding_side="left",
-                return_tensors="pt",
-            ).to(model.device)
-            mask = inputs["attention_mask"].bool()
-            rows = [
-                ids[row_mask].tolist()
-                for ids, row_mask in zip(inputs["input_ids"], mask, strict=True)
-            ]
+            rows = processor.tokenizer(texts)["input_ids"]
             common = 0
             while all(
                 common < len(row) and row[common] == rows[0][common] for row in rows
             ):
                 common += 1
-            tails = [len(row) - common for row in rows]
-            if common == 0 or min(tails) == 0:
+            tails = [row[common:] for row in rows]
+            if common == 0 or min(map(len, tails)) == 0:
                 raise ValueError("Continuations must differ after a shared start.")
-            keep = max(tails) + 1
-            with torch.inference_mode():
-                logits = model(**inputs, logits_to_keep=keep).logits
-            log_probs = torch.log_softmax(logits.float(), dim=-1)
+            inputs = processor(
+                text=texts[:1], images=formatted.get("images"), return_tensors="pt"
+            ).to(model.device)
+            ids = inputs["input_ids"]
+            length = ids.shape[1] - len(tails[0])
+            if ids[0, length:].tolist() != tails[0]:
+                raise ValueError("The image must sit before the continuations.")
+            shared = {
+                key: value[:, :length] if key in _PER_TOKEN_INPUTS else value
+                for key, value in inputs.items()
+            }
+            # Qwen-VL keeps the image's position offset between calls and
+            # reapplies it to any call with a cache, so a stale one would
+            # shift a text-only request's tails.
+            base = getattr(model, "model", None)
+            if hasattr(base, "rope_deltas"):
+                base.rope_deltas = None
             request_scores = []
-            for row, (ids, tail) in enumerate(
-                zip(inputs["input_ids"], tails, strict=True)
-            ):
-                # The kept logits end at the last token; token j of the tail
-                # sits tail - j from the end and is predicted one before.
-                total = 0.0
-                for j in range(tail):
-                    position = keep - tail + j - 1
-                    token = ids[ids.shape[0] - tail + j]
-                    total += float(log_probs[row, position, token])
-                request_scores.append(total)
+            with torch.inference_mode():
+                output = model(**shared, use_cache=True, logits_to_keep=1)
+                first = torch.log_softmax(output.logits[0, -1].float(), dim=-1)
+                for start in range(0, len(tails), size):
+                    chunk = tails[start : start + size]
+                    width = max(map(len, chunk))
+                    # Padded on the right, so causal attention keeps each
+                    # pad out of its row's logits.
+                    batch = torch.tensor(
+                        [tail + tail[-1:] * (width - len(tail)) for tail in chunk],
+                        device=model.device,
+                    )
+                    cache = copy.deepcopy(output.past_key_values)
+                    cache.batch_repeat_interleave(len(chunk))
+                    logits = model(
+                        input_ids=batch, past_key_values=cache, use_cache=True
+                    ).logits
+                    log_probs = torch.log_softmax(logits.float(), dim=-1)
+                    for row, tail in enumerate(chunk):
+                        # The start's last logits predict the tail's first
+                        # token; each tail token predicts the next.
+                        total = float(first[tail[0]])
+                        for j in range(1, len(tail)):
+                            total += float(log_probs[row, j - 1, tail[j]])
+                        request_scores.append(total)
             scores.append(tuple(request_scores))
         return scores
